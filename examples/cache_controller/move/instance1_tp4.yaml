@@ -1,0 +1,17 @@
+chunk_size: 256
+local_cpu: True
+max_local_cpu_size: 20
+
+# P2P configurations for TP=4
+enable_p2p: True
+p2p_host: "localhost"
+p2p_init_ports: [8200, 8201, 8202, 8203]
+p2p_lookup_ports: [8210, 8211, 8212, 8213]
+transfer_channel: "nixl"
+
+# Cache controller configurations
+enable_controller: True
+lmcache_instance_id: "lmcache_instance_1_tp4"
+controller_pull_url: "localhost:8300"
+controller_reply_url: "localhost:8400"
+lmcache_worker_ports: [8500, 8501, 8502, 8503]

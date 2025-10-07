@@ -57,3 +57,48 @@ You should be able to see a return message indicating the KV cache has started t
 ```
 
 `num_tokens` reports how many tokens are tracked for the request in the system. The returned `event_id` can be used to check the status of the move operation (this functionality is coming soon).
+
+### Running with 8 GPUs and a 70B model
+
+To exercise the same flow with a larger model (for example `meta-llama/Llama-3.1-70B-Instruct`)
+across eight GPUs (four GPUs per vLLM engine), use the tensor-parallel aware configs that ship
+with this directory:
+
+1. Launch the two vLLM engines, each pinned to four GPUs and using the `tp4` configuration file
+   that exposes four worker ports (one per tensor-parallel rank):
+
+   ```bash
+   PYTHONHASHSEED=123 UCX_TLS=rc CUDA_VISIBLE_DEVICES=0,1,2,3 \
+     LMCACHE_CONFIG_FILE=instance1_tp4.yaml \
+     vllm serve meta-llama/Llama-3.1-70B-Instruct \
+       --tensor-parallel-size 4 \
+       --gpu-memory-utilization 0.9 \
+       --port 8000 \
+       --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}'
+   ```
+
+   ```bash
+   PYTHONHASHSEED=123 UCX_TLS=rc CUDA_VISIBLE_DEVICES=4,5,6,7 \
+     LMCACHE_CONFIG_FILE=instance2_tp4.yaml \
+     vllm serve meta-llama/Llama-3.1-70B-Instruct \
+       --tensor-parallel-size 4 \
+       --gpu-memory-utilization 0.9 \
+       --port 8001 \
+       --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}'
+   ```
+
+   The `instance*_tp4.yaml` files preallocate distinct NIXL P2P port ranges and controller worker
+   ports for each tensor-parallel rank. Adjust the port lists if other services already occupy
+   those ranges in your cluster.
+
+2. Reuse the controller command from step 2 and the GDPVal helper script from step 3. The script
+   will target the larger model automatically when you pass `--model meta-llama/Llama-3.1-70B-Instruct`
+   (omit the flag to keep using the smaller default).
+
+3. Feed the emitted token ids into the move command exactly as before. The controller response will
+   show the number of tokens tracked for the 70B request, which is typically much larger than the
+   8B variant.
+
+Because the 70B checkpoints require gated access on Hugging Face, make sure the model weights are
+available in your environment before launching the servers, and confirm that each machine exposes
+four A100-class GPUs (or equivalent HBM capacity) per vLLM process.
