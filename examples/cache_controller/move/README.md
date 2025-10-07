@@ -23,46 +23,37 @@ PYTHONHASHSEED=123 UCX_TLS=rc CUDA_VISIBLE_DEVICES=1 LMCACHE_CONFIG_FILE=instanc
 PYTHONHASHSEED=123 lmcache_controller --host localhost --port 9000 --monitor-ports '{"pull": 8300, "reply": 8400}'
 ```
 
-3. Send a request to vllm engine 1:  
+3. Use the GDPVal dataset to drive a request. First make sure the dataset has been
+   downloaded to `/xfs1/alex/dataset/openai_gdpval`. Then run the helper script:
+
 ```bash
-curl -X POST http://localhost:8000/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "meta-llama/Llama-3.1-8B-Instruct",
-    "prompt": "Explain the significance of KV cache in language models.",
-    "max_tokens": 10
-  }'
+python use_gdpval_prompt.py \
+  --dataset-dir /xfs1/alex/dataset/openai_gdpval \
+  --index 0 \
+  --max-tokens 32
 ```
 
-4. Tokenize the prompt:  
-```bash
-curl -X POST http://localhost:8000/tokenize \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "meta-llama/Llama-3.1-8B-Instruct",
-    "prompt": "Explain the significance of KV cache in language models."
-  }'
-```
+This sends the selected dataset prompt to the vLLM server on port `8000`, prints the
+completion text, and returns the token ids needed in the next step. You can pass
+`--task-id <uuid>` instead of `--index` to target a specific task and use
+`--save-token-file` to persist the ids for later reuse.
+Install the `datasets` and `requests` packages if they are not already available.
 
-You should be able to see the returned token ids as:
-```plaintext
-{"count":12,"tokens":[128000,849,21435,279,26431,315,85748,6636,304,4221,4211,13],"token_strs":null}
-```
-
-5. Move the request's KV cache from vllm engine 1's CPU to vllm engine 2's CPU using request's token ids:
+4. Move the request's KV cache from vllm engine 1's CPU to vllm engine 2's CPU
+   using the token ids reported by the helper script:
 ```bash
 curl -X POST http://localhost:9000/move \
   -H "Content-Type: application/json" \
   -d '{
     "old_position": ["lmcache_instance_1", "LocalCPUBackend"],
     "new_position": ["lmcache_instance_2", "LocalCPUBackend"],
-    "tokens": [128000, 849, 21435, 279, 26431, 315, 85748, 6636, 304, 4221, 4211, 13]
+    "tokens": [/* paste the array emitted by use_gdpval_prompt.py */]
   }'
 ```
 You should be able to see a return message indicating the KV cache has started to be moved in the system:
 
 ```plaintext
-{"num_tokens": 12, "event_id": "xxx"}
+{"num_tokens": <token_count>, "event_id": "xxx"}
 ```
 
-`num_tokens: 12` means that there are 12 tokens's KV cache are stored in the system. The returned `event_id` can be used to check the status of the move operation (this functionality is coming soon).
+`num_tokens` reports how many tokens are tracked for the request in the system. The returned `event_id` can be used to check the status of the move operation (this functionality is coming soon).
