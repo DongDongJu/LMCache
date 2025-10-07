@@ -102,3 +102,15 @@ with this directory:
 Because the 70B checkpoints require gated access on Hugging Face, make sure the model weights are
 available in your environment before launching the servers, and confirm that each machine exposes
 four A100-class GPUs (or equivalent HBM capacity) per vLLM process.
+
+#### Automated launch script
+
+The `run_8gpu_example.sh` helper wires up the controller, both tensor-parallel vLLM servers, and an
+optional GDPVal warmup in one shot:
+
+```bash
+bash run_8gpu_example.sh --dataset-dir /xfs1/alex/dataset/openai_gdpval
+```
+
+Use `--model`, `--gpu-set-a`, or `--gpu-set-b` to target different checkpoints or GPU assignments,
+and pass `--skip-helper` when you only want the services to start without issuing a prompt.
