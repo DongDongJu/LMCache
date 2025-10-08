@@ -424,7 +424,10 @@ async def main(args):
     )
     model = args.model
 
-    pre_warmup_prompts = [str(i) + "xx" + " ".join(["hi"] * 1000) for i in range(5)]
+    pre_warmup_length = args.warmup_prefill_len
+    pre_warmup_prompts = [
+        str(i) + "xx" + " ".join(["hi"] * pre_warmup_length) for i in range(5)
+    ]
 
     await test_long_document_qa(
         client=client,
@@ -621,6 +624,12 @@ def create_argument_parser():
         type=float,
         default=0.0,
         help="Sleep time after warm up iteration",
+    )
+    parser.add_argument(
+        "--warmup-prefill-len",
+        type=int,
+        default=1000,
+        help="Number of tokens used in the pre-warmup prompts.",
     )
 
     parser.add_argument(

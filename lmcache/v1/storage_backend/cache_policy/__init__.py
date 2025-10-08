@@ -4,17 +4,37 @@ from typing import Dict, Type
 
 # First Party
 from lmcache.v1.storage_backend.cache_policy.base_policy import BaseCachePolicy
+from lmcache.v1.storage_backend.cache_policy.clock_ecl import (
+    CLOCKECLCachePolicy,
+)
+from lmcache.v1.storage_backend.cache_policy.anchored_sliding_window import (
+    AnchoredSlidingWindowCachePolicy,
+)
 from lmcache.v1.storage_backend.cache_policy.fifo import FIFOCachePolicy
 from lmcache.v1.storage_backend.cache_policy.lfu import LFUCachePolicy
 from lmcache.v1.storage_backend.cache_policy.lru import LRUCachePolicy
 from lmcache.v1.storage_backend.cache_policy.mru import MRUCachePolicy
+from lmcache.v1.storage_backend.cache_policy.sieve import SIEVECachePolicy
+from lmcache.v1.storage_backend.cache_policy.sieve_slru import (
+    SIEVESLRUCachePolicy,
+)
+from lmcache.v1.storage_backend.cache_policy.sieve_pdg import (
+    SIEVEPDGCachePolicy,
+)
+from lmcache.v1.storage_backend.cache_policy.web_cache import WebCachePolicy
 
 # Cache policy mapping
 POLICY_MAPPING: Dict[str, Type[BaseCachePolicy]] = {
+    "ANCHOR_SLIDING_WINDOW": AnchoredSlidingWindowCachePolicy,
     "LRU": LRUCachePolicy,
     "LFU": LFUCachePolicy,
     "FIFO": FIFOCachePolicy,
     "MRU": MRUCachePolicy,
+    "SIEVE": SIEVECachePolicy,
+    "SIEVE_SLRU": SIEVESLRUCachePolicy,
+    "SIEVE_PDG": SIEVEPDGCachePolicy,
+    "WEB_CACHE": WebCachePolicy,
+    "CLOCK_ECL": CLOCKECLCachePolicy,
 }
 
 

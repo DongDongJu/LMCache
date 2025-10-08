@@ -82,7 +82,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # to help maintain suffix -> prefix order in the dict
         # assumption: only one request is looked up at a time
         # (only one worker per cache engine)
-        self.keys_in_request: List[CacheEngineKey] = []
+        self.keys_in_request: List[tuple[CacheEngineKey, str]] = []
         self._setup_metrics()
 
     def _setup_metrics(self):
@@ -105,14 +105,18 @@ class LocalCPUBackend(AllocatorBackendInterface):
             if pin:
                 self.hot_cache[key].pin()
                 # vllm lookup sets pin to True
-                self.keys_in_request.append(key)
+                self.keys_in_request.append((key, "prefill"))
             return True
 
     def touch_cache(self):
         # flip the order of the keys in the request
         with self.cpu_lock:
-            for key in reversed(self.keys_in_request):
-                self.cache_policy.update_on_hit(key, self.hot_cache)
+            for key, stage in reversed(self.keys_in_request):
+                self.cache_policy.update_on_hit(
+                    key,
+                    self.hot_cache,
+                    stage=stage,
+                )
             self.keys_in_request = []
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -135,7 +139,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
             memory_obj.ref_count_up()
             self.hot_cache[key] = memory_obj
 
-            self.cache_policy.update_on_put(key)
+            stage = key.get_stage() or "prefill"
+            self.cache_policy.update_on_put(key, stage=stage)
 
             # TODO(Jiayi): optimize this with batching?
             # push kv admit msg
@@ -206,7 +211,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 if pin:
                     self.hot_cache[key].pin()
                     # vllm lookup sets pin to True
-                    self.keys_in_request.append(key)
+                    self.keys_in_request.append((key, "prefill"))
                 num_hit_chunks += 1
         return num_hit_chunks
 

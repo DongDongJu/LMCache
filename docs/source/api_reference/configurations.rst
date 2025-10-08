@@ -66,7 +66,7 @@ Basic cache settings that control the core functionality of LMCache.
      - Whether to enable Python garbage collection. Values: true/false. Default: true
    * - cache_policy
      - LMCACHE_CACHE_POLICY
-     - Cache eviction policy (e.g. "LRU", "LFU", "FIFO"). Default: "LRU"
+    - Cache eviction policy ("LRU", "MRU", "LFU", "FIFO", "SIEVE", "SIEVE_SLRU", "SIEVE_PDG", "CLOCK_ECL"). Default: "LRU"
    * - numa_mode
      - LMCACHE_NUMA_MODE
      - NUMA-aware memory allocation mode. Values: "auto" (detect from system), "manual" (use extra_config mapping), null (disabled). When enabled, allocates pinned memory on specific NUMA nodes for better GPU-CPU memory bandwidth. Default: null
@@ -78,7 +78,7 @@ Basic cache settings that control the core functionality of LMCache.
      - Caches requests only if priority value ≤ limit. (**Not applicable for PD Disaggregation**) Type: int. Default: None
    * - extra_config
      - LMCACHE_EXTRA_CONFIG={"key": value, ...}
-     - Additional configuration as JSON dict. For NUMA manual mode, include "gpu_to_numa_mapping": {gpu_id: numa_node, ...}. Default: {}
+    - Additional configuration as JSON dict. For NUMA manual mode, include "gpu_to_numa_mapping": {gpu_id: numa_node, ...}. CLOCK_ECL also consumes keys such as ``scan_cap`` (int, default 32), ``decode_hot_ttl_ms`` (int, default 1500), ``big_threshold_bytes`` (string/int, optional), and ``bip_sample_rate`` (float, default 0.0). Default: {}
      
 Cache Blending Configurations
 -----------------------------

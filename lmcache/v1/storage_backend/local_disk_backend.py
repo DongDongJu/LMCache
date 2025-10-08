@@ -144,7 +144,7 @@ class LocalDiskBackend(StorageBackendInterface):
         # to help maintain suffix -> prefix order in the dict
         # assumption: only one request is looked up at a time
         # (only one worker per cache engine)
-        self.keys_in_request: List[CacheEngineKey] = []
+        self.keys_in_request: List[tuple[CacheEngineKey, str]] = []
 
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
@@ -167,14 +167,14 @@ class LocalDiskBackend(StorageBackendInterface):
             if pin:
                 self.dict[key].pin()
                 # vllm lookup sets pin to True
-                self.keys_in_request.append(key)
+                self.keys_in_request.append((key, "prefill"))
             return True
 
     def touch_cache(self):
         # flip the order of the keys in the request
         with self.disk_lock:
-            for key in reversed(self.keys_in_request):
-                self.cache_policy.update_on_hit(key, self.dict)
+            for key, stage in reversed(self.keys_in_request):
+                self.cache_policy.update_on_hit(key, self.dict, stage=stage)
             self.keys_in_request = []
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -308,7 +308,8 @@ class LocalDiskBackend(StorageBackendInterface):
         if not evict_success:
             return None
 
-        self.cache_policy.update_on_put(key)
+        stage = key.get_stage() or "prefill"
+        self.cache_policy.update_on_put(key, stage=stage)
         memory_obj.ref_count_up()
 
         asyncio.run_coroutine_threadsafe(
@@ -343,13 +344,13 @@ class LocalDiskBackend(StorageBackendInterface):
             self.disk_lock.release()
             return None
 
-        self.cache_policy.update_on_hit(key, self.dict)
+        self.cache_policy.update_on_hit(key, self.dict, stage="decode")
 
         self.disk_lock.release()
 
         self.disk_lock.acquire()
         # Update cache recency
-        self.cache_policy.update_on_hit(key, self.dict)
+        self.cache_policy.update_on_hit(key, self.dict, stage="decode")
 
         disk_meta = self.dict[key]
         path = disk_meta.path
@@ -381,7 +382,7 @@ class LocalDiskBackend(StorageBackendInterface):
             assert key in self.dict, f"Key {key} not found in disk cache after pinning"
 
             # NOTE(Jiayi): Currently, we consider prefetch as cache hit.
-            self.cache_policy.update_on_hit(key, self.dict)
+            self.cache_policy.update_on_hit(key, self.dict, stage="prefill")
 
             path = self.dict[key].path
             dtype = self.dict[key].dtype
@@ -404,7 +405,7 @@ class LocalDiskBackend(StorageBackendInterface):
             self.dict[key].pin()
 
             # Update cache recency
-            self.cache_policy.update_on_hit(key, self.dict)
+            self.cache_policy.update_on_hit(key, self.dict, stage="prefill")
 
             self.disk_lock.release()
             logger.debug(f"Prefetching {key} from disk.")
@@ -433,7 +434,7 @@ class LocalDiskBackend(StorageBackendInterface):
                     return num_hit_counts
                 if pin:
                     self.dict[key].pin()
-                    self.keys_in_request.append(key)
+                    self.keys_in_request.append((key, "prefill"))
                 num_hit_counts += 1
         return num_hit_counts
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections.abc import MutableMapping
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Optional, TypeVar
 import abc
 
 # First Party
@@ -31,6 +31,7 @@ class BaseCachePolicy(Generic[TCache], metaclass=abc.ABCMeta):
         self,
         key: CacheEngineKey,
         cache_dict: TCache,
+        stage: Optional[str] = None,
     ) -> None:
         """
         Update cache_dict and internal states when a cache is used
@@ -46,6 +47,7 @@ class BaseCachePolicy(Generic[TCache], metaclass=abc.ABCMeta):
     def update_on_put(
         self,
         key: CacheEngineKey,
+        stage: Optional[str] = None,
     ) -> None:
         """
         Update cache_dict and internal states when a cache is stored

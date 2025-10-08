@@ -4,6 +4,7 @@ import asyncio
 import os
 import shutil
 import tempfile
+from typing import Any, Optional
 
 # Third Party
 import pytest
@@ -11,7 +12,7 @@ import torch
 
 # First Party
 from lmcache.config import LMCacheEngineMetadata
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, DiskCacheMetadata
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     MemoryFormat,
@@ -19,6 +20,7 @@ from lmcache.v1.memory_management import (
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
+from lmcache.v1.storage_backend.cache_policy.base_policy import BaseCachePolicy
 
 
 class MockLookupServer:
@@ -39,6 +41,40 @@ class MockLMCacheWorker:
 
     def put_msg(self, msg):
         self.messages.append(msg)
+
+
+class RecordingPolicy(BaseCachePolicy[dict[CacheEngineKey, Any]]):
+    def __init__(self) -> None:
+        self.hit_stages: list[Optional[str]] = []
+        self.put_stages: list[Optional[str]] = []
+
+    def init_mutable_mapping(self) -> dict[CacheEngineKey, Any]:
+        return {}
+
+    def update_on_hit(
+        self,
+        key: CacheEngineKey,
+        cache_dict: dict[CacheEngineKey, Any],
+        stage: Optional[str] = None,
+    ) -> None:
+        self.hit_stages.append(stage)
+
+    def update_on_put(
+        self,
+        key: CacheEngineKey,
+        stage: Optional[str] = None,
+    ) -> None:
+        self.put_stages.append(stage)
+
+    def update_on_force_evict(self, key: CacheEngineKey) -> None:
+        pass
+
+    def get_evict_candidates(
+        self,
+        cache_dict: dict[CacheEngineKey, Any],
+        num_candidates: int = 1,
+    ) -> list[CacheEngineKey]:
+        return []
 
 
 def create_test_config(disk_path: str, max_disk_size: float = 1.0):
@@ -160,6 +196,42 @@ class TestLocalDiskBackend:
         )
 
         assert backend.lmcache_worker == lmcache_worker
+
+        local_cpu_backend.memory_allocator.close()
+
+    def test_stage_annotations_prefill_and_decode(
+        self, temp_disk_path, async_loop, local_cpu_backend
+    ):
+        config = create_test_config(temp_disk_path)
+        backend = LocalDiskBackend(
+            config=config,
+            loop=async_loop,
+            local_cpu_backend=local_cpu_backend,
+            dst_device="cuda",
+        )
+
+        policy = RecordingPolicy()
+        backend.cache_policy = policy
+        backend.dict = policy.init_mutable_mapping()
+
+        key = create_test_key(999)
+        disk_meta = DiskCacheMetadata(
+            path=os.path.join(temp_disk_path, "dummy.pt"),
+            size=128,
+            shape=torch.Size([1]),
+            dtype=torch.float32,
+            fmt=MemoryFormat.KV_T2D,
+        )
+        backend.dict[key] = disk_meta
+
+        assert backend.contains(key, pin=True)
+        backend.touch_cache()
+        assert policy.hit_stages[-1] == "prefill"
+        backend.dict[key].unpin()
+
+        backend.load_bytes_from_disk = lambda *args, **kwargs: create_test_memory_obj()
+        backend.get_blocking(key)
+        assert policy.hit_stages[-1] == "decode"
 
         local_cpu_backend.memory_allocator.close()
 

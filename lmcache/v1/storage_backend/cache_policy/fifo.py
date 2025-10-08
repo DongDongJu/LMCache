@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Any
+from typing import Any, Optional
 
 # First Party
 from lmcache.logging import init_logger
@@ -26,12 +26,14 @@ class FIFOCachePolicy(BaseCachePolicy[dict[CacheEngineKey, Any]]):
         self,
         key: CacheEngineKey,
         cache_dict: dict[CacheEngineKey, Any],
+        stage: Optional[str] = None,
     ) -> None:
         pass
 
     def update_on_put(
         self,
         key: CacheEngineKey,
+        stage: Optional[str] = None,
     ) -> None:
         pass
 

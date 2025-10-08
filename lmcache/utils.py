@@ -186,6 +186,24 @@ class CacheEngineKey:
         )
         return key
 
+    def get_stage(self) -> Optional[str]:
+        """Return stage metadata if present in request configs."""
+        if not self.request_configs:
+            return None
+        stage = self.request_configs.get("lmcache.stage")
+        if stage is None:
+            stage = self.request_configs.get("lmcache.stage.put")
+        if isinstance(stage, str):
+            stage_lower = stage.lower()
+            if stage_lower in {"prefill", "decode"}:
+                return stage_lower
+        tagged_stage = self.request_configs.get("lmcache.tag.stage")
+        if isinstance(tagged_stage, str):
+            tagged_lower = tagged_stage.lower()
+            if tagged_lower in {"prefill", "decode"}:
+                return tagged_lower
+        return None
+
     @staticmethod
     def from_string(s):
         parts = s.split("@")

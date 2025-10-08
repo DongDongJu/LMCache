@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-from typing import Any
+from typing import Any, Optional
 
 # Third Party
 from sortedcontainers import SortedDict
@@ -40,6 +40,7 @@ class LFUCachePolicy(BaseCachePolicy[dict[CacheEngineKey, Any]]):
         self,
         key: CacheEngineKey,
         cache_dict: dict[CacheEngineKey, Any],
+        stage: Optional[str] = None,
     ) -> None:
         curr_freq = self.key_to_freq[key]
         self.freq_to_keys[curr_freq].pop(key)
@@ -57,6 +58,7 @@ class LFUCachePolicy(BaseCachePolicy[dict[CacheEngineKey, Any]]):
     def update_on_put(
         self,
         key: CacheEngineKey,
+        stage: Optional[str] = None,
     ) -> None:
         # Initialize the frequency for the new key.
         self.key_to_freq[key] = 1

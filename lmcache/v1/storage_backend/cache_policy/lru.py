@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Optional
 
 # First Party
 from lmcache.logging import init_logger
@@ -26,12 +26,14 @@ class LRUCachePolicy(BaseCachePolicy[OrderedDict[CacheEngineKey, Any]]):
         self,
         key: CacheEngineKey,
         cache_dict: OrderedDict[CacheEngineKey, Any],
+        stage: Optional[str] = None,
     ) -> None:
         cache_dict.move_to_end(key)
 
     def update_on_put(
         self,
         key: CacheEngineKey,
+        stage: Optional[str] = None,
     ) -> None:
         # No action needed for LRU on put, as the key is already at the end.
         pass

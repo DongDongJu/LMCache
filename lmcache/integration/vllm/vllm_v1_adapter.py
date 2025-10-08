@@ -380,6 +380,14 @@ class ReqMeta:
             # Do not load if not in `can_load` state
             load_spec = None
 
+        request_configs = (
+            tracker.request_configs.copy()
+            if tracker.request_configs is not None
+            else {}
+        )
+        stage_value = "decode" if tracker.is_decode_phase else "prefill"
+        request_configs["lmcache.stage.put"] = stage_value
+
         return ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
@@ -388,7 +396,7 @@ class ReqMeta:
             save_spec=save_spec,
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
-            request_configs=tracker.request_configs,
+            request_configs=request_configs or None,
         )
 
 

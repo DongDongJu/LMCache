@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 import threading
+from typing import Any, Optional
 
 # Third Party
 import pytest
@@ -15,6 +16,7 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
 )
+from lmcache.v1.storage_backend.cache_policy.base_policy import BaseCachePolicy
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
 
@@ -36,6 +38,40 @@ class MockLMCacheWorker:
 
     def put_msg(self, msg):
         self.messages.append(msg)
+
+
+class RecordingPolicy(BaseCachePolicy[dict[CacheEngineKey, Any]]):
+    def __init__(self) -> None:
+        self.hit_stages: list[Optional[str]] = []
+        self.put_stages: list[Optional[str]] = []
+
+    def init_mutable_mapping(self) -> dict[CacheEngineKey, Any]:
+        return {}
+
+    def update_on_hit(
+        self,
+        key: CacheEngineKey,
+        cache_dict: dict[CacheEngineKey, Any],
+        stage: Optional[str] = None,
+    ) -> None:
+        self.hit_stages.append(stage)
+
+    def update_on_put(
+        self,
+        key: CacheEngineKey,
+        stage: Optional[str] = None,
+    ) -> None:
+        self.put_stages.append(stage)
+
+    def update_on_force_evict(self, key: CacheEngineKey) -> None:
+        pass
+
+    def get_evict_candidates(
+        self,
+        cache_dict: dict[CacheEngineKey, Any],
+        num_candidates: int = 1,
+    ) -> list[CacheEngineKey]:
+        return []
 
 
 def create_test_config(
@@ -158,6 +194,39 @@ class TestLocalCPUBackend:
         # LocalCPUBackend always returns False for exists_in_put_tasks
         assert not local_cpu_backend.exists_in_put_tasks(key)
         local_cpu_backend.memory_allocator.close()
+
+    def test_stage_annotations_on_put_and_hit(self, memory_allocator):
+        config = create_test_config()
+        backend = LocalCPUBackend(config=config, memory_allocator=memory_allocator)
+
+        policy = RecordingPolicy()
+        backend.cache_policy = policy
+        backend.hot_cache = policy.init_mutable_mapping()
+
+        prefill_key = CacheEngineKey("vllm", "test_model", 3, 0, hash("prefill"))
+        prefill_obj = create_test_memory_obj()
+        backend.submit_put_task(prefill_key, prefill_obj)
+        assert policy.put_stages[-1] == "prefill"
+
+        assert backend.contains(prefill_key, pin=True)
+        backend.touch_cache()
+        assert policy.hit_stages[-1] == "prefill"
+
+        decode_key = CacheEngineKey(
+            "vllm",
+            "test_model",
+            3,
+            1,
+            hash("decode"),
+            {"lmcache.stage.put": "decode"},
+        )
+        decode_obj = create_test_memory_obj()
+        backend.submit_put_task(decode_key, decode_obj)
+        assert policy.put_stages[-1] == "decode"
+
+        backend.remove(prefill_key)
+        backend.remove(decode_key)
+        memory_allocator.close()
 
     def test_submit_put_task(self, local_cpu_backend):
         """Test submit_put_task()."""
