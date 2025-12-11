@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections import deque
+import logging
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence
 import threading
@@ -23,6 +25,8 @@ from lmcache.v1.memory_management import (
     MemoryObj,
     MixedMemoryAllocator,
     PagedCpuGpuMemoryAllocator,
+    MemoryObjMetadata,
+    TensorMemoryObj,
 )
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
@@ -35,6 +39,133 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+class RingTensorMemoryObj(TensorMemoryObj):
+    def __init__(
+        self,
+        raw_data: torch.Tensor,
+        metadata,
+        parent_allocator,
+        *,
+        offset: int,
+        size_bytes: int,
+    ):
+        super().__init__(raw_data, metadata, parent_allocator)
+        self.offset = offset
+        self.size_bytes = size_bytes
+
+
+class RingPinnedAllocator(MemoryAllocatorInterface):
+    """
+    Simple ring-buffer allocator on a preallocated pinned tensor.
+    """
+
+    def __init__(self, capacity_bytes: int, align_bytes: int = 4096):
+        self.capacity = capacity_bytes
+        self.align_bytes = align_bytes
+        self.buffer = torch.empty(capacity_bytes, dtype=torch.uint8, pin_memory=True)
+        self.tail = 0
+        self.used = 0
+        self._segments: deque[tuple[int, int, bool]] = deque()
+        self._lock = threading.RLock()
+
+    def _round_up(self, x: int) -> int:
+        a = self.align_bytes
+        return ((x + a - 1) // a) * a
+
+    def _reclaim_front(self) -> None:
+        while self._segments and self._segments[0][2]:
+            _, sz, _ = self._segments.popleft()
+            self.used = max(0, self.used - sz)
+
+    def allocate(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        eviction: bool = True,
+        busy_loop: bool = True,
+    ) -> Optional[MemoryObj]:
+        numel = 1
+        for d in shape:
+            numel *= d
+        size_bytes = self._round_up(numel * torch.tensor([], dtype=dtype).element_size())
+        if size_bytes > self.capacity:
+            return None
+        with self._lock:
+            self._reclaim_front()
+            if self.used + size_bytes > self.capacity:
+                return None
+            if self.tail + size_bytes <= self.capacity:
+                offset = self.tail
+                self.tail = (self.tail + size_bytes) % self.capacity
+            else:
+                self._reclaim_front()
+                if self._segments:
+                    return None
+                offset = 0
+                self.tail = size_bytes
+            self.used += size_bytes
+            self._segments.append((offset, size_bytes, False))
+            view = self.buffer.narrow(0, offset, size_bytes)
+        # reinterpret as target dtype and shape
+        tensor_view = view.view(dtype).view(shape)
+        meta = MemoryObjMetadata(
+            shape=shape,
+            dtype=dtype,
+            address=int(tensor_view.data_ptr()),
+            phy_size=size_bytes,
+            ref_count=1,
+            fmt=fmt,
+        )
+        return RingTensorMemoryObj(tensor_view, meta, self, offset=offset, size_bytes=size_bytes)
+
+    def batched_allocate(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        eviction: bool = True,
+        busy_loop: bool = True,
+    ) -> Optional[list[MemoryObj]]:
+        res: List[MemoryObj] = []
+        for _ in range(batch_size):
+            obj = self.allocate(shape, dtype, fmt, eviction=eviction, busy_loop=busy_loop)
+            if obj is None:
+                return None
+            res.append(obj)
+        return res
+
+    def free(self, memory_obj: MemoryObj) -> None:
+        if not isinstance(memory_obj, RingTensorMemoryObj):
+            return
+        off = memory_obj.offset
+        sz = memory_obj.size_bytes
+        with self._lock:
+            for idx, (o, s, free_flag) in enumerate(self._segments):
+                if o == off and s == sz and not free_flag:
+                    self._segments[idx] = (o, s, True)
+                    break
+            self._reclaim_front()
+        logger.debug(
+            "RingPinnedAllocator free offset=%d size=%d used=%d free=%d",
+            off,
+            sz,
+            self.used,
+            self.capacity - self.used,
+        )
+
+    def batched_free(self, memory_objs: list[MemoryObj]) -> None:
+        for obj in memory_objs:
+            self.free(obj)
+
+    def memcheck(self) -> bool:
+        return True
+
+
+    def utilization(self) -> float:
+        return self.used / self.capacity if self.capacity else 0.0
 
 class LocalCPUBackend(AllocatorBackendInterface):
     """
@@ -102,6 +233,18 @@ class LocalCPUBackend(AllocatorBackendInterface):
             logger.warning("Controller message sender is not initialized")
 
         self._setup_metrics()
+
+        # Ring eviction daemon (only if ring allocator is used)
+        self._ring_eviction_stop = threading.Event()
+        self._ring_eviction_thread: Optional[threading.Thread] = None
+        if isinstance(self.memory_allocator, RingPinnedAllocator):
+            # thresholds: evict down to low watermark if above high watermark
+            self._ring_high_wm = float(getattr(config, "local_cpu_ring_high_watermark", 0.9))
+            self._ring_low_wm = float(getattr(config, "local_cpu_ring_low_watermark", 0.7))
+            self._ring_poll_interval = float(
+                getattr(config, "local_cpu_ring_eviction_interval_sec", 0.1)
+            )
+            self._start_ring_eviction_daemon()
 
     def _setup_metrics(self):
         prometheus_logger = PrometheusLogger.GetInstanceOrNone()
@@ -385,6 +528,25 @@ class LocalCPUBackend(AllocatorBackendInterface):
             )
             return paged_mem_allocator
         else:
+            # Optional ring buffer allocator (preallocated pinned pool)
+            ring_mb = float(getattr(config, "local_cpu_ring_mb", 0.0) or 0.0)
+            if ring_mb > 0:
+                ring_bytes = int(ring_mb * 1024**2)
+                total_bytes = int(cpu_size * 1024**3)
+                if ring_bytes > total_bytes:
+                    logger.info(
+                        "Ring size %.2f MB exceeds max_local_cpu_size %.2f GB; clamping to %.2f GB",
+                        ring_mb,
+                        cpu_size,
+                        total_bytes / 1024**3,
+                    )
+                    ring_bytes = total_bytes
+                logger.info(
+                    "LocalCPUBackend using ring pinned allocator: %.2f MB (align=4096)",
+                    ring_mb,
+                )
+                return RingPinnedAllocator(ring_bytes, align_bytes=4096)
+
             # Check if lazy memory allocator should be enabled
             use_lazy = (
                 config.enable_lazy_memory_allocator
@@ -449,9 +611,22 @@ class LocalCPUBackend(AllocatorBackendInterface):
         - many retrieves happen concurrently
         (we use the async serializer to handle this)
         """
-        logger.debug(
-            f"Allocating memory in local cpu backend with busy loop: {busy_loop}"
-        )
+        if isinstance(self.memory_allocator, RingPinnedAllocator):
+            logger.debug(
+                "Alloc local_cpu allocator=%s busy_loop=%s used=%d free=%d align=%d cap_mb=%.2f",
+                type(self.memory_allocator).__name__,
+                busy_loop,
+                self.memory_allocator.used,
+                self.memory_allocator.capacity - self.memory_allocator.used,
+                self.memory_allocator.align_bytes,
+                self.memory_allocator.capacity / 1024**2,
+            )
+        else:
+            logger.debug(
+                "Alloc local_cpu allocator=%s busy_loop=%s",
+                type(self.memory_allocator).__name__,
+                busy_loop,
+            )
         if fmt is None:
             if self.layerwise:
                 if self.enable_blending:
@@ -741,7 +916,60 @@ class LocalCPUBackend(AllocatorBackendInterface):
         return self.memory_allocator
 
     def close(self) -> None:
+        if self._ring_eviction_thread is not None:
+            self._ring_eviction_stop.set()
+            self._ring_eviction_thread.join(timeout=1.0)
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self.memory_allocator.close()
         self.clear()
+
+    def _start_ring_eviction_daemon(self) -> None:
+        def _loop():
+            while not self._ring_eviction_stop.is_set():
+                try:
+                    self._ring_eviction_tick()
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("Ring eviction tick failed: %s", exc)
+                time.sleep(self._ring_poll_interval)
+
+        self._ring_eviction_thread = threading.Thread(
+            target=_loop, name="lmc-ring-evict", daemon=True
+        )
+        self._ring_eviction_thread.start()
+
+    def _ring_eviction_tick(self) -> None:
+        # Only meaningful when hot cache is used
+        if not self.use_hot:
+            return
+        alloc = self.memory_allocator
+        if not isinstance(alloc, RingPinnedAllocator):
+            return
+        util = alloc.utilization()
+        if util < self._ring_high_wm:
+            return
+
+        target_util = self._ring_low_wm
+        evicted = 0
+        with self.cpu_lock:
+            while alloc.utilization() > target_util:
+                evict_keys = self.cache_policy.get_evict_candidates(
+                    self.hot_cache, num_candidates=1
+                )
+                if not evict_keys:
+                    break
+                key = evict_keys[0]
+                mem_obj = self.hot_cache.pop(key, None)
+                if mem_obj is None:
+                    continue
+                self.cache_policy.update_on_force_evict(key)
+                self.memory_allocator.free(mem_obj)
+                evicted += 1
+
+        if evicted > 0:
+            logger.debug(
+                "Ring eviction evicted=%d util=%.3f free=%d",
+                evicted,
+                alloc.utilization(),
+                alloc.capacity - alloc.used,
+            )

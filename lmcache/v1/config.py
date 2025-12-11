@@ -139,6 +139,23 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "max_local_cpu_size": {"type": float, "default": 5.0, "env_converter": float},
     "reserve_local_cpu_size": {"type": float, "default": 0.0, "env_converter": float},
+    # Preallocated ring buffer for LocalCPUBackend (MB). 0 disables it.
+    "local_cpu_ring_mb": {"type": float, "default": 0.0, "env_converter": float},
+    "local_cpu_ring_high_watermark": {
+        "type": float,
+        "default": 0.9,
+        "env_converter": float,
+    },
+    "local_cpu_ring_low_watermark": {
+        "type": float,
+        "default": 0.7,
+        "env_converter": float,
+    },
+    "local_cpu_ring_eviction_interval_sec": {
+        "type": float,
+        "default": 0.1,
+        "env_converter": float,
+    },
     "local_disk": {
         "type": Optional[str],
         "default": None,
