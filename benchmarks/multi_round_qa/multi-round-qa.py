@@ -357,10 +357,12 @@ class UserSessionManager:
         self.sessions: list[UserSession] = []
 
         gap_between_requests_per_user = workload_config.num_users / workload_config.qps
-        session_alive_time = gap_between_requests_per_user * (
-            workload_config.num_rounds - 1
+        session_alive_time = gap_between_requests_per_user * max(
+            workload_config.num_rounds - 1, 0
         )
-        self.gap_between_users = session_alive_time / (workload_config.num_users + 0)
+        # avoid div-by-zero and negative values
+        effective_users = max(workload_config.num_users, 1)
+        self.gap_between_users = session_alive_time / effective_users
         self.ramp_up_time = workload_config.num_users * self.gap_between_users
 
         logger.info(
@@ -370,6 +372,7 @@ class UserSessionManager:
         )
 
         self.user_id = init_user_id
+        self.sharegpt_cursor = 0
         self.last_user_join = 0.0
         self.session_summaries: list[pd.DataFrame] = []
         self.start_time: float | None = None
@@ -410,9 +413,9 @@ class UserSessionManager:
         self.user_id += 1
         user_config = UserConfig.new_user_config(self.user_id, self.workload_config)
         if self.use_sharegpt:
-            user_session = UserSession(
-                user_config, self.use_sharegpt, self.sharegpt_data[self.user_id]
-            )
+            data = self.sharegpt_data[self.sharegpt_cursor % len(self.sharegpt_data)]
+            self.sharegpt_cursor += 1
+            user_session = UserSession(user_config, self.use_sharegpt, data)
         else:
             user_session = UserSession(user_config, self.use_sharegpt)
         self.sessions.append(user_session)
@@ -430,15 +433,12 @@ class UserSessionManager:
         self.sessions = [s for s in self.sessions if not s.finished]
 
     def _can_join_user(self, timestamp: float) -> bool:
-        # No new user session if gap_between_users time interval not meets
-        if timestamp - self.last_user_join <= self.gap_between_users:
+        # Cap active users to configured num_users
+        if len(self.sessions) >= self.workload_config.num_users:
             return False
 
-        # No user seession if active user count is less than configured
-        if (
-            self.enforce_strict_concurrent_users
-            and len(self.sessions) >= self.workload_config.num_users
-        ):
+        # No new user session if gap_between_users time interval not meets
+        if timestamp - self.last_user_join <= self.gap_between_users:
             return False
         return True
 
