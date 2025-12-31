@@ -15,11 +15,23 @@ from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 
-if torch.cuda.is_available():
-    # First Party
-    import lmcache.c_ops as lmc_ops
-
 logger = init_logger(__name__)
+
+try:
+    if torch.cuda.is_available():
+        # First Party
+        import lmcache.c_ops as lmc_ops
+    else:
+        raise ModuleNotFoundError
+except Exception:
+    # First Party
+    import lmcache.non_cuda_equivalents as lmc_ops
+
+    if torch.cuda.is_available():
+        logger.warning(
+            "CUDA is available but 'lmcache.c_ops' is not importable; "
+            "GPU connector will use Python fallbacks (may be slower/limited)."
+        )
 
 
 class GPUConnectorInterface(metaclass=abc.ABCMeta):

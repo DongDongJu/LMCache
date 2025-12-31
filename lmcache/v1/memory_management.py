@@ -21,15 +21,23 @@ from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.system_detection import NUMAMapping
 
-if torch.cuda.is_available():
-    # First Party
-    import lmcache.c_ops as lmc_ops
-else:
+logger = init_logger(__name__)
+
+try:
+    if torch.cuda.is_available():
+        # First Party
+        import lmcache.c_ops as lmc_ops
+    else:
+        raise ModuleNotFoundError
+except Exception:
     # First Party
     import lmcache.non_cuda_equivalents as lmc_ops
 
-
-logger = init_logger(__name__)
+    if torch.cuda.is_available():
+        logger.warning(
+            "CUDA is available but 'lmcache.c_ops' is not importable; "
+            "falling back to Python non-CUDA equivalents."
+        )
 
 
 class MemoryFormat(Enum):
@@ -368,6 +376,33 @@ def _allocate_cpu_memory(
     buffer = torch.frombuffer(buf, dtype=torch.uint8)
 
     return buffer
+
+
+def _allocate_unpinned_numa_memory(
+    size: int,
+    numa_node: int,
+) -> torch.Tensor:
+    """Allocate pageable CPU memory on a specific NUMA node (best-effort).
+
+    This uses mmap+mbind+first-touch on CUDA builds, and a regular CPU tensor on
+    non-CUDA builds.
+    """
+    if size == 0:
+        return torch.empty(0, dtype=torch.uint8)
+
+    ptr = lmc_ops.alloc_numa_ptr(size, numa_node)
+    array_type = ctypes.c_uint8 * size
+    buf = array_type.from_address(ptr)
+    return torch.frombuffer(buf, dtype=torch.uint8)
+
+
+def _free_unpinned_numa_memory(
+    buffer: torch.Tensor,
+    size: int,
+) -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    lmc_ops.free_numa_ptr(buffer.data_ptr(), size)
 
 
 def _free_cpu_memory(

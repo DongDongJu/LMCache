@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Optional
 import platform
 
@@ -21,6 +22,26 @@ from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
 
 logger = init_logger(__name__)
+
+
+@lru_cache(maxsize=128)
+def get_numa_distance(from_node: int, to_node: int) -> int:
+    """Best-effort NUMA distance from sysfs.
+
+    Returns a large value if distance cannot be determined.
+    """
+    try:
+        path = f"/sys/devices/system/node/node{int(from_node)}/distance"
+        with open(path) as f:
+            parts = [p for p in f.read().strip().split() if p]
+        if not parts:
+            return 10**9
+        idx = int(to_node)
+        if idx < 0 or idx >= len(parts):
+            return 10**9
+        return int(parts[idx])
+    except Exception:
+        return 10**9
 
 
 @dataclass

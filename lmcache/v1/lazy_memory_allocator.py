@@ -28,14 +28,23 @@ if TYPE_CHECKING:
     # First Party
     from lmcache.v1.config import LMCacheEngineConfig
 
-if torch.cuda.is_available():
-    # First Party
-    import lmcache.c_ops as lmc_ops
-else:
+logger = init_logger(__name__)
+
+try:
+    if torch.cuda.is_available():
+        # First Party
+        import lmcache.c_ops as lmc_ops
+    else:
+        raise ModuleNotFoundError
+except Exception:
     # First Party
     import lmcache.non_cuda_equivalents as lmc_ops
 
-logger = init_logger(__name__)
+    if torch.cuda.is_available():
+        logger.warning(
+            "CUDA is available but 'lmcache.c_ops' is not importable; "
+            "lazy allocator will use Python fallbacks where possible."
+        )
 
 
 class CompositeBuffer:

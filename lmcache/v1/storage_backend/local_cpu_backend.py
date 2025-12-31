@@ -162,7 +162,57 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     key=key.chunk_hash,
                 )
 
+            self._hybrid_demote_hot_cache_if_needed_locked()
+
         return None
+
+    def _hybrid_demote_hot_cache_if_needed_locked(self) -> None:
+        """Best-effort DRAM hot-cache demotion for hybrid mode.
+
+        Only applies when:
+        - hybrid/cxl backend enabled
+        - prefer_cxl_on_put enabled (LocalCPUBackend is staging/hot only)
+        - demote_on_pressure enabled
+        - dram_hot_cache_max_chunks > 0
+
+        Demotion means evicting from DRAM hot cache; data remains available in
+        capacity tier.
+        """
+        if not self.use_hot:
+            return
+        hybrid = self.config.get_hybrid_config()
+        if not bool(hybrid["enabled"]):
+            return
+        if not bool(hybrid["prefer_cxl_on_put"]):
+            return
+        if not bool(hybrid["demote_on_pressure"]):
+            return
+        max_chunks = int(hybrid["dram_hot_cache_max_chunks"])
+        if max_chunks <= 0:
+            return
+
+        demoted = 0
+        while len(self.hot_cache) > max_chunks:
+            evict_keys = self.cache_policy.get_evict_candidates(
+                self.hot_cache,
+                num_candidates=1,
+            )
+            if not evict_keys:
+                break
+
+            evict_key = evict_keys[0]
+            mem_obj = self.hot_cache.pop(evict_key, None)
+            if mem_obj is None:
+                continue
+
+            # Do not send controller EVICT here: this is a DRAM-tier demotion,
+            # and the chunk remains available in capacity (CXL) tier.
+            mem_obj.ref_count_down()
+            self.cache_policy.update_on_force_evict(evict_key)
+            demoted += 1
+
+        if demoted:
+            self.stats_monitor.update_interval_local_hybrid_demote_from_dram(demoted)
 
     def batched_submit_put_task(
         self,

@@ -38,6 +38,24 @@ def free_pinned_numa_ptr(ptr: int, size: int | None = None) -> None:
     _tensor_registry.pop(ptr, None)
 
 
+def alloc_numa_ptr(size: int, numa_id: int = 0) -> int:
+    """Non-CUDA equivalent of allocating pageable memory with NUMA awareness.
+
+    Note: NUMA binding is not supported in the non-CUDA fallback; this allocates
+    a normal CPU tensor and returns its data pointer.
+    """
+    tensor = torch.empty(size, dtype=torch.uint8, pin_memory=False)
+    tensor.fill_(0)
+    ptr = tensor.data_ptr()
+    _tensor_registry[ptr] = tensor
+    return ptr
+
+
+def free_numa_ptr(ptr: int, size: int | None = None) -> None:
+    """Non-CUDA equivalent of freeing a previously allocated NUMA pointer."""
+    _tensor_registry.pop(ptr, None)
+
+
 def alloc_pinned_ptr(size: int, device_id: int = 0) -> int:
     """Non-CUDA equivalent of allocating pinned memory and returning pointer
     to it. Note: Pinned memory is not supported on non-CUDA."""

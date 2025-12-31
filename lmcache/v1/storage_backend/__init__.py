@@ -15,6 +15,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.gds_backend import GdsBackend
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.local_cxl_backend import LocalCXLBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 from lmcache.v1.storage_backend.p2p_backend import P2PBackend
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
@@ -161,6 +162,17 @@ def CreateStorageBackends(
         )
         backend_name = str(p2p_backend)
         storage_backends[backend_name] = p2p_backend
+
+    # Optional local capacity tier (e.g., CXL NUMA node) behind DRAM staging.
+    if local_cpu_backend is not None and config.get_hybrid_config()["enabled"]:
+        cxl_backend = LocalCXLBackend(
+            config=config,
+            loop=loop,
+            local_cpu_backend=local_cpu_backend,
+            dst_device=dst_device,
+            metadata=metadata,
+        )
+        storage_backends[str(cxl_backend)] = cxl_backend
 
     if enable_nixl_storage:
         # First Party

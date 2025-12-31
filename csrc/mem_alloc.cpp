@@ -68,6 +68,30 @@ uintptr_t alloc_pinned_numa_ptr(size_t size, int node) {
   return reinterpret_cast<uintptr_t>(ptr);
 }
 
+uintptr_t alloc_numa_ptr(size_t size, int node) {
+  void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (ptr == MAP_FAILED)
+    throw std::runtime_error(std::string("mmap failed: ") + strerror(errno));
+
+  // If node < 0, skip NUMA binding and just fault-in.
+  if (node >= 0) {
+    // Maximum of 64 numa nodes
+    unsigned long mask = 1UL << node;
+    long maxnode = 8 * sizeof(mask);
+    if (mbind_sys(ptr, size, MPOL_BIND, &mask, maxnode,
+                  MPOL_MF_MOVE | MPOL_MF_STRICT) != 0) {
+      int err = errno;
+      munmap(ptr, size);
+      throw std::runtime_error(std::string("mbind failed: ") + strerror(err));
+    }
+  }
+
+  first_touch(ptr, size);
+
+  return reinterpret_cast<uintptr_t>(ptr);
+}
+
 void free_pinned_numa_ptr(uintptr_t ptr, size_t size) {
   void* p = reinterpret_cast<void*>(ptr);
   // Unpin first, then unmap.
@@ -77,6 +101,13 @@ void free_pinned_numa_ptr(uintptr_t ptr, size_t size) {
     throw std::runtime_error(std::string("cudaHostUnregister failed: ") +
                              cudaGetErrorString(st));
   }
+  if (munmap(p, size) != 0) {
+    throw std::runtime_error(std::string("munmap failed: ") + strerror(errno));
+  }
+}
+
+void free_numa_ptr(uintptr_t ptr, size_t size) {
+  void* p = reinterpret_cast<void*>(ptr);
   if (munmap(p, size) != 0) {
     throw std::runtime_error(std::string("munmap failed: ") + strerror(errno));
   }

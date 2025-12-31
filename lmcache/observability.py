@@ -83,6 +83,15 @@ class LMCacheStats:
 
     interval_request_cache_lifespan: List[float]  # cache lifespan in minutes
 
+    # Local capacity tier (e.g., CXL) metrics
+    interval_local_cxl_put_requests: int
+    interval_local_cxl_get_requests: int
+    interval_local_cxl_copy_bytes_dram_to_cxl: int
+    interval_local_cxl_copy_bytes_cxl_to_dram: int
+
+    interval_local_hybrid_promote_to_dram_count: int
+    interval_local_hybrid_demote_from_dram_count: int
+
 
 @dataclass
 class LookupRequestStats:
@@ -166,6 +175,15 @@ class LMCStatsMonitor:
         self.interval_vllm_hit_tokens = 0  # total hit tokens in vllm
         self.interval_prompt_tokens = 0  # total prompt tokens
         self.interval_lookup_0_hit_requests = 0
+
+        # Local capacity tier (e.g., CXL) metrics
+        self.interval_local_cxl_put_requests = 0
+        self.interval_local_cxl_get_requests = 0
+        self.interval_local_cxl_copy_bytes_dram_to_cxl = 0
+        self.interval_local_cxl_copy_bytes_cxl_to_dram = 0
+
+        self.interval_local_hybrid_promote_to_dram_count = 0
+        self.interval_local_hybrid_demote_from_dram_count = 0
 
         # P2P transfer metrics
         self.interval_p2p_requests = 0
@@ -394,6 +412,24 @@ class LMCStatsMonitor:
         self.interval_vllm_hit_tokens += delta
 
     @thread_safe
+    def update_interval_local_cxl_put(self, copied_bytes: int) -> None:
+        self.interval_local_cxl_put_requests += 1
+        self.interval_local_cxl_copy_bytes_dram_to_cxl += copied_bytes
+
+    @thread_safe
+    def update_interval_local_cxl_get(self, copied_bytes: int) -> None:
+        self.interval_local_cxl_get_requests += 1
+        self.interval_local_cxl_copy_bytes_cxl_to_dram += copied_bytes
+
+    @thread_safe
+    def update_interval_local_hybrid_promote_to_dram(self, count: int = 1) -> None:
+        self.interval_local_hybrid_promote_to_dram_count += count
+
+    @thread_safe
+    def update_interval_local_hybrid_demote_from_dram(self, count: int = 1) -> None:
+        self.interval_local_hybrid_demote_from_dram_count += count
+
+    @thread_safe
     def update_interval_prompt_tokens(self, delta: int):
         self.interval_prompt_tokens += delta
 
@@ -435,6 +471,14 @@ class LMCStatsMonitor:
         self.interval_p2p_transferred_tokens = 0
 
         self.interval_lookup_0_hit_requests = 0
+
+        self.interval_local_cxl_put_requests = 0
+        self.interval_local_cxl_get_requests = 0
+        self.interval_local_cxl_copy_bytes_dram_to_cxl = 0
+        self.interval_local_cxl_copy_bytes_cxl_to_dram = 0
+
+        self.interval_local_hybrid_promote_to_dram_count = 0
+        self.interval_local_hybrid_demote_from_dram_count = 0
 
         new_retrieve_requests = {}
         for request_id, retrieve_stats in self.retrieve_requests.items():
@@ -563,6 +607,12 @@ class LMCStatsMonitor:
             interval_request_cache_lifespan=request_lifespan,
             interval_prompt_tokens=self.interval_prompt_tokens,
             interval_lookup_0_hit_requests=self.interval_lookup_0_hit_requests,
+            interval_local_cxl_put_requests=self.interval_local_cxl_put_requests,
+            interval_local_cxl_get_requests=self.interval_local_cxl_get_requests,
+            interval_local_cxl_copy_bytes_dram_to_cxl=self.interval_local_cxl_copy_bytes_dram_to_cxl,
+            interval_local_cxl_copy_bytes_cxl_to_dram=self.interval_local_cxl_copy_bytes_cxl_to_dram,
+            interval_local_hybrid_promote_to_dram_count=self.interval_local_hybrid_promote_to_dram_count,
+            interval_local_hybrid_demote_from_dram_count=self.interval_local_hybrid_demote_from_dram_count,
         )
         self._clear()
         return ret
@@ -716,6 +766,43 @@ class PrometheusLogger:
         self.counter_lookup_0_hit_requests = self._counter_cls(
             name="lmcache:lookup_0_hit_requests",
             documentation="Total number of 0 hit lookup requests",
+            labelnames=labelnames,
+        )
+
+        self.counter_local_cxl_put_requests = self._counter_cls(
+            name="lmcache:local_cxl_put_requests",
+            documentation="Total number of put requests into the local CXL tier",
+            labelnames=labelnames,
+        )
+        self.counter_local_cxl_get_requests = self._counter_cls(
+            name="lmcache:local_cxl_get_requests",
+            documentation="Total number of get requests from the local CXL tier",
+            labelnames=labelnames,
+        )
+        self.counter_local_cxl_copy_bytes_dram_to_cxl = self._counter_cls(
+            name="lmcache:local_cxl_copy_bytes_dram_to_cxl",
+            documentation="Total bytes copied from DRAM staging to local CXL tier",
+            labelnames=labelnames,
+        )
+        self.counter_local_cxl_copy_bytes_cxl_to_dram = self._counter_cls(
+            name="lmcache:local_cxl_copy_bytes_cxl_to_dram",
+            documentation="Total bytes copied from local CXL tier to DRAM staging",
+            labelnames=labelnames,
+        )
+
+        self.counter_local_hybrid_promote_to_dram_count = self._counter_cls(
+            name="lmcache:local_hybrid_promote_to_dram_count",
+            documentation=(
+                "Total number of promotions from capacity tier into DRAM hot cache"
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_local_hybrid_demote_from_dram_count = self._counter_cls(
+            name="lmcache:local_hybrid_demote_from_dram_count",
+            documentation=(
+                "Total number of demotions (evictions) from DRAM hot cache back to "
+                "capacity"
+            ),
             labelnames=labelnames,
         )
 
@@ -1246,6 +1333,32 @@ class PrometheusLogger:
             stats.interval_lookup_0_hit_requests,
         )
 
+        self._log_counter(
+            self.counter_local_cxl_put_requests,
+            stats.interval_local_cxl_put_requests,
+        )
+        self._log_counter(
+            self.counter_local_cxl_get_requests,
+            stats.interval_local_cxl_get_requests,
+        )
+        self._log_counter(
+            self.counter_local_cxl_copy_bytes_dram_to_cxl,
+            stats.interval_local_cxl_copy_bytes_dram_to_cxl,
+        )
+        self._log_counter(
+            self.counter_local_cxl_copy_bytes_cxl_to_dram,
+            stats.interval_local_cxl_copy_bytes_cxl_to_dram,
+        )
+
+        self._log_counter(
+            self.counter_local_hybrid_promote_to_dram_count,
+            stats.interval_local_hybrid_promote_to_dram_count,
+        )
+        self._log_counter(
+            self.counter_local_hybrid_demote_from_dram_count,
+            stats.interval_local_hybrid_demote_from_dram_count,
+        )
+
         self._log_gauge(self.gauge_retrieve_hit_rate, stats.retrieve_hit_rate)
 
         self._log_gauge(self.gauge_lookup_hit_rate, stats.lookup_hit_rate)
@@ -1367,6 +1480,26 @@ class LMCacheStatsLogger:
             stats = self.monitor.get_stats_and_clear()
             self.prometheus_logger.log_prometheus(stats)
             self.lmc_usage_logger.incr_or_send_stats(stats)
+            # Minimal log line for hybrid evaluation (only when active).
+            if (
+                stats.interval_local_cxl_put_requests
+                or stats.interval_local_cxl_get_requests
+                or stats.interval_local_cxl_copy_bytes_dram_to_cxl
+                or stats.interval_local_cxl_copy_bytes_cxl_to_dram
+                or stats.interval_local_hybrid_promote_to_dram_count
+                or stats.interval_local_hybrid_demote_from_dram_count
+            ):
+                logger.info(
+                    "HybridTier: cxl_put=%d cxl_get=%d "
+                    "copy_dram_to_cxl=%dB copy_cxl_to_dram=%dB "
+                    "promote=%d demote=%d",
+                    stats.interval_local_cxl_put_requests,
+                    stats.interval_local_cxl_get_requests,
+                    stats.interval_local_cxl_copy_bytes_dram_to_cxl,
+                    stats.interval_local_cxl_copy_bytes_cxl_to_dram,
+                    stats.interval_local_hybrid_promote_to_dram_count,
+                    stats.interval_local_hybrid_demote_from_dram_count,
+                )
             # Use Event.wait() instead of time.sleep() for interruptible sleep
             # Returns True if event was set, False if timeout occurred
             self.shutdown_event.wait(self.log_interval)

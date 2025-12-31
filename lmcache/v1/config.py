@@ -31,6 +31,41 @@ import lmcache.config as orig_config
 logger = init_logger(__name__)
 
 
+def _to_gb_or_auto(value: Any) -> float:
+    """Parse a GB size or accept 'auto' as a sentinel.
+
+    Returns:
+        float: Parsed GB value. 'auto'/'' maps to 0.0 (treated as auto later).
+    """
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("auto", ""):
+            return 0.0
+        return float(s)
+    return float(value)
+
+
+def _normalize_max_local_cpu_size_gb(max_local_cpu_size: Any) -> float:
+    """Normalize max_local_cpu_size to a positive GB value.
+
+    Policy:
+    - "auto" / 0 / None / omitted => nominal 5.0 GiB
+    - Never return 0
+    """
+    try:
+        gb = _to_gb_or_auto(max_local_cpu_size)
+    except Exception:
+        gb = 0.0
+
+    if gb <= 0:
+        return 5.0
+    return float(gb)
+
+
 # Configuration aliases and deprecated mappings
 _CONFIG_ALIASES = {
     # Maps deprecated names to current names
@@ -68,7 +103,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": True,
         "env_converter": _to_bool,
     },
-    "max_local_cpu_size": {"type": float, "default": 5.0, "env_converter": float},
+    "max_local_cpu_size": {
+        "type": Any,
+        "default": "auto",
+        "env_converter": _to_gb_or_auto,
+    },
     "reserve_local_cpu_size": {"type": float, "default": 0.0, "env_converter": float},
     "local_disk": {
         "type": Optional[str],
@@ -513,6 +552,74 @@ def _validate_config(self):
         assert self.nixl_buffer_size is not None
         assert self.nixl_buffer_device is not None
 
+    # Normalize CPU pool size so we never end up with a 0-byte pool.
+    before = self.max_local_cpu_size
+    self.max_local_cpu_size = _normalize_max_local_cpu_size_gb(self.max_local_cpu_size)
+    if before != self.max_local_cpu_size:
+        logger.info(
+            "LMCache: max_local_cpu_size=%r normalized to %.2f GB",
+            before,
+            self.max_local_cpu_size,
+        )
+
+    # Hybrid/CXL backend config validation (minimal, extra_config-based).
+    extra = self.extra_config or {}
+    local_mem_backend = extra.get("local_memory_backend")
+    if local_mem_backend in ("hybrid", "cxl"):
+        cxl_pool_gb = float(extra.get("cxl_capacity_pool_gb", 0.0) or 0.0)
+        if cxl_pool_gb <= 0:
+            raise ValueError(
+                "hybrid/cxl mode requires extra_config['cxl_capacity_pool_gb'] > 0"
+            )
+
+        has_cxl_selector = any(
+            k in extra
+            for k in (
+                "cxl_numa_node",
+                "gpu_to_cxl_numa_candidates",
+                "socket_to_cxl_numa",
+                "dram_numa_to_cxl_numa",
+            )
+        )
+        if not has_cxl_selector:
+            raise ValueError(
+                "hybrid/cxl mode requires one of: "
+                "extra_config['cxl_numa_node'], "
+                "extra_config['gpu_to_cxl_numa_candidates'], "
+                "extra_config['socket_to_cxl_numa'], "
+                "extra_config['dram_numa_to_cxl_numa']"
+            )
+
+        policy = str(extra.get("cxl_select_policy", "first")).lower()
+        if policy not in ("first", "nearest"):
+            raise ValueError(
+                "extra_config['cxl_select_policy'] must be 'first' or 'nearest'"
+            )
+
+        # Validate hybrid control knobs (best-effort types).
+        for bkey in ("prefer_cxl_on_put", "promote_on_get", "demote_on_pressure"):
+            if bkey in extra and not isinstance(extra[bkey], (bool, int)):
+                raise ValueError(f"extra_config[{bkey!r}] must be a bool")
+        if "dram_hot_cache_max_chunks" in extra:
+            max_chunks = int(extra.get("dram_hot_cache_max_chunks") or 0)
+            if max_chunks < 0:
+                raise ValueError(
+                    "extra_config['dram_hot_cache_max_chunks'] must be >= 0",
+                )
+        if "cxl_serde" in extra:
+            cxl_serde = str(extra.get("cxl_serde") or "naive").strip().lower()
+            if cxl_serde not in ("naive", "cachegen", "kivi"):
+                raise ValueError(
+                    "extra_config['cxl_serde'] must be one of: "
+                    "'naive', 'cachegen', 'kivi'"
+                )
+
+    # Disk-tier policy knobs (best-effort types).
+    if "prefer_local_disk_on_put" in extra and not isinstance(
+        extra["prefer_local_disk_on_put"], (bool, int)
+    ):
+        raise ValueError("extra_config['prefer_local_disk_on_put'] must be a bool")
+
     return self
 
 
@@ -552,6 +659,32 @@ def _get_extra_config_value(self, key, default_value=None):
         return self.extra_config.get(key, default_value)
     else:
         return default_value
+
+
+def _get_hybrid_config(self) -> Dict[str, Any]:
+    """Return normalized hybrid/CXL config derived from extra_config.
+
+    This is intended as a single-source-of-truth helper so that backends don't
+    repeat ad-hoc dict parsing logic.
+    """
+    extra = self.extra_config or {}
+    backend = str(extra.get("local_memory_backend", "")).strip().lower()
+    cxl_pool_gb = float(extra.get("cxl_capacity_pool_gb", 0.0) or 0.0)
+    enabled = backend in ("hybrid", "cxl") and cxl_pool_gb > 0.0
+    dram_hot_cache_max_chunks = int(extra.get("dram_hot_cache_max_chunks", 0) or 0)
+    cxl_serde = str(extra.get("cxl_serde", "naive") or "naive").strip().lower()
+
+    return {
+        "enabled": enabled,
+        "backend": backend,
+        "cxl_capacity_pool_gb": cxl_pool_gb,
+        "cxl_serde": cxl_serde,
+        "cxl_select_policy": str(extra.get("cxl_select_policy", "first")).lower(),
+        "prefer_cxl_on_put": bool(extra.get("prefer_cxl_on_put", False)),
+        "promote_on_get": bool(extra.get("promote_on_get", False)),
+        "demote_on_pressure": bool(extra.get("demote_on_pressure", False)),
+        "dram_hot_cache_max_chunks": dram_hot_cache_max_chunks,
+    }
 
 
 def _get_lmcache_worker_ids(self, use_mla, world_size):
@@ -716,6 +849,7 @@ LMCacheEngineConfig = create_config_class(
         "log_config": _log_config,
         "to_original_config": _to_original_config,
         "get_extra_config_value": _get_extra_config_value,
+        "get_hybrid_config": _get_hybrid_config,
         "get_lmcache_worker_ids": _get_lmcache_worker_ids,
         "get_lookup_server_worker_ids": _get_lookup_server_worker_ids,
         "from_legacy": classmethod(_from_legacy),
