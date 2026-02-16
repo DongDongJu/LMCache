@@ -601,8 +601,8 @@ class NixlStorageBackend(AllocatorBackendInterface, ABC):
     @abstractmethod
     async def batched_get_non_blocking(
         self,
-        lookup_id: str,
         keys: list[CacheEngineKey],
+        lookup_id: str,
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
         pass
@@ -863,6 +863,7 @@ class NixlStaticStorageBackend(NixlStorageBackend):
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
+        transfer_spec: Any = None,
     ) -> List[Optional[MemoryObj]]:
         """
         A blocking function to get the kv cache from the storage backend.
@@ -882,8 +883,8 @@ class NixlStaticStorageBackend(NixlStorageBackend):
 
     async def batched_get_non_blocking(
         self,
-        lookup_id: str,
         keys: list[CacheEngineKey],
+        lookup_id: str,
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
         obj_list = await self.storage_to_mem(keys)
@@ -1335,6 +1336,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
+        transfer_spec: Any = None,
     ) -> List[Optional[MemoryObj]]:
         """
         A blocking function to get the kv cache from the storage backend.
@@ -1349,8 +1351,8 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
 
     async def batched_get_non_blocking(
         self,
-        lookup_id: str,
         keys: list[CacheEngineKey],
+        lookup_id: str,
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
         """

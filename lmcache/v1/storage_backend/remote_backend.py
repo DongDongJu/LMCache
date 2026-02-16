@@ -365,6 +365,7 @@ class RemoteBackend(StorageBackendInterface):
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
+        transfer_spec: Any = None,
     ) -> List[Optional[MemoryObj]]:
         # Check if local_cpu_backend is available (required for memory allocation)
         if self.local_cpu_backend is None:
@@ -515,8 +516,8 @@ class RemoteBackend(StorageBackendInterface):
 
     async def batched_get_non_blocking(
         self,
-        lookup_id: str,
         keys: List[CacheEngineKey],
+        lookup_id: str,
         transfer_spec: Any = None,
     ) -> List[MemoryObj]:
         # Check if local_cpu_backend is available (required for memory allocation)
@@ -536,7 +537,10 @@ class RemoteBackend(StorageBackendInterface):
             # warning, this timeout will not actually stop the
             # scheduler from waiting for the result
             return await asyncio.wait_for(
-                self.connection.batched_get_non_blocking(lookup_id, keys),
+                self.connection.batched_get_non_blocking(
+                    keys,
+                    lookup_id=lookup_id,
+                ),
                 self.blocking_timeout_secs,
             )
         except asyncio.TimeoutError:

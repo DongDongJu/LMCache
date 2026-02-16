@@ -549,8 +549,8 @@ class P2PBackend(StorageBackendInterface):
 
     async def batched_get_non_blocking(
         self,
-        lookup_id: str,
         keys: list[CacheEngineKey],
+        lookup_id: str,
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
         target_peer_init_url, _ = self.lookup_id_to_peer_mapping.pop(lookup_id)

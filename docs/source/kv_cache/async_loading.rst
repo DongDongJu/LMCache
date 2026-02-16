@@ -48,7 +48,7 @@ The following Mermaid sequence diagram illustrates the end-to-end flow:
      SM->>BE: batched_async_contains(lookup_id, keys, pin=True)
      alt prefix hit across tiers
        BE-->>SM: num_hit_chunks (per tier)
-       SM->>BE: batched_get_non_blocking(lookup_id, hit_prefix)
+       SM->>BE: batched_get_non_blocking(hit_prefix, lookup_id, transfer_spec)
        BE-->>SM: Future[List[MemoryObj]]
        SM->>EM: add_event(EventType.LOADING, lookup_id, gather_all)
        SM-->>WS: send_response_to_scheduler(lookup_id, retrieved_length)

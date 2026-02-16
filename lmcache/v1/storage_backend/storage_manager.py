@@ -18,6 +18,7 @@ from typing import (
 import asyncio
 import functools
 import threading
+import uuid
 
 # Third Party
 import torch
@@ -430,7 +431,11 @@ class StorageManager:
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
             ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+            backend.batched_submit_put_task(
+                ks,
+                objs,
+                transfer_spec=transfer_spec,
+            )
 
         for cname, (ks, objs) in obj_dict.items():
             for memory_obj in objs:
@@ -491,7 +496,10 @@ class StorageManager:
         """
         # TODO (ApostaC): remove the nested optional here
         for backend_name, storage_backend in self.get_active_storage_backends(location):
-            memory_objs = storage_backend.batched_get_blocking(keys)
+            memory_objs = storage_backend.batched_get_blocking(
+                keys,
+                transfer_spec=None,
+            )
             if memory_objs:
                 # Align with single-key `get()` logic:
                 # auto-write remote data to local CPU cache
@@ -512,7 +520,11 @@ class StorageManager:
                     # TODO (lisiG9): Refactor this write-back logic into caching
                     #  policy module
                     memory_objs_no_none = cast(List[MemoryObj], memory_objs)
-                    local_cpu_backend.batched_submit_put_task(keys, memory_objs_no_none)
+                    local_cpu_backend.batched_submit_put_task(
+                        keys,
+                        memory_objs_no_none,
+                        transfer_spec=None,
+                    )
                 return memory_objs
         return [None] * len(keys)
 
@@ -535,11 +547,15 @@ class StorageManager:
         """
         if location is None:
             location = "LocalCPUBackend"
-        for keys_multi_chunk in keys:
+        for layer_idx, keys_multi_chunk in enumerate(keys):
             # Retrieve all chunks for one layer
             backend = self.storage_backends[location]
-            # TODO(Jiayi): need to make async loading and layerwise compatible
-            coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
+            lookup_id = f"layerwise-{layer_idx}-{uuid.uuid4()}"
+            coro = backend.batched_get_non_blocking(
+                keys_multi_chunk,
+                lookup_id=lookup_id,
+                transfer_spec=None,
+            )
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
             yield task
 
@@ -713,9 +729,11 @@ class StorageManager:
             # num_hit_chunks is only used for the multi serializer
             get_coro = self.async_serializer.run(
                 backend.batched_get_non_blocking(
-                    lookup_id,
                     backend_keys,
-                    {"cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]},
+                    lookup_id=lookup_id,
+                    transfer_spec={
+                        "cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]
+                    },
                 ),
                 num_hit_chunks,
             )

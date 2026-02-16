@@ -159,8 +159,8 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
 
     async def batched_get_non_blocking(
         self,
-        lookup_id: str,
         keys: list[CacheEngineKey],
+        lookup_id: str,
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
         """
@@ -177,6 +177,7 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
+        transfer_spec: Any = None,
     ) -> List[Optional[MemoryObj]]:
         """
         A blocking function to get the kv cache from the storage backend.
