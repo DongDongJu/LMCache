@@ -133,16 +133,16 @@ class AuditBackend(StorageBackendInterface):
 
     async def batched_get_non_blocking(
         self,
-        keys: list[CacheEngineKey],
         lookup_id: str,
+        keys: list[CacheEngineKey],
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
         start_time = time.perf_counter()
         try:
             result = await self.real_backend.batched_get_non_blocking(
+                lookup_id,
                 keys,
-                lookup_id=lookup_id,
-                transfer_spec=transfer_spec,
+                transfer_spec,
             )
             self._log_operation("BATCHED_GET_NON_BLOCKING", start_time, None, True)
             return result
@@ -194,14 +194,10 @@ class AuditBackend(StorageBackendInterface):
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
-        transfer_spec: Any = None,
     ) -> List[Optional[MemoryObj]]:
         start_time = time.perf_counter()
         try:
-            result = self.real_backend.batched_get_blocking(
-                keys,
-                transfer_spec=transfer_spec,
-            )
+            result = self.real_backend.batched_get_blocking(keys)
             self._log_operation(
                 "BATCHED_GET_BLOCKING",
                 start_time,

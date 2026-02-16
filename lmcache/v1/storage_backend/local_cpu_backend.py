@@ -215,8 +215,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
     async def batched_get_non_blocking(
         self,
-        keys: list[CacheEngineKey],
         lookup_id: str,
+        keys: list[CacheEngineKey],
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
         mem_objs = []

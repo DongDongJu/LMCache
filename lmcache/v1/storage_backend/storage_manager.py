@@ -496,10 +496,7 @@ class StorageManager:
         """
         # TODO (ApostaC): remove the nested optional here
         for backend_name, storage_backend in self.get_active_storage_backends(location):
-            memory_objs = storage_backend.batched_get_blocking(
-                keys,
-                transfer_spec=None,
-            )
+            memory_objs = storage_backend.batched_get_blocking(keys)
             if memory_objs:
                 # Align with single-key `get()` logic:
                 # auto-write remote data to local CPU cache
@@ -552,9 +549,9 @@ class StorageManager:
             backend = self.storage_backends[location]
             lookup_id = f"layerwise-{layer_idx}-{uuid.uuid4()}"
             coro = backend.batched_get_non_blocking(
+                lookup_id,
                 keys_multi_chunk,
-                lookup_id=lookup_id,
-                transfer_spec=None,
+                None,
             )
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
             yield task
@@ -729,11 +726,9 @@ class StorageManager:
             # num_hit_chunks is only used for the multi serializer
             get_coro = self.async_serializer.run(
                 backend.batched_get_non_blocking(
+                    lookup_id,
                     backend_keys,
-                    lookup_id=lookup_id,
-                    transfer_spec={
-                        "cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]
-                    },
+                    {"cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]},
                 ),
                 num_hit_chunks,
             )
