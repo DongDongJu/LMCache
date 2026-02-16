@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from multiprocessing import shared_memory
-from typing import AsyncIterator, List, Optional, Tuple
+from typing import Any, AsyncIterator, List, Optional, Tuple
 import asyncio
 import json
 import time
@@ -909,14 +909,19 @@ class SageMakerHyperPodConnector(RemoteConnector):
         return True
 
     async def _batched_get_non_blocking(
-        self, lookup_id: str, keys: List[CacheEngineKey]
+        self,
+        keys: List[CacheEngineKey],
+        lookup_id: str,
     ) -> List[MemoryObj]:
         """Prefetch multiple keys and filter out None results."""
         results = await self.batched_get(keys)
         return [r for r in results if r is not None]
 
     async def batched_get_non_blocking(
-        self, lookup_id: str, keys: List[CacheEngineKey]
+        self,
+        keys: List[CacheEngineKey],
+        lookup_id: str,
+        transfer_spec: Any = None,
     ) -> List[MemoryObj]:
         """Prefetch multiple keys (queued with priority)."""
         return await self.pq_executor.submit_job(

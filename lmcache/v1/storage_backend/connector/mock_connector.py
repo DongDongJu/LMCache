@@ -5,7 +5,7 @@
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import List, Optional
+from typing import Any, List, Optional
 import asyncio
 
 # First Party
@@ -327,8 +327,9 @@ class MockConnector(RemoteConnector):
 
     async def batched_get_non_blocking(
         self,
-        lookup_id: str,
         keys: List[CacheEngineKey],
+        lookup_id: str,
+        transfer_spec: Any = None,
     ) -> List[MemoryObj]:
         # batched get is already async and the non-blocking element is handled
         # in the StorageManager

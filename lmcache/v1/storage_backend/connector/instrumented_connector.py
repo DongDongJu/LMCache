@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional
+from typing import Any, List, Optional
 import time
 
 # First Party
@@ -113,11 +113,15 @@ class InstrumentedRemoteConnector(RemoteConnector):
 
     async def batched_get_non_blocking(
         self,
-        lookup_id: str,
         keys: List[CacheEngineKey],
+        lookup_id: str,
+        transfer_spec: Any = None,
     ) -> List[MemoryObj]:
         begin = time.perf_counter()
-        memory_objs = await self._connector.batched_get_non_blocking(lookup_id, keys)
+        memory_objs = await self._connector.batched_get_non_blocking(
+            keys,
+            lookup_id=lookup_id,
+        )
         end = time.perf_counter()
         duration = end - begin
 

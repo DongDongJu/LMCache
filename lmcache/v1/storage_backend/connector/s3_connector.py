@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from enum import IntEnum, auto
-from typing import List, Optional
+from typing import Any, List, Optional
 from urllib.parse import quote as url_quote
 import asyncio
 import ctypes
@@ -632,15 +632,18 @@ class S3Connector(RemoteConnector):
 
     async def _batched_get_non_blocking(
         self,
-        lookup_id: str,
         keys: List[CacheEngineKey],
+        lookup_id: str,
     ) -> List[MemoryObj]:
         # batched get is already a coroutine
         result = await self.batched_get(keys)
         return [r for r in result if r is not None]
 
     async def batched_get_non_blocking(
-        self, lookup_id: str, keys: List[CacheEngineKey]
+        self,
+        keys: List[CacheEngineKey],
+        lookup_id: str,
+        transfer_spec: Any = None,
     ) -> List[MemoryObj]:
         return await self.pq_executor.submit_job(
             self._batched_get_non_blocking,

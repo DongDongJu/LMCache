@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional
+from typing import Any, List, Optional
 import abc
 import asyncio
 
@@ -282,8 +282,9 @@ class RemoteConnector(metaclass=abc.ABCMeta):
 
     async def batched_get_non_blocking(
         self,
-        lookup_id: str,
         keys: List[CacheEngineKey],
+        lookup_id: str,
+        transfer_spec: Any = None,
     ) -> List[MemoryObj]:
         """Batched get the memory_objs of the corresponding keys (non-blocking)
 
@@ -294,8 +295,9 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         failure will be returned.
 
         Args:
-            lookup_id: Identifier for this lookup operation
             keys: List of keys to get
+            lookup_id: Identifier for this lookup operation
+            transfer_spec: Optional transfer spec (unused in base implementation)
 
         Returns:
             List of consecutive memory objects from the beginning until the first

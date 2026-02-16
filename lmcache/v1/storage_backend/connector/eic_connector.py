@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from enum import IntEnum, auto
-from typing import List, Optional, Union, no_type_check
+from typing import Any, List, Optional, Union, no_type_check
 import asyncio
 import ctypes
 import os
@@ -710,8 +710,8 @@ class EICConnector(RemoteConnector):
 
     async def _batched_get_non_blocking(
         self,
-        lookup_id: str,
         keys: List[CacheEngineKey],
+        lookup_id: str,
     ) -> List[MemoryObj]:
         # calling self.get will create a circular dependency
         results = await asyncio.gather(*(self._get(key) for key in keys))
@@ -719,8 +719,9 @@ class EICConnector(RemoteConnector):
 
     async def batched_get_non_blocking(
         self,
-        lookup_id: str,
         keys: List[CacheEngineKey],
+        lookup_id: str,
+        transfer_spec: Any = None,
     ) -> List[MemoryObj]:
         if not hasattr(self, "pq_executor") or self.pq_executor is None:
             logger.error("pq_executor is not initialized in EICConnector")
