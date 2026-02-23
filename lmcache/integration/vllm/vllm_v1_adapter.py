@@ -392,7 +392,7 @@ class ReqMeta:
         slot_mapping = slot_mapping.flatten()[: len(token_ids)]
         assert slot_mapping.dtype == torch.long  # TODO: this could be removed
 
-        # For load operation: check whether the request is scheduled to load
+        # For load operation: log if the request is scheduled to load
         if load_spec is not None and load_spec.can_load:
             logger.debug(
                 "Scheduled to load %d tokens (%d cached in vLLM) for request %s",
@@ -400,10 +400,8 @@ class ReqMeta:
                 load_spec.vllm_cached_tokens,
                 tracker.req_id,
             )
-        else:
-            # Do not load if not in `can_load` state
-            load_spec = None
 
+        # Note: We keep load_spec even when can_load=False to pass metrics to worker
         return ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
@@ -491,9 +489,8 @@ class LMCacheConnectorV1Impl:
                     config_key = key[8:]  # Remove "lmcache." prefix
                     if validate_and_set_config_value(config, config_key, value):
                         logger.info(
-                            "Updated config %s from vLLM extra config: %s",
+                            "Updated config %s from vLLM extra config",
                             config_key,
-                            value,
                         )
 
     def _init_connector_state(
@@ -771,12 +768,21 @@ class LMCacheConnectorV1Impl:
         self.layerwise_retrievers = []
 
         for idx, request in enumerate(metadata.requests):
-            if request.load_spec is None:
+            if request.load_spec is None or not request.load_spec.can_load:
                 continue
             last_idx = idx
 
         for idx, request in enumerate(metadata.requests):
-            if request.load_spec is None:
+            # Update metrics for all requests that have a load_spec
+            if request.load_spec is not None:
+                self._stats_monitor.update_interval_vllm_hit_tokens(
+                    request.load_spec.vllm_cached_tokens
+                )
+                self._stats_monitor.update_interval_prompt_tokens(
+                    len(request.token_ids)
+                )
+
+            if request.load_spec is None or not request.load_spec.can_load:
                 continue
 
             tokens = request.token_ids
@@ -856,11 +862,6 @@ class LMCacheConnectorV1Impl:
                         slot_mapping[:lmcache_cached_tokens],
                     )
                     self._invalid_block_ids.update(missing_blocks)
-
-            self._stats_monitor.update_interval_vllm_hit_tokens(
-                request.load_spec.vllm_cached_tokens
-            )
-            self._stats_monitor.update_interval_prompt_tokens(len(tokens))
 
     def record_failed_blocks(
         self,
@@ -1264,9 +1265,11 @@ class LMCacheConnectorV1Impl:
 
         if num_external_hit_tokens is None:
             logger.debug(
-                "Reqid: %s, Total tokens %d, LMCache hit tokens: None.",
+                "Reqid: %s, Total tokens %d, Inference Engine computed tokens: %d, "
+                "LMCache hit tokens: None.",
                 req_id,
                 request.num_tokens,
+                num_computed_tokens,
             )
             return None
 
@@ -1280,13 +1283,34 @@ class LMCacheConnectorV1Impl:
         if num_external_hit_tokens == request.num_tokens:
             need_to_allocate -= 1
 
-        logger.info(
-            "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, need to load: %d",
-            req_id,
-            request.num_tokens,
-            num_external_hit_tokens,
-            need_to_allocate,
-        )
+        # Check if hit tokens meet the minimum for retrieve
+        # If below minimum, skip retrieve but still record hit tokens
+        # for skip_leading_tokens to avoid re-storing existing chunks
+        min_retrieve = self.config.min_retrieve_tokens
+        below_min_retrieve = min_retrieve > 0 and need_to_allocate < min_retrieve
+
+        if below_min_retrieve:
+            logger.info(
+                "Reqid: %s, Total tokens %d, Inference Engine computed tokens: %d, "
+                "LMCache hit tokens: %d, but need to load: %d < min_retrieve %d, "
+                "skip retrieve but record for save skip",
+                req_id,
+                request.num_tokens,
+                num_computed_tokens,
+                num_external_hit_tokens,
+                max(need_to_allocate, 0),
+                min_retrieve,
+            )
+        else:
+            logger.info(
+                "Reqid: %s, Total tokens %d, Inference Engine computed tokens: %d, "
+                "LMCache hit tokens: %d, need to load: %d",
+                req_id,
+                request.num_tokens,
+                num_computed_tokens,
+                num_external_hit_tokens,
+                max(need_to_allocate, 0),
+            )
 
         self.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
@@ -1294,7 +1318,7 @@ class LMCacheConnectorV1Impl:
             can_load=False,
         )
 
-        if need_to_allocate <= 0:
+        if below_min_retrieve or need_to_allocate <= 0:
             return 0
 
         # TODO: Align to vLLM block size. Should test whether it can be removed
