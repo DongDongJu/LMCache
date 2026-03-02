@@ -9,9 +9,17 @@ Provides ``create_l2_adapter`` to instantiate an L2 adapter from its config.
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
+    LocalDiskL2AdapterConfig,
     MockL2AdapterConfig,
+    RustRawBlockL2AdapterConfig,
+)
+from lmcache.v1.distributed.l2_adapters.local_disk_l2_adapter import (
+    LocalDiskL2Adapter,
 )
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import MockL2Adapter
+from lmcache.v1.distributed.l2_adapters.rust_raw_block_l2_adapter import (
+    RustRawBlockL2Adapter,
+)
 
 
 def create_l2_adapter(config: L2AdapterConfigBase) -> L2AdapterInterface:
@@ -31,6 +39,10 @@ def create_l2_adapter(config: L2AdapterConfigBase) -> L2AdapterInterface:
     """
     if isinstance(config, MockL2AdapterConfig):
         return MockL2Adapter(config)
+    if isinstance(config, RustRawBlockL2AdapterConfig):
+        return RustRawBlockL2Adapter(config)
+    if isinstance(config, LocalDiskL2AdapterConfig):
+        return LocalDiskL2Adapter(config)
 
     raise ValueError(
         f"Unknown L2 adapter config type: {type(config).__name__}. "

@@ -20,6 +20,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.native_storage_ops import Bitmap
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.storage_backend.abstract_backend import (
@@ -149,27 +150,28 @@ class RustRawBlockBackend(StoragePluginInterface):
             extra.get("rust_raw_block.meta_verify_on_load", True)
         )
 
-        get_full_chunk_size_bytes = getattr(
-            self.local_cpu_backend, "get_full_chunk_size_bytes", None
-        )
-        if callable(get_full_chunk_size_bytes):
-            full_chunk_bytes = int(get_full_chunk_size_bytes())
+        slot_bytes_override = extra.get("rust_raw_block.slot_bytes", None)
+        if slot_bytes_override is not None:
+            self.slot_bytes = int(slot_bytes_override)
         else:
-            get_full_chunk_size = getattr(
-                self.local_cpu_backend, "get_full_chunk_size", None
+            get_full_chunk_size_bytes = getattr(
+                self.local_cpu_backend, "get_full_chunk_size_bytes", None
             )
-            if not callable(get_full_chunk_size):
-                raise ValueError(
-                    "local_cpu_backend must expose get_full_chunk_size_bytes() "
-                    "or get_full_chunk_size()"
+            if callable(get_full_chunk_size_bytes):
+                full_chunk_bytes = int(get_full_chunk_size_bytes())
+            else:
+                get_full_chunk_size = getattr(
+                    self.local_cpu_backend, "get_full_chunk_size", None
                 )
-            full_chunk_bytes = int(get_full_chunk_size())
-        default_slot_bytes = _round_up(
-            self.header_bytes + full_chunk_bytes, self.block_align
-        )
-        self.slot_bytes: int = int(
-            extra.get("rust_raw_block.slot_bytes", default_slot_bytes)
-        )
+                if not callable(get_full_chunk_size):
+                    raise ValueError(
+                        "local_cpu_backend must expose get_full_chunk_size_bytes() "
+                        "or get_full_chunk_size()"
+                    )
+                full_chunk_bytes = int(get_full_chunk_size())
+            self.slot_bytes = _round_up(
+                self.header_bytes + full_chunk_bytes, self.block_align
+            )
 
         if self.slot_bytes < self.header_bytes + 1:
             raise ValueError("rust_raw_block.slot_bytes too small")
@@ -195,7 +197,7 @@ class RustRawBlockBackend(StoragePluginInterface):
 
         self._lock = threading.Lock()
         self._index: dict[CacheEngineKey, _Entry] = {}
-        self._pinned: set[CacheEngineKey] = set()
+        self._pin_count: dict[CacheEngineKey, int] = {}
         self._inflight: dict[CacheEngineKey, _Inflight] = {}
         self._lru: "OrderedDict[CacheEngineKey, None]" = OrderedDict()
 
@@ -391,24 +393,34 @@ class RustRawBlockBackend(StoragePluginInterface):
 
     def _evict_one(self) -> bool:
         for victim in list(self._lru.keys()):
-            if victim in self._pinned or victim in self._inflight:
+            if victim in self._pin_count or victim in self._inflight:
                 continue
             entry = self._index.pop(victim, None)
             if entry is None:
                 self._lru.pop(victim, None)
                 continue
             self._lru.pop(victim, None)
-            self._pinned.discard(victim)
+            self._pin_count.pop(victim, None)
             self._append_free_slot_locked(self._offset_to_slot(int(entry.offset)))
             self._meta_dirty_total += 1
             return True
         return False
 
+    def _pin_locked(self, key: CacheEngineKey) -> None:
+        self._pin_count[key] = self._pin_count.get(key, 0) + 1
+
+    def _unpin_locked(self, key: CacheEngineKey) -> None:
+        count = self._pin_count.get(key, 0)
+        if count <= 1:
+            self._pin_count.pop(key, None)
+        else:
+            self._pin_count[key] = count - 1
+
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self._lock:
             ok = key in self._index
             if ok and pin:
-                self._pinned.add(key)
+                self._pin_locked(key)
             return ok
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -418,14 +430,14 @@ class RustRawBlockBackend(StoragePluginInterface):
     def pin(self, key: CacheEngineKey) -> bool:
         with self._lock:
             if key in self._index:
-                self._pinned.add(key)
+                self._pin_locked(key)
                 return True
             return False
 
     def unpin(self, key: CacheEngineKey) -> bool:
         with self._lock:
-            if key in self._pinned:
-                self._pinned.remove(key)
+            if key in self._pin_count:
+                self._unpin_locked(key)
                 return True
             return key in self._index
 
@@ -434,7 +446,7 @@ class RustRawBlockBackend(StoragePluginInterface):
             existed = key in self._index or key in self._inflight
             entry = self._index.pop(key, None)
             inflight = self._inflight.get(key)
-            self._pinned.discard(key)
+            self._pin_count.pop(key, None)
             self._lru.pop(key, None)
             if entry is not None:
                 self._append_free_slot_locked(self._offset_to_slot(int(entry.offset)))
@@ -442,6 +454,75 @@ class RustRawBlockBackend(StoragePluginInterface):
             if inflight is not None:
                 inflight.canceled = True
             return existed
+
+    def store_batch_blocking(
+        self,
+        keys: Sequence[CacheEngineKey],
+        src_objs: list[MemoryObj],
+    ) -> bool:
+        """Blocking batch store API used by distributed L2 adapters."""
+        futures = self.batched_submit_put_task(keys, src_objs)
+        if not futures:
+            return True
+        for fut in futures:
+            fut.result()
+        return True
+
+    def lookup_and_lock(self, keys: list[CacheEngineKey]) -> Bitmap:
+        """Lookup keys and increase per-key pin refcount for found entries."""
+        bitmap = Bitmap(len(keys))
+        with self._lock:
+            for idx, key in enumerate(keys):
+                if key in self._index:
+                    bitmap.set(idx)
+                    self._pin_locked(key)
+        return bitmap
+
+    def unlock(self, keys: list[CacheEngineKey]) -> None:
+        """Decrease per-key pin refcount for keys previously locked."""
+        with self._lock:
+            for key in keys:
+                self._unpin_locked(key)
+
+    def load_into_blocking(
+        self,
+        keys: list[CacheEngineKey],
+        dst_objs: list[MemoryObj],
+    ) -> Bitmap:
+        """Blocking batch load API that writes into caller-owned buffers."""
+        if len(keys) != len(dst_objs):
+            raise ValueError(
+                "load_into_blocking requires the same number of keys and buffers"
+            )
+
+        bitmap = Bitmap(len(keys))
+        for idx, (key, dst_obj) in enumerate(zip(keys, dst_objs, strict=False)):
+            src_obj = self.get_blocking(key)
+            if src_obj is None:
+                continue
+
+            src_view = src_obj.byte_array
+            dst_view = dst_obj.byte_array
+            if hasattr(src_view, "cast"):
+                src_view = src_view.cast("B")
+            if hasattr(dst_view, "cast"):
+                dst_view = dst_view.cast("B")
+
+            src_buf = memoryview(src_view).cast("B")
+            dst_buf = memoryview(dst_view).cast("B")
+
+            src_len = len(src_buf)
+            dst_len = len(dst_buf)
+            if dst_len < src_len:
+                src_obj.ref_count_down()
+                continue
+
+            dst_buf[:src_len] = src_buf[:src_len]
+            dst_obj.metadata.cached_positions = src_obj.metadata.cached_positions
+            src_obj.ref_count_down()
+            bitmap.set(idx)
+
+        return bitmap
 
     def batched_submit_put_task(
         self,
@@ -730,7 +811,7 @@ class RustRawBlockBackend(StoragePluginInterface):
                 if k not in self._index:
                     break
                 if pin:
-                    self._pinned.add(k)
+                    self._pin_locked(k)
                 hit += 1
         return hit
 
@@ -1118,7 +1199,7 @@ class RustRawBlockBackend(StoragePluginInterface):
                 if key in self._index:
                     removed_entry = self._index.pop(key)
                 self._lru.pop(key, None)
-                self._pinned.discard(key)
+                self._pin_count.pop(key, None)
                 if removed_entry is not None:
                     self._append_free_slot_locked(
                         self._offset_to_slot(int(removed_entry.offset))

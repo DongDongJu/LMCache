@@ -75,7 +75,7 @@ def update_session_for_key(
         session_manager: The session manager to use.
     """
     session = session_manager.get_or_create(key.request_id)
-    session.set_tokens(list(key.token_ids))
+    session.set_tokens(key.get_token_ids_as_ints())
     session.get_hashes(key.start, key.end)
 
 
@@ -113,6 +113,74 @@ def resolve_key(
     ]
 
 
+def resolve_precomputed_block_hash_keys(
+    key: IPCCacheEngineKey,
+    chunk_size: int,
+    block_size: int,
+) -> list[IPCCacheEngineKey]:
+    """Convert block-hash token_ids to one chunk-hash key per LMCache chunk."""
+    if not key.token_ids:
+        return []
+
+    blocks_in_chunk = max(1, int(chunk_size) // int(block_size))
+    usable = len(key.token_ids) - (len(key.token_ids) % blocks_in_chunk)
+    if usable <= 0:
+        return []
+
+    keys: list[IPCCacheEngineKey] = []
+    for idx in range(blocks_in_chunk - 1, usable, blocks_in_chunk):
+        token = key.token_ids[idx]
+        if isinstance(token, int):
+            chunk_hash = TokenHasher.hash_to_bytes(token)
+        else:
+            chunk_hash = bytes(token)
+        keys.append(
+            IPCCacheEngineKey(
+                model_name=key.model_name,
+                world_size=key.world_size,
+                worker_id=key.worker_id,
+                token_ids=tuple(),
+                start=idx - blocks_in_chunk + 1,
+                end=idx + 1,
+                request_id=key.request_id,
+                chunk_hash=chunk_hash,
+            )
+        )
+    return keys
+
+
+def resolve_ipc_keys(
+    key: IPCCacheEngineKey,
+    session_manager: SessionManager,
+    chunk_size: int,
+    block_size: int,
+) -> list[IPCCacheEngineKey]:
+    """Resolve input key to chunk-hash keys (precomputed or token-based)."""
+    if key.chunk_hash is not None:
+        return [key]
+    if key.token_ids and isinstance(key.token_ids[0], (bytes, bytearray)):
+        return resolve_precomputed_block_hash_keys(
+            key=key, chunk_size=chunk_size, block_size=block_size
+        )
+    update_session_for_key(key, session_manager)
+    return resolve_key(key, session_manager)
+
+
+def get_layout_desc(gpu_context: GPUCacheContext, num_tokens: int) -> MemoryLayoutDesc:
+    """Get the memory layout description for a given GPU context and number of tokens.
+
+    Args:
+        gpu_context: The GPU cache context containing the KV cache information.
+        num_tokens: The number of tokens to determine the layout for.
+
+    Returns:
+        MemoryLayoutDesc: The memory layout description containing shapes and dtypes.
+    """
+    shape = gpu_context.get_kv_buffer_shape(num_tokens)
+    dtype = gpu_context.dtype
+    return MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+
+
 # Main class for the mp cache engine
 class MPCacheEngine:
     def __init__(
@@ -123,6 +191,12 @@ class MPCacheEngine:
     ):
         # GPU ID -> KV cache tensors
         self.gpu_contexts: dict[int, GPUCacheContext] = {}
+
+        # GPU ID -> (model name, world size) as metadata
+        # NOTE: This is mainly for determining the layout desc during prefetch
+        # We assume that if the (model name, world size) is the same, then
+        # the layout desc returned by the gpu context is the same.
+        self.gpu_context_meta: dict[int, tuple[str, int]] = {}
 
         # chunk size
         self.chunk_size = chunk_size
@@ -139,16 +213,25 @@ class MPCacheEngine:
         )
         self.session_manager = SessionManager(self.token_hasher)
 
-    def register_kv_cache(self, instance_id: int, kv_caches: KVCache) -> None:
+    def register_kv_cache(
+        self,
+        instance_id: int,
+        kv_caches: KVCache,
+        model_name: str,
+        world_size: int,
+    ) -> None:
         """
         Registers the KV cache tensors for a given GPU instance ID.
 
         Args:
             instance_id (int): The GPU instance ID (such as PID).
             kv_caches (KVCache): The KV cache tensor wrappers from vLLM.
+            model_name (str): The name of the model associated with this KV cache.
+            world_size (int): The world size associated with this KV cache.
         """
         gpu_context = GPUCacheContext(kv_caches, self.chunk_size)
         self.gpu_contexts[instance_id] = gpu_context
+        self.gpu_context_meta[instance_id] = (model_name, world_size)
         logger.info(
             "Registered KV cache for GPU ID %d with %d layers",
             instance_id,
@@ -164,6 +247,7 @@ class MPCacheEngine:
         """
         if instance_id in self.gpu_contexts:
             del self.gpu_contexts[instance_id]
+            del self.gpu_context_meta[instance_id]
             logger.info("Unregistered KV cache for GPU ID %d", instance_id)
             torch.cuda.empty_cache()
         else:
@@ -192,8 +276,21 @@ class MPCacheEngine:
                 that signals the completion of the store operation. The second
                 element indicates whether the store operation was successful.
         """
-        update_session_for_key(key, self.session_manager)
-        ipc_keys = resolve_key(key, self.session_manager)
+        assert instance_id in self.gpu_contexts, (
+            f"KV cache not registered for GPU ID {instance_id}"
+        )
+        gpu_context = self.gpu_contexts[instance_id]
+
+        ipc_keys = resolve_ipc_keys(
+            key=key,
+            session_manager=self.session_manager,
+            chunk_size=self.chunk_size,
+            block_size=gpu_context.block_size,
+        )
+        if not ipc_keys:
+            event = torch.cuda.Event(interprocess=True)
+            event.record()
+            return event.ipc_handle(), True
 
         st = time.perf_counter()
 
@@ -201,11 +298,6 @@ class MPCacheEngine:
             "Must store with worker_id != None"
         )
         obj_keys = ipc_keys_to_object_keys(ipc_keys)
-
-        assert instance_id in self.gpu_contexts, (
-            f"KV cache not registered for GPU ID {instance_id}"
-        )
-        gpu_context = self.gpu_contexts[instance_id]
 
         with (
             torch.cuda.device(gpu_context.device),
@@ -220,11 +312,7 @@ class MPCacheEngine:
             )
             vllm_event.wait(stream=gpu_context.stream)
 
-            num_tokens = self.chunk_size
-            cpu_shape = gpu_context.get_kv_buffer_shape(num_tokens)
-            layout_desc = MemoryLayoutDesc(
-                shapes=[cpu_shape], dtypes=[gpu_context.dtype]
-            )
+            layout_desc = get_layout_desc(gpu_context, self.chunk_size)
             reserved_dict = self.storage_manager.reserve_write(
                 obj_keys, layout_desc, "new"
             )
@@ -240,7 +328,7 @@ class MPCacheEngine:
                 slot_mapping = slot_mapping_tensor[start:end]
 
                 # Copy from GPU to CPU
-                tmp_buffer = gpu_context.get_tmp_gpu_buffer(num_tokens)
+                tmp_buffer = gpu_context.get_tmp_gpu_buffer(self.chunk_size)
                 with self.lock:
                     lmc_ops.multi_layer_kv_transfer(
                         tmp_buffer,
@@ -294,8 +382,21 @@ class MPCacheEngine:
                 that signals the completion of the retrieve operation. The second
                 element indicates whether the key was successfully retrieved.
         """
-        update_session_for_key(key, self.session_manager)
-        ipc_keys = resolve_key(key, self.session_manager)
+        assert instance_id in self.gpu_contexts, (
+            f"KV cache not registered for GPU ID {instance_id}"
+        )
+        gpu_context = self.gpu_contexts[instance_id]
+
+        ipc_keys = resolve_ipc_keys(
+            key=key,
+            session_manager=self.session_manager,
+            chunk_size=self.chunk_size,
+            block_size=gpu_context.block_size,
+        )
+        if not ipc_keys:
+            event = torch.cuda.Event(interprocess=True)
+            event.record()
+            return event.ipc_handle(), False
 
         st = time.perf_counter()
 
@@ -303,11 +404,6 @@ class MPCacheEngine:
             "Must retrieve with worker_id != None"
         )
         obj_keys = ipc_keys_to_object_keys(ipc_keys)
-
-        assert instance_id in self.gpu_contexts, (
-            f"KV cache not registered for GPU ID {instance_id}"
-        )
-        gpu_context = self.gpu_contexts[instance_id]
 
         def _retrieve_loop(keys: list[ObjectKey], memory_objs: list[MemoryObj]) -> None:
             for idx, (key, memory_obj) in enumerate(
@@ -373,7 +469,7 @@ class MPCacheEngine:
 
     def lookup(
         self,
-        keys: list[IPCCacheEngineKey],
+        key: IPCCacheEngineKey,
     ) -> int:
         """Lookup prefix cache hits for the given keys.
 
@@ -385,13 +481,41 @@ class MPCacheEngine:
             Number of matched chunks (prefix match count).
         """
         ipc_keys: list[IPCCacheEngineKey] = []
-        for key in keys:
-            ipc_keys.extend(key.to_hash_keys(self.token_hasher))
+        model_name, world_size = key.model_name, key.world_size
+
+        # Find the gpu context and calculate the layout desc
+        layout_desc: MemoryLayoutDesc | None = None
+        lookup_block_size: int | None = None
+        for gpu_id, (m_name, w_size) in self.gpu_context_meta.items():
+            if m_name == model_name and w_size == world_size:
+                gpu_ctx = self.gpu_contexts[gpu_id]
+                layout_desc = get_layout_desc(gpu_ctx, self.chunk_size)
+                lookup_block_size = gpu_ctx.block_size
+                break
+
+        if layout_desc is None:
+            logger.error(
+                "No GPU context found for model %s with world size %d during lookup!",
+                model_name,
+                world_size,
+            )
+            return 0
+
+        # Prepare for the obj keys
+        assert lookup_block_size is not None
+        ipc_keys.extend(
+            resolve_ipc_keys(
+                key=key,
+                session_manager=self.session_manager,
+                chunk_size=self.chunk_size,
+                block_size=lookup_block_size,
+            )
+        )
         if not ipc_keys:
             return 0
         obj_keys = ipc_keys_to_object_keys(ipc_keys)
 
-        handle = self.storage_manager.submit_prefetch_task(obj_keys)
+        handle = self.storage_manager.submit_prefetch_task(obj_keys, layout_desc)
         while True:
             found_count = self.storage_manager.query_prefetch_status(handle)
             if found_count is not None:

@@ -159,6 +159,105 @@ class MockL2AdapterConfig(L2AdapterConfigBase):
 
 register_l2_adapter_type("mock", MockL2AdapterConfig)
 
+
+class RustRawBlockL2AdapterConfig(L2AdapterConfigBase):
+    """Config for Rust raw-block L2 adapter."""
+
+    def __init__(
+        self,
+        device_path: str,
+        capacity_bytes: int = 0,
+        use_odirect: bool = True,
+        block_align: int = 4096,
+        header_bytes: int = 4096,
+        meta_total_bytes: int = 128 * 1024 * 1024,
+        meta_enable_periodic: bool = True,
+    ):
+        self.device_path = device_path
+        self.capacity_bytes = capacity_bytes
+        self.use_odirect = use_odirect
+        self.block_align = block_align
+        self.header_bytes = header_bytes
+        self.meta_total_bytes = meta_total_bytes
+        self.meta_enable_periodic = meta_enable_periodic
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RustRawBlockL2AdapterConfig":
+        device_path = d.get("device_path")
+        if not isinstance(device_path, str) or not device_path:
+            raise ValueError("device_path must be a non-empty string")
+
+        capacity_bytes = int(d.get("capacity_bytes", 0))
+        if capacity_bytes < 0:
+            raise ValueError("capacity_bytes must be >= 0")
+
+        block_align = int(d.get("block_align", 4096))
+        header_bytes = int(d.get("header_bytes", 4096))
+        meta_total_bytes = int(d.get("meta_total_bytes", 128 * 1024 * 1024))
+        use_odirect = bool(d.get("use_odirect", True))
+        meta_enable_periodic = bool(d.get("meta_enable_periodic", True))
+
+        return cls(
+            device_path=device_path,
+            capacity_bytes=capacity_bytes,
+            use_odirect=use_odirect,
+            block_align=block_align,
+            header_bytes=header_bytes,
+            meta_total_bytes=meta_total_bytes,
+            meta_enable_periodic=meta_enable_periodic,
+        )
+
+    @classmethod
+    def help(cls) -> str:
+        return (
+            "Rust raw-block L2 adapter config fields:\\n"
+            "- device_path (str): raw block device path (required)\\n"
+            "- capacity_bytes (int): optional capacity cap; 0 means auto\\n"
+            "- use_odirect (bool): use O_DIRECT path (default: true)"
+        )
+
+
+register_l2_adapter_type("rust_raw_block", RustRawBlockL2AdapterConfig)
+
+
+class LocalDiskL2AdapterConfig(L2AdapterConfigBase):
+    """Config for LocalDisk-backed L2 adapter."""
+
+    def __init__(
+        self,
+        path: str,
+        max_size_gb: float,
+        use_odirect: bool = False,
+    ):
+        self.path = path
+        self.max_size_gb = max_size_gb
+        self.use_odirect = use_odirect
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LocalDiskL2AdapterConfig":
+        path = d.get("path")
+        if not isinstance(path, str) or not path:
+            raise ValueError("path must be a non-empty string")
+
+        max_size_gb = d.get("max_size_gb")
+        if not isinstance(max_size_gb, (int, float)) or max_size_gb <= 0:
+            raise ValueError("max_size_gb must be a positive number")
+
+        use_odirect = bool(d.get("use_odirect", False))
+        return cls(path=path, max_size_gb=float(max_size_gb), use_odirect=use_odirect)
+
+    @classmethod
+    def help(cls) -> str:
+        return (
+            "Local disk L2 adapter config fields:\\n"
+            "- path (str): cache directory path (required)\\n"
+            "- max_size_gb (float): max disk usage in GB (required, >0)\\n"
+            "- use_odirect (bool): use O_DIRECT path (default: false)"
+        )
+
+
+register_l2_adapter_type("local_disk", LocalDiskL2AdapterConfig)
+
 # -----------------------------------------------------------------------------
 # Main config: list of adapter configs (order = adapter order)
 # -----------------------------------------------------------------------------

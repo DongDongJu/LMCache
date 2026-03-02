@@ -454,3 +454,87 @@ def test_rust_raw_block_backend_ignores_torn_newer_checkpoint(
             assert out is None
         finally:
             backend2.close()
+
+
+@pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
+def test_rust_raw_block_backend_mp_batch_apis(memory_allocator, loop_in_thread):
+    """Validate store/lookup/load/unlock APIs used by MP L2 adapters."""
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(64 * 1024 * 1024)
+
+        config = LMCacheEngineConfig.from_defaults(
+            chunk_size=256,
+            local_cpu=True,
+            max_local_cpu_size=0.1,
+            lmcache_instance_id="test_rust_raw_block_backend_mp_batch",
+        )
+        config.extra_config = {
+            "rust_raw_block.device_path": dev_path,
+            "rust_raw_block.block_align": 4096,
+            "rust_raw_block.header_bytes": 4096,
+            "rust_raw_block.meta_total_bytes": 4 * 1024 * 1024,
+            "rust_raw_block.meta_enable_periodic": False,
+        }
+        metadata = LMCacheMetadata(
+            model_name="test_model",
+            world_size=1,
+            local_world_size=1,
+            worker_id=0,
+            local_worker_id=0,
+            kv_dtype=torch.bfloat16,
+            kv_shape=(4, 2, 256, 8, 128),
+        )
+
+        local_cpu = LocalCPUBackend(
+            config=config,
+            metadata=metadata,
+            dst_device="cpu",
+            memory_allocator=memory_allocator,
+        )
+
+        backend = RustRawBlockBackend(
+            config=config,
+            metadata=metadata,
+            local_cpu_backend=local_cpu,
+            loop=loop_in_thread,
+            dst_device="cpu",
+        )
+
+        try:
+            alloc = AdHocMemoryAllocator(device="cpu")
+            key = CacheEngineKey("test_model", 1, 0, 9001, torch.bfloat16)
+
+            src = alloc.allocate(
+                [torch.Size([2, 16, 8, 128])], [torch.bfloat16], fmt=MemoryFormat.KV_T2D
+            )
+            assert src is not None and src.tensor is not None
+            src.tensor.fill_(13)
+
+            assert backend.store_batch_blocking([key], [src]) is True
+
+            lookup_bitmap = backend.lookup_and_lock([key])
+            assert lookup_bitmap.test(0)
+
+            dst = alloc.allocate(
+                [torch.Size([2, 16, 8, 128])], [torch.bfloat16], fmt=MemoryFormat.KV_T2D
+            )
+            assert dst is not None
+
+            load_bitmap = backend.load_into_blocking([key], [dst])
+            assert load_bitmap.test(0)
+            assert bytes(dst.byte_array) == bytes(src.byte_array)
+
+            # Two locks (lookup + contains pin) should require two unlocks.
+            assert backend.contains(key, pin=True) is True
+            backend.unlock([key])
+            with backend._lock:
+                assert backend._pin_count.get(key, 0) == 1
+            backend.unlock([key])
+            with backend._lock:
+                assert backend._pin_count.get(key, 0) == 0
+        finally:
+            backend.close()

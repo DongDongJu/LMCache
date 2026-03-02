@@ -180,7 +180,7 @@ class IPCCacheEngineKey:
     world_size: int
     worker_id: int | None
 
-    token_ids: tuple[int, ...]  # frozen tuple for hashability
+    token_ids: tuple[int | bytes, ...]  # frozen tuple for hashability
     start: int
     end: int
 
@@ -188,6 +188,18 @@ class IPCCacheEngineKey:
     request_id: str = field(compare=False)
 
     chunk_hash: bytes | None = None
+
+    def get_token_ids_as_ints(self) -> list[int]:
+        """Normalize token_ids into integers for hashing/session logic."""
+        normalized: list[int] = []
+        for token in self.token_ids:
+            if isinstance(token, int):
+                normalized.append(token)
+            elif isinstance(token, (bytes, bytearray)):
+                normalized.append(int.from_bytes(bytes(token), byteorder="big"))
+            else:
+                raise TypeError(f"Unsupported token id type: {type(token)!r}")
+        return normalized
 
     def to_hash_keys(
         self,
@@ -206,7 +218,7 @@ class IPCCacheEngineKey:
             prefix_hash: Optional int hash to combine with token_ids.
         """
         chunk_hashes = hasher.compute_chunk_hashes(
-            list(self.token_ids), full_chunk_only, prefix_hash
+            self.get_token_ids_as_ints(), full_chunk_only, prefix_hash
         )
         return [
             IPCCacheEngineKey(

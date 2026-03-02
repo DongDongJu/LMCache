@@ -70,17 +70,11 @@ def get_lmcache_chunk_size(
 
 @dataclass
 class LoadStoreOp:
-    token_ids: list[int]
-    """Token IDs for the load/store operation"""
+    block_hashes: list[bytes]
+    """Per-vLLM-block hashes from vLLM scheduler metadata."""
 
     block_ids: list[int]
     """Block ids for the load/store operation"""
-
-    start: int = 0
-    """Start token index"""
-
-    end: int = 0
-    """End token index"""
 
     def __len__(self) -> int:
         return len(self.block_ids)
@@ -118,7 +112,6 @@ class LMCacheMPSchedulerAdapter:
 
         self.model_name = model_name
         self.world_size = world_size
-        self.worker_id = kv_rank
 
         # Read chunk size from lmcache
         self.chunk_size = get_lmcache_chunk_size(self.mq_client)
@@ -131,7 +124,7 @@ class LMCacheMPSchedulerAdapter:
     def maybe_submit_lookup_request(
         self,
         request_id: str,
-        token_ids: list[int],
+        block_hashes: list[bytes],
     ):
         """
         Submit a new lookup request to LMCache if there is no ongoing request.
@@ -139,7 +132,7 @@ class LMCacheMPSchedulerAdapter:
         Args:
             request_id: The ID of the lookup request. The same ID indicates it's
                 from the same request
-            token_ids: Token IDs to lookup from LMCache
+            block_hashes: vLLM block hashes to lookup from LMCache
 
         Returns:
             None
@@ -155,21 +148,19 @@ class LMCacheMPSchedulerAdapter:
             # Skip if there is already a lookup request
             return
 
-        aligned_end = (len(token_ids) // self.chunk_size) * self.chunk_size
+        aligned_blocks = (
+            len(block_hashes) // self.blocks_in_chunk
+        ) * self.blocks_in_chunk
 
-        keys = [
-            self._create_key(
-                token_ids,
-                start=0,
-                end=aligned_end,
-                request_id=request_id,
-            ).no_worker_id_version()
-        ]
+        key = self._create_key(
+            block_hashes[:aligned_blocks],
+            request_id=request_id,
+        ).no_worker_id_version()
 
         future = send_lmcache_request(
             self.mq_client,
             RequestType.LOOKUP,
-            [keys],
+            [key],
         )
         self.lookup_futures[request_id] = future
 
@@ -229,19 +220,19 @@ class LMCacheMPSchedulerAdapter:
     # Helper functions
     def _create_key(
         self,
-        token_ids: list[int],
-        start: int,
-        end: int,
+        block_hashes: list[bytes],
         request_id: str,
     ) -> IPCCacheEngineKey:
-        """Convert token IDs to an IPC cache engine key"""
+        """Convert vLLM block hashes to an IPC cache engine key."""
+        # NOTE: for the scheduler adapter, we don't have a worker id,
+        # so we set it to None in the key.
         return IPCCacheEngineKey(
             model_name=self.model_name,
             world_size=self.world_size,
-            worker_id=self.worker_id,
-            token_ids=tuple(token_ids),
-            start=start,
-            end=end,
+            worker_id=None,
+            token_ids=tuple(block_hashes),
+            start=0,
+            end=len(block_hashes),
             request_id=request_id,
         )
 
@@ -313,7 +304,12 @@ class LMCacheMPWorkerAdapter:
         future = send_lmcache_request(
             self.mq_client,
             RequestType.REGISTER_KV_CACHE,
-            [self.instance_id, wrap_kv_caches(kv_caches)],
+            [
+                self.instance_id,
+                wrap_kv_caches(kv_caches),
+                self.model_name,
+                self.world_size,
+            ],
         )
         future.result()
 
@@ -330,8 +326,8 @@ class LMCacheMPWorkerAdapter:
             event: The CUDA event that is recorded after the current
                 model inference step
         """
-        assert op.token_ids is not None
-        key = self._create_key(op.token_ids, op.start, op.end, request_id=request_id)
+        assert op.block_hashes is not None
+        key = self._create_key(op.block_hashes, request_id=request_id)
         future = send_lmcache_request(
             self.mq_client,
             RequestType.STORE,
@@ -352,8 +348,8 @@ class LMCacheMPWorkerAdapter:
             event: The CUDA event that is recorded after the current
                 model inference step
         """
-        assert op.token_ids is not None
-        key = self._create_key(op.token_ids, op.start, op.end, request_id=request_id)
+        assert op.block_hashes is not None
+        key = self._create_key(op.block_hashes, request_id=request_id)
         future = send_lmcache_request(
             self.mq_client,
             RequestType.RETRIEVE,
@@ -524,18 +520,16 @@ class LMCacheMPWorkerAdapter:
 
     def _create_key(
         self,
-        token_ids: list[int],
-        start: int,
-        end: int,
+        block_hashes: list[bytes],
         request_id: str,
     ) -> IPCCacheEngineKey:
-        """Convert token IDs to an IPC cache engine key"""
+        """Convert vLLM block hashes to an IPC cache engine key."""
         return IPCCacheEngineKey(
             model_name=self.model_name,
             world_size=self.world_size,
             worker_id=self.worker_id,
-            token_ids=tuple(token_ids),
-            start=start,
-            end=end,
+            token_ids=tuple(block_hashes),
+            start=0,
+            end=len(block_hashes),
             request_id=request_id,
         )
