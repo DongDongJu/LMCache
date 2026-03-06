@@ -12,7 +12,11 @@ This module defines the protocol for:
 """
 
 # First Party
-from lmcache.v1.multiprocess.custom_types import IPCCacheEngineKey, KVCache
+from lmcache.v1.multiprocess.custom_types import (
+    IPCCacheEngineKey,
+    KVCache,
+    MAXHashKey,
+)
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
 
 # Define request names for this protocol group
@@ -23,6 +27,9 @@ REQUEST_NAMES = [
     "RETRIEVE",
     "LOOKUP",
     "FREE_LOOKUP_LOCKS",
+    "STORE_MAX_HASHES",
+    "RETRIEVE_MAX_HASHES",
+    "LOOKUP_MAX_HASHES",
     "END_SESSION",
 ]
 
@@ -99,6 +106,34 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         "FREE_LOOKUP_LOCKS": ProtocolDefinition(
             payload_classes=[KeyType],
             response_class=None,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Store MAX hash-addressed payloads (bytes path).
+        # Payload:
+        #   - keys: list[MAXHashKey]
+        #   - payloads: list[bytes]
+        # Returns: bool
+        "STORE_MAX_HASHES": ProtocolDefinition(
+            payload_classes=[list[MAXHashKey], list[bytes]],
+            response_class=bool,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Retrieve MAX hash-addressed payloads (bytes path).
+        # Payload:
+        #   - keys: list[MAXHashKey]
+        # Returns: list[bytes]
+        "RETRIEVE_MAX_HASHES": ProtocolDefinition(
+            payload_classes=[list[MAXHashKey]],
+            response_class=list[bytes],
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Lookup MAX hash-addressed payloads (bytes path).
+        # Payload:
+        #   - keys: list[MAXHashKey]
+        # Returns: int - contiguous prefix hit count
+        "LOOKUP_MAX_HASHES": ProtocolDefinition(
+            payload_classes=[list[MAXHashKey]],
+            response_class=int,
             handler_type=HandlerType.BLOCKING,
         ),
         # End session

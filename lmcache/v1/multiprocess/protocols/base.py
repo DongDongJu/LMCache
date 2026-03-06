@@ -45,6 +45,9 @@ class RequestType(enum.Enum):
     RETRIEVE = enum.auto()
     LOOKUP = enum.auto()
     FREE_LOOKUP_LOCKS = enum.auto()
+    STORE_MAX_HASHES = enum.auto()
+    RETRIEVE_MAX_HASHES = enum.auto()
+    LOOKUP_MAX_HASHES = enum.auto()
     END_SESSION = enum.auto()
 
     # Controller operations

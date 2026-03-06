@@ -45,6 +45,7 @@ from lmcache.v1.multiprocess.config import (
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheEngineKey,
     KVCache,
+    MAXHashKey,
 )
 from lmcache.v1.multiprocess.gpu_context import (
     GPUCacheContext,
@@ -131,6 +132,39 @@ def get_layout_desc(gpu_context: GPUCacheContext, num_tokens: int) -> MemoryLayo
     shape = gpu_context.get_kv_buffer_shape(num_tokens)
     dtype = gpu_context.dtype
     return MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+
+
+def get_bytes_layout_desc(num_bytes: int) -> MemoryLayoutDesc:
+    """Create a bytes-oriented layout descriptor for hash-addressed payloads."""
+    return MemoryLayoutDesc(
+        shapes=[torch.Size([1, 1, 1, num_bytes])],
+        dtypes=[torch.uint8],
+    )
+
+
+def max_hash_key_to_object_key(key: MAXHashKey) -> ObjectKey:
+    """Convert a MAX hash key into distributed storage ObjectKey."""
+    kv_rank = ObjectKey.ComputeKVRank(
+        world_size=key.world_size,
+        global_rank=key.worker_id,
+        local_world_size=key.world_size,
+        local_rank=key.worker_id,
+    )
+    return ObjectKey(
+        chunk_hash=key.chunk_hash_bytes(),
+        model_name=key.model_name,
+        kv_rank=kv_rank,
+    )
+
+
+def wait_prefetch_count(
+    storage_manager: StorageManager, handle: int
+) -> int:
+    """Wait for a prefetch task and return the resolved prefix-hit count."""
+    while True:
+        found_count = storage_manager.query_prefetch_status(handle)
+        if found_count is not None:
+            return int(found_count)
 
 
 # Main class for the mp cache engine
@@ -483,6 +517,112 @@ class MPCacheEngine:
         obj_keys = ipc_keys_to_object_keys(ipc_keys)
         self.storage_manager.finish_read_prefetched(obj_keys)
 
+    def lookup_max_hashes(self, keys: list[MAXHashKey]) -> int:
+        """Lookup contiguous prefix hits for MAX hash-addressed keys."""
+        if not keys:
+            return 0
+
+        obj_keys = [max_hash_key_to_object_key(k) for k in keys]
+        handle = self.storage_manager.submit_prefetch_task(
+            obj_keys, get_bytes_layout_desc(1)
+        )
+        hit_count = wait_prefetch_count(self.storage_manager, handle)
+        if hit_count > 0:
+            # release temporary read locks from lookup path
+            self.storage_manager.finish_read_prefetched(obj_keys[:hit_count])
+        return hit_count
+
+    def store_max_hashes(
+        self,
+        keys: list[MAXHashKey],
+        payloads: list[bytes],
+    ) -> bool:
+        """Store hash-addressed bytes payloads for MAX connector."""
+        if len(keys) != len(payloads):
+            logger.error(
+                "store_max_hashes payload mismatch: %d keys vs %d payloads",
+                len(keys),
+                len(payloads),
+            )
+            return False
+
+        for key, payload in zip(keys, payloads, strict=True):
+            obj_key = max_hash_key_to_object_key(key)
+            layout_desc = get_bytes_layout_desc(len(payload))
+            reserved = self.storage_manager.reserve_write(
+                [obj_key], layout_desc, "new"
+            )
+
+            memory_obj = reserved.get(obj_key)
+            if memory_obj is None:
+                # already exists or cannot reserve now; keep fail-open semantics
+                continue
+
+            tensor = memory_obj.tensor
+            if tensor is None:
+                logger.error("Reserved memory object has no tensor for key: %s", key)
+                continue
+
+            dst = tensor.contiguous().reshape(-1).view(torch.uint8)
+            src = torch.frombuffer(memoryview(payload), dtype=torch.uint8)
+            if dst.numel() != src.numel():
+                logger.error(
+                    "Payload size mismatch for key %s: expected=%d got=%d",
+                    key,
+                    dst.numel(),
+                    src.numel(),
+                )
+                continue
+
+            dst.copy_(src)
+            self.storage_manager.finish_write([obj_key])
+
+        return True
+
+    def retrieve_max_hashes(
+        self,
+        keys: list[MAXHashKey],
+    ) -> list[bytes]:
+        """Retrieve contiguous prefix payloads for MAX hash-addressed keys."""
+        if not keys:
+            return []
+
+        obj_keys = [max_hash_key_to_object_key(k) for k in keys]
+        handle = self.storage_manager.submit_prefetch_task(
+            obj_keys, get_bytes_layout_desc(1)
+        )
+        prefix_hit = wait_prefetch_count(self.storage_manager, handle)
+        if prefix_hit <= 0:
+            return []
+
+        prefetched_keys = obj_keys[:prefix_hit]
+        released_keys: list[ObjectKey] = []
+        payloads: list[bytes] = []
+        try:
+            with self.storage_manager.read_prefetched_results(
+                prefetched_keys
+            ) as memory_objs:
+                if not memory_objs:
+                    return []
+
+                released_keys = prefetched_keys[: len(memory_objs)]
+                for memory_obj in memory_objs:
+                    tensor = memory_obj.tensor
+                    if tensor is None:
+                        return []
+                    payloads.append(
+                        tensor.contiguous()
+                        .reshape(-1)
+                        .view(torch.uint8)
+                        .numpy()
+                        .tobytes()
+                    )
+        finally:
+            if released_keys:
+                self.storage_manager.finish_read_prefetched(released_keys)
+
+        return payloads
+
     # =========================================================================
     # Utility methods
     # =========================================================================
@@ -596,6 +736,21 @@ def run_cache_server(
     add_handler_helper(server, RequestType.LOOKUP, engine.lookup)
     add_handler_helper(server, RequestType.FREE_LOOKUP_LOCKS, engine.free_lookup_locks)
     add_handler_helper(server, RequestType.RETRIEVE, engine.retrieve)
+    add_handler_helper(
+        server,
+        RequestType.STORE_MAX_HASHES,
+        engine.store_max_hashes,
+    )
+    add_handler_helper(
+        server,
+        RequestType.LOOKUP_MAX_HASHES,
+        engine.lookup_max_hashes,
+    )
+    add_handler_helper(
+        server,
+        RequestType.RETRIEVE_MAX_HASHES,
+        engine.retrieve_max_hashes,
+    )
     add_handler_helper(server, RequestType.CLEAR, engine.clear)
     add_handler_helper(server, RequestType.GET_CHUNK_SIZE, engine.get_chunk_size)
     add_handler_helper(server, RequestType.END_SESSION, engine.end_session)
@@ -606,8 +761,7 @@ def run_cache_server(
         mp_config.host,
         mp_config.port,
     )
-    # Start the ZMQ server
-    torch.cuda.init()
+    # Start the ZMQ server. GPU contexts are initialized lazily by workers.
     server.start()
 
     # Start prometheus controller after engine creation (loggers are registered)

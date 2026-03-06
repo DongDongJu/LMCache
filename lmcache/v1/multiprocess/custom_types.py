@@ -259,6 +259,20 @@ class IPCCacheEngineKey:
         )
 
 
+@dataclass(frozen=True)
+class MAXHashKey:
+    """MAX-specific hash-addressed key for LMCache MP bytes transport."""
+
+    model_name: str
+    world_size: int
+    worker_id: int
+    block_hash: int
+
+    def chunk_hash_bytes(self) -> bytes:
+        masked = self.block_hash & ((1 << 64) - 1)
+        return masked.to_bytes(8, byteorder="big", signed=False)
+
+
 # Type exports
 KVCache = list[CudaIPCWrapper]
 
