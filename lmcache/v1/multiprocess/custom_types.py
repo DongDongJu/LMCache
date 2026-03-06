@@ -269,6 +269,7 @@ class MAXHashKey:
     block_hash: int
 
     def chunk_hash_bytes(self) -> bytes:
+        """Return the MAX block hash encoded as the LMCache object-key hash."""
         masked = self.block_hash & ((1 << 64) - 1)
         return masked.to_bytes(8, byteorder="big", signed=False)
 

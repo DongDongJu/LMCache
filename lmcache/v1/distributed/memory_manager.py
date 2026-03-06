@@ -94,6 +94,8 @@ class L1MemoryManager:
             L1Error: Error code indicating the result of the operation.
             It will be `L1Error.SUCCESS` if the operation succeeds.
         """
+        if not mem_objs:
+            return L1Error.SUCCESS
         self._allocator.batched_free(mem_objs)
         return L1Error.SUCCESS
 

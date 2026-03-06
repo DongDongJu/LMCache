@@ -8,6 +8,10 @@ This module defines the protocol for:
 - STORE: Store KV cache blocks to the server
 - RETRIEVE: Retrieve KV cache blocks from the server
 - LOOKUP: Check if keys exist in the cache
+- FREE_LOOKUP_LOCKS: Release lookup-time read locks without retrieving data
+- STORE_MAX_HASHES: Store MAX hash-addressed KV payloads
+- RETRIEVE_MAX_HASHES: Retrieve MAX hash-addressed KV payloads
+- LOOKUP_MAX_HASHES: Look up MAX hash-addressed KV payloads
 - END_SESSION: End a session and clean up associated resources
 """
 

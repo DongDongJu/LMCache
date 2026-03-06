@@ -413,8 +413,8 @@ class MessageQueueServer:
                 self.output_queue.put(frames_to_send)
                 self.output_notifier.send(b"1")
 
-            except Exception as e:
-                logger.error("Error in blocking handler: %s", e)
+            except Exception:
+                logger.exception("Error in blocking handler")
 
         # TODO: HERE'S A BUG: WE CANNOT SEND RESPONSE IN THE FUTURE THREAD
         # BECAUSE THE OUTPUT ZMQ SOCKET IS NOT THREAD-SAFE.

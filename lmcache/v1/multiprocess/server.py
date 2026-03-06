@@ -135,7 +135,14 @@ def get_layout_desc(gpu_context: GPUCacheContext, num_tokens: int) -> MemoryLayo
 
 
 def get_bytes_layout_desc(num_bytes: int) -> MemoryLayoutDesc:
-    """Create a bytes-oriented layout descriptor for hash-addressed payloads."""
+    """Create a bytes-oriented layout descriptor for hash-addressed payloads.
+
+    Args:
+        num_bytes: Size of each payload in bytes.
+
+    Returns:
+        MemoryLayoutDesc describing a single uint8 payload buffer.
+    """
     return MemoryLayoutDesc(
         shapes=[torch.Size([1, 1, 1, num_bytes])],
         dtypes=[torch.uint8],
@@ -143,7 +150,14 @@ def get_bytes_layout_desc(num_bytes: int) -> MemoryLayoutDesc:
 
 
 def max_hash_key_to_object_key(key: MAXHashKey) -> ObjectKey:
-    """Convert a MAX hash key into distributed storage ObjectKey."""
+    """Convert a MAX hash key into the distributed-storage object key format.
+
+    Args:
+        key: MAX hash-addressed key received from the MP protocol.
+
+    Returns:
+        ObjectKey pointing at the corresponding LMCache storage object.
+    """
     kv_rank = ObjectKey.ComputeKVRank(
         world_size=key.world_size,
         global_rank=key.worker_id,
@@ -160,11 +174,38 @@ def max_hash_key_to_object_key(key: MAXHashKey) -> ObjectKey:
 def wait_prefetch_count(
     storage_manager: StorageManager, handle: int
 ) -> int:
-    """Wait for a prefetch task and return the resolved prefix-hit count."""
+    """Wait for a prefetch task and return the resolved prefix-hit count.
+
+    Args:
+        storage_manager: Storage manager that owns the prefetch task.
+        handle: Prefetch handle returned by ``submit_prefetch_task``.
+
+    Returns:
+        The number of contiguous prefix objects reported by the prefetch path.
+    """
     while True:
         found_count = storage_manager.query_prefetch_status(handle)
         if found_count is not None:
             return int(found_count)
+
+
+def resolve_prefetch_count(
+    storage_manager: StorageManager,
+    obj_keys: list[ObjectKey],
+    layout_desc: MemoryLayoutDesc,
+) -> int:
+    """Submit a prefetch request and return the resolved contiguous hit count.
+
+    Args:
+        storage_manager: Storage manager used for prefetch bookkeeping.
+        obj_keys: Object keys to prefetch in prefix order.
+        layout_desc: Layout metadata used by the prefetch controller.
+
+    Returns:
+        The contiguous prefix hit count once the prefetch request completes.
+    """
+    handle = storage_manager.submit_prefetch_task(obj_keys, layout_desc)
+    return wait_prefetch_count(storage_manager, handle)
 
 
 # Main class for the mp cache engine
@@ -476,11 +517,11 @@ class MPCacheEngine:
             return 0
         obj_keys = ipc_keys_to_object_keys(ipc_keys)
 
-        handle = self.storage_manager.submit_prefetch_task(obj_keys, layout_desc)
-        while True:
-            found_count = self.storage_manager.query_prefetch_status(handle)
-            if found_count is not None:
-                break
+        found_count = resolve_prefetch_count(
+            self.storage_manager,
+            obj_keys,
+            layout_desc,
+        )
         # NOTE(Kuntai): this assumes two things:
         # 1. the world size is the same between keys
         # 2. the lookup sort the keys in prefix order and breaks at the first failure
@@ -518,15 +559,23 @@ class MPCacheEngine:
         self.storage_manager.finish_read_prefetched(obj_keys)
 
     def lookup_max_hashes(self, keys: list[MAXHashKey]) -> int:
-        """Lookup contiguous prefix hits for MAX hash-addressed keys."""
+        """Lookup contiguous prefix hits for MAX hash-addressed keys.
+
+        Args:
+            keys: Ordered MAX hash keys describing a request prefix.
+
+        Returns:
+            Number of contiguous prefix payloads already available.
+        """
         if not keys:
             return 0
 
         obj_keys = [max_hash_key_to_object_key(k) for k in keys]
-        handle = self.storage_manager.submit_prefetch_task(
-            obj_keys, get_bytes_layout_desc(1)
+        hit_count = resolve_prefetch_count(
+            self.storage_manager,
+            obj_keys,
+            get_bytes_layout_desc(1),
         )
-        hit_count = wait_prefetch_count(self.storage_manager, handle)
         if hit_count > 0:
             # release temporary read locks from lookup path
             self.storage_manager.finish_read_prefetched(obj_keys[:hit_count])
@@ -537,7 +586,16 @@ class MPCacheEngine:
         keys: list[MAXHashKey],
         payloads: list[bytes],
     ) -> bool:
-        """Store hash-addressed bytes payloads for MAX connector."""
+        """Store hash-addressed bytes payloads for the MAX connector.
+
+        Args:
+            keys: MAX hash keys that identify each stored payload.
+            payloads: Serialized KV payloads aligned with ``keys``.
+
+        Returns:
+            ``True`` after attempting all stores. Individual conflicts are
+            handled with fail-open semantics and logged.
+        """
         if len(keys) != len(payloads):
             logger.error(
                 "store_max_hashes payload mismatch: %d keys vs %d payloads",
@@ -583,15 +641,23 @@ class MPCacheEngine:
         self,
         keys: list[MAXHashKey],
     ) -> list[bytes]:
-        """Retrieve contiguous prefix payloads for MAX hash-addressed keys."""
+        """Retrieve contiguous prefix payloads for MAX hash-addressed keys.
+
+        Args:
+            keys: Ordered MAX hash keys describing a request prefix.
+
+        Returns:
+            Serialized KV payloads for the longest available prefix.
+        """
         if not keys:
             return []
 
         obj_keys = [max_hash_key_to_object_key(k) for k in keys]
-        handle = self.storage_manager.submit_prefetch_task(
-            obj_keys, get_bytes_layout_desc(1)
+        prefix_hit = resolve_prefetch_count(
+            self.storage_manager,
+            obj_keys,
+            get_bytes_layout_desc(1),
         )
-        prefix_hit = wait_prefetch_count(self.storage_manager, handle)
         if prefix_hit <= 0:
             return []
 
