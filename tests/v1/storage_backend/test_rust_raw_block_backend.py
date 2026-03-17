@@ -538,3 +538,212 @@ def test_rust_raw_block_backend_mp_batch_apis(memory_allocator, loop_in_thread):
                 assert backend._pin_count.get(key, 0) == 0
         finally:
             backend.close()
+
+
+@pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
+def test_rust_raw_block_backend_tp4_initialization(memory_allocator, loop_in_thread):
+    """Test TP=4 initialization with per-TP device paths."""
+    TP = 4
+    with tempfile.TemporaryDirectory() as td:
+        device_paths = [os.path.join(td, f"device{i}.bin") for i in range(TP)]
+        for p in device_paths:
+            with open(p, "wb") as f:
+                f.truncate(256 * 1024 * 1024)
+
+        config = LMCacheEngineConfig.from_defaults(
+            chunk_size=256,
+            local_cpu=True,
+            max_local_cpu_size=0.1,
+            lmcache_instance_id="test_rust_raw_block_backend_tp4_init",
+        )
+        config.storage_plugins = []
+        config.extra_config = {
+            "rust_raw_block.per_tp_device_paths": {
+                str(i): device_paths[i] for i in range(TP)
+            },
+            "rust_raw_block.block_align": 4096,
+            "rust_raw_block.header_bytes": 4096,
+            "rust_raw_block.meta_total_bytes": 4 * 1024 * 1024,
+            "rust_raw_block.meta_enable_periodic": False,
+        }
+
+        backends = []
+        try:
+            for i in range(TP):
+                metadata = LMCacheMetadata(
+                    model_name="test-model",
+                    world_size=TP,
+                    local_world_size=TP,
+                    worker_id=i,
+                    local_worker_id=i,
+                    kv_dtype=torch.bfloat16,
+                    kv_shape=(32, 2, 256, 32, 128),
+                )
+                local_cpu = LocalCPUBackend(
+                    config=config,
+                    metadata=metadata,
+                    dst_device="cpu",
+                    memory_allocator=memory_allocator,
+                )
+                be = RustRawBlockBackend(
+                    config=config,
+                    metadata=metadata,
+                    local_cpu_backend=local_cpu,
+                    loop=loop_in_thread,
+                    dst_device="cpu",
+                )
+                backends.append(be)
+                assert be.device_path == device_paths[i]
+            # Verify all device paths are unique
+            assert len({b.device_path for b in backends}) == TP
+        finally:
+            for backend in backends:
+                backend.close()
+
+
+@pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
+def test_rust_raw_block_backend_tp4_comprehensive_io(memory_allocator, loop_in_thread):
+    """Comprehensive TP=4 I/O test covering roundtrip, multiple ops, and isolation."""
+    TP = 4
+    with tempfile.TemporaryDirectory() as td:
+        device_paths = [os.path.join(td, f"device{i}.bin") for i in range(TP)]
+        for p in device_paths:
+            with open(p, "wb") as f:
+                f.truncate(512 * 1024 * 1024)
+
+        config = LMCacheEngineConfig.from_defaults(
+            chunk_size=256,
+            local_cpu=True,
+            max_local_cpu_size=0.1,
+            lmcache_instance_id="test_rust_raw_block_backend_tp4_io",
+        )
+        config.storage_plugins = []
+        config.extra_config = {
+            "rust_raw_block.per_tp_device_paths": {
+                str(i): device_paths[i] for i in range(TP)
+            },
+            "rust_raw_block.capacity_bytes": 0,
+            "rust_raw_block.block_align": 4096,
+            "rust_raw_block.header_bytes": 4096,
+            "rust_raw_block.meta_total_bytes": 4 * 1024 * 1024,
+            "rust_raw_block.meta_enable_periodic": False,
+        }
+
+        backends = []
+        try:
+            # Create all TP backends
+            for i in range(TP):
+                metadata = LMCacheMetadata(
+                    model_name="test-model",
+                    world_size=TP,
+                    local_world_size=TP,
+                    worker_id=i,
+                    local_worker_id=i,
+                    kv_dtype=torch.bfloat16,
+                    kv_shape=(32, 2, 256, 32, 128),
+                )
+                local_cpu = LocalCPUBackend(
+                    config=config,
+                    metadata=metadata,
+                    dst_device="cpu",
+                    memory_allocator=memory_allocator,
+                )
+                be = RustRawBlockBackend(
+                    config=config,
+                    metadata=metadata,
+                    local_cpu_backend=local_cpu,
+                    loop=loop_in_thread,
+                    dst_device="cpu",
+                )
+                backends.append(be)
+
+            # -------------------------------------------------------------------
+            # Part 1: Single put/get roundtrip per TP
+            # -------------------------------------------------------------------
+            allocator = AdHocMemoryAllocator(device="cpu")
+            for tp in range(TP):
+                backend = backends[tp]
+                key = CacheEngineKey("test-model", TP, tp, 1000 + tp, torch.bfloat16)
+                obj = allocator.allocate(
+                    [torch.Size([2, 16, 8, 128])],
+                    [torch.bfloat16],
+                    fmt=MemoryFormat.KV_T2D,
+                )
+                assert obj is not None
+                assert obj.tensor is not None
+                obj.tensor.fill_(tp * 10)
+                expected = bytes(obj.byte_array)
+
+                futs = backend.batched_submit_put_task([key], [obj])
+                assert futs is not None
+                futs[0].result(timeout=10)
+                # Cleanup the input MemoryObj after put
+                obj.ref_count_down()
+
+                out = backend.get_blocking(key)
+                assert out is not None
+                assert bytes(out.byte_array) == expected
+                # Cleanup the output MemoryObj after get
+                out.ref_count_down()
+
+                # Verify isolation - this TP should not see other TPs' data
+                for other in range(TP):
+                    if other == tp:
+                        continue
+                    other_key = CacheEngineKey(
+                        "test-model", TP, other, 1000 + other, torch.bfloat16
+                    )
+                    assert backend.get_blocking(other_key) is None
+
+            # -------------------------------------------------------------------
+            # Part 2: Multiple sequential operations per TP
+            # -------------------------------------------------------------------
+            all_keys = []
+            for tp in range(TP):
+                keys = []
+                for i in range(TP - 1):
+                    allocator = AdHocMemoryAllocator(device="cpu")
+                    obj = allocator.allocate(
+                        [torch.Size([2, 16, 8, 128])],
+                        [torch.bfloat16],
+                        fmt=MemoryFormat.KV_T2D,
+                    )
+                    assert obj is not None
+                    assert obj.tensor is not None
+                    obj.tensor.fill_(tp * 100 + i)
+                    key = CacheEngineKey(
+                        "test-model", TP, tp, tp * 100 + i, torch.bfloat16
+                    )
+                    keys.append(key)
+                    futs = backends[tp].batched_submit_put_task([key], [obj])
+                    assert futs is not None
+                    futs[0].result(timeout=10)
+                    # Cleanup the input MemoryObj after put
+                    obj.ref_count_down()
+                all_keys.append(keys)
+
+            # Verify all data can be retrieved
+            for tp in range(TP):
+                for key in all_keys[tp]:
+                    out = backends[tp].get_blocking(key)
+                    assert out is not None
+                    assert out.tensor is not None
+                    # Cleanup the output MemoryObj after get
+                    out.ref_count_down()
+
+            # -------------------------------------------------------------------
+            # Part 3: Verify TP isolation for all keys
+            # -------------------------------------------------------------------
+            for tp in range(TP):
+                for other in range(TP):
+                    if other == tp:
+                        continue
+                    for key in all_keys[other]:
+                        assert backends[tp].get_blocking(key) is None
+        finally:
+            for backend in backends:
+                backend.close()
