@@ -43,6 +43,7 @@ from lmcache.v1.storage_backend.abstract_backend import (
     StorageBackendInterface,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.sysram_backend import SysRAMBackend
 
 if TYPE_CHECKING:
     # First Party
@@ -64,7 +65,9 @@ def allocate_and_copy_objects(
     allocator_backend: AllocatorBackendInterface,
     keys: Sequence[CacheEngineKey],
     src_memory_objs: list[MemoryObj],
-    stream: torch.cuda.Stream,
+    stream: Optional[torch.cuda.Stream],
+    eviction: bool = True,
+    busy_loop: bool = False,
 ) -> tuple[Sequence[CacheEngineKey], list[MemoryObj]]:
     """
     Allocate the memory objects and copy the data from src_memory_objs to
@@ -82,7 +85,9 @@ def allocate_and_copy_objects(
           that has been successfully allocated
         - list of the memory objects that has been successfully allocated
     """
+    admitted_keys = []
     allocated_objects = []
+    used_stream = False
     for key, src_memory_obj in zip(keys, src_memory_objs, strict=False):
         if allocator_backend.contains(key):
             continue
@@ -90,14 +95,15 @@ def allocate_and_copy_objects(
             src_memory_obj.get_shape(),
             src_memory_obj.get_dtype(),
             fmt=src_memory_obj.meta.fmt,
-            eviction=True,
-            busy_loop=False,
+            eviction=eviction,
+            busy_loop=busy_loop,
         )
 
         if memory_obj is None:
             break
 
-        if memory_obj.tensor is None:
+        dst_tensor = memory_obj.raw_tensor
+        if dst_tensor is None:
             # This should not happen with current implementation,
             # but handle it defensively to avoid memory leak
             logger.warning(
@@ -107,12 +113,30 @@ def allocate_and_copy_objects(
             memory_obj.ref_count_down()
             break
 
-        with torch.cuda.stream(stream):
-            memory_obj.tensor.copy_(src_memory_obj.tensor, non_blocking=True)
+        src_tensor = src_memory_obj.raw_tensor
+        if src_tensor is None:
+            logger.warning(
+                "Source MemoryObj has None tensor, releasing the allocated object."
+            )
+            memory_obj.ref_count_down()
+            break
+
+        copy_size = src_memory_obj.get_size()
+        dst_view = dst_tensor[:copy_size]
+        src_view = src_tensor[:copy_size]
+
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                dst_view.copy_(src_view, non_blocking=True)
+            used_stream = True
+        else:
+            dst_view.copy_(src_view, non_blocking=False)
+        admitted_keys.append(key)
         allocated_objects.append(memory_obj)
 
-    stream.synchronize()
-    return keys[: len(allocated_objects)], allocated_objects
+    if used_stream:
+        stream.synchronize()
+    return admitted_keys, allocated_objects
 
 
 class WeightedSemaphore:
@@ -318,6 +342,20 @@ class StorageManager:
         assert isinstance(allocator_backend, AllocatorBackendInterface)
         return allocator_backend
 
+    def _get_sysram_backend(self) -> Optional[SysRAMBackend]:
+        backend = self.storage_backends.get("SysRAMBackend")
+        if isinstance(backend, SysRAMBackend):
+            return backend
+        return None
+
+    def _should_use_sysram_tiering(self) -> bool:
+        return (
+            not self.enable_pd
+            and self.metadata.role != "scheduler"
+            and self._get_sysram_backend() is not None
+            and self.local_cpu_backend is not None
+        )
+
     @_lmcache_nvtx_annotate
     def allocate(
         self,
@@ -334,6 +372,27 @@ class StorageManager:
         # TODO (Jiayi): We might need to pre-allocate and management
         # disk in a similar way as CPU.
         assert self.allocator_backend is not None
+        if self._should_use_sysram_tiering():
+            assert self.local_cpu_backend is not None
+            sysram_backend = self._get_sysram_backend()
+            assert sysram_backend is not None
+
+            memory_obj = self.local_cpu_backend.allocate(
+                shapes,
+                dtypes,
+                fmt,
+                eviction=False,
+                busy_loop=busy_loop,
+            )
+            if memory_obj is not None:
+                return memory_obj
+            return sysram_backend.allocate(
+                shapes,
+                dtypes,
+                fmt,
+                eviction=eviction,
+                busy_loop=busy_loop,
+            )
         return self.allocator_backend.allocate(
             shapes, dtypes, fmt, eviction=eviction, busy_loop=busy_loop
         )
@@ -356,6 +415,29 @@ class StorageManager:
         # disk in a similar way as CPU.
         if self.allocator_backend is None:
             raise RuntimeError("Allocator backend not available for scheduler role")
+        if self._should_use_sysram_tiering():
+            assert self.local_cpu_backend is not None
+            sysram_backend = self._get_sysram_backend()
+            assert sysram_backend is not None
+
+            memory_objs = self.local_cpu_backend.batched_allocate(
+                shapes,
+                dtypes,
+                batch_size,
+                fmt,
+                eviction=False,
+                busy_loop=busy_loop,
+            )
+            if memory_objs is not None:
+                return memory_objs
+            return sysram_backend.batched_allocate(
+                shapes,
+                dtypes,
+                batch_size,
+                fmt,
+                eviction=eviction,
+                busy_loop=busy_loop,
+            )
         return self.allocator_backend.batched_allocate(
             shapes, dtypes, batch_size, fmt, eviction=eviction, busy_loop=busy_loop
         )
@@ -375,6 +457,82 @@ class StorageManager:
             "StorageManager.put is deprecated and should not be called anymore"
         )
 
+    def _batched_put_with_sysram(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        transfer_spec: Any = None,
+    ) -> None:
+        assert self.local_cpu_backend is not None
+        sysram_backend = self._get_sysram_backend()
+        assert sysram_backend is not None
+
+        local_cpu_keys: list[CacheEngineKey] = []
+        local_cpu_objs: list[MemoryObj] = []
+        sysram_keys: list[CacheEngineKey] = []
+        sysram_objs: list[MemoryObj] = []
+
+        sysram_allocator = sysram_backend.get_memory_allocator()
+        for key, memory_obj in zip(keys, memory_objs, strict=False):
+            if self.local_cpu_backend.contains(key) or sysram_backend.contains(key):
+                continue
+
+            if memory_obj.parent() is sysram_allocator:
+                sysram_keys.append(key)
+                sysram_objs.append(memory_obj)
+            else:
+                local_cpu_keys.append(key)
+                local_cpu_objs.append(memory_obj)
+
+        if local_cpu_keys:
+            self.local_cpu_backend.batched_submit_put_task(
+                local_cpu_keys,
+                local_cpu_objs,
+                transfer_spec=transfer_spec,
+            )
+        if sysram_keys:
+            sysram_backend.batched_submit_put_task(
+                sysram_keys,
+                sysram_objs,
+                transfer_spec=transfer_spec,
+            )
+
+        copied_obj_dict: dict[
+            str,
+            tuple[Sequence[CacheEngineKey], list[MemoryObj]],
+        ] = {}
+        for backend_name, backend in self.storage_backends.items():
+            if backend_name in ["LocalCPUBackend", "SysRAMBackend"]:
+                continue
+
+            with self._bypass_lock:
+                if backend_name in self._bypassed_backends:
+                    continue
+
+            allocator_backend = backend.get_allocator_backend()
+            if allocator_backend in [self.local_cpu_backend, sysram_backend]:
+                ks = keys
+                objs = memory_objs
+            else:
+                cname = get_backend_cname(allocator_backend)
+                if cname not in copied_obj_dict:
+                    new_keys, new_objs = allocate_and_copy_objects(
+                        allocator_backend,
+                        keys,
+                        memory_objs,
+                        self.internal_copy_stream,
+                    )
+                    copied_obj_dict[cname] = (new_keys, new_objs)
+                ks, objs = copied_obj_dict[cname]
+
+            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+
+        for memory_obj in memory_objs:
+            memory_obj.ref_count_down()
+        for _, objs in copied_obj_dict.values():
+            for memory_obj in objs:
+                memory_obj.ref_count_down()
+
     def batched_put(
         self,
         keys: Sequence[CacheEngineKey],
@@ -388,6 +546,14 @@ class StorageManager:
         Do not store if the same object is being stored (handled here by
         storage manager) or has been stored (handled by storage backend).
         """
+        if location is None and self._should_use_sysram_tiering():
+            self._batched_put_with_sysram(
+                keys,
+                memory_objs,
+                transfer_spec=transfer_spec,
+            )
+            return
+
         # The dictionary from backend cname to objects and keys
         obj_dict: dict[
             str,
@@ -442,7 +608,7 @@ class StorageManager:
             memory_obj = backend.get_blocking(key)
             if memory_obj:
                 if (
-                    backend_name not in ["LocalCPUBackend", "PDBackend"]
+                    backend_name not in ["LocalCPUBackend", "PDBackend", "SysRAMBackend"]
                     and "LocalCPUBackend" in self.storage_backends
                 ):
                     local_cpu_backend = self.storage_backends["LocalCPUBackend"]
@@ -486,7 +652,7 @@ class StorageManager:
                 # Align with single-key `get()` logic:
                 # auto-write remote data to local CPU cache
                 if (
-                    backend_name not in ["LocalCPUBackend", "PDBackend"]
+                    backend_name not in ["LocalCPUBackend", "PDBackend", "SysRAMBackend"]
                     and "LocalCPUBackend" in self.storage_backends
                     and None not in memory_objs
                 ):
@@ -978,7 +1144,11 @@ class StorageManager:
 
     def touch_cache(self):
         for backend_name, backend in self.storage_backends.items():
-            if backend_name == "LocalCPUBackend" or backend_name == "LocalDiskBackend":
+            if backend_name in [
+                "LocalCPUBackend",
+                "LocalDiskBackend",
+                "SysRAMBackend",
+            ]:
                 backend.touch_cache()
 
     def remove(

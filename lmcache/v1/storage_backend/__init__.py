@@ -168,6 +168,27 @@ def CreateStorageBackends(
         else:
             logger.info("No cpu memory is allocated as max_local_cpu_size <= 0")
 
+    sysram_backend_config = config.get_sysram_backend_config()
+    if (
+        metadata.role != "scheduler"
+        and sysram_backend_config["enabled"]
+        and "SysRAMBackend" not in _skip
+    ):
+        assert local_cpu_backend is not None, (
+            "SysRAM backend requires LocalCPUBackend for hot-cache hits and "
+            "retrieval staging."
+        )
+        # First Party
+        from lmcache.v1.storage_backend.sysram_backend import SysRAMBackend
+
+        sysram_backend = SysRAMBackend(
+            config=config,
+            metadata=metadata,
+            local_cpu_backend=local_cpu_backend,
+            dst_device=dst_device,
+        )
+        storage_backends[str(sysram_backend)] = sysram_backend
+
     if config.enable_p2p and "P2PBackend" not in _skip:
         assert local_cpu_backend is not None
         assert lmcache_worker is not None

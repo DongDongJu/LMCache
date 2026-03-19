@@ -542,6 +542,7 @@ def _validate_config(self):
     enable_nixl_storage = self.extra_config is not None and self.extra_config.get(
         "enable_nixl_storage"
     )
+    sysram_backend_config = self.get_sysram_backend_config()
     if self.enable_pd:
         assert self.pd_role is not None
         assert self.pd_buffer_size is not None
@@ -584,6 +585,14 @@ def _validate_config(self):
         assert self.nixl_buffer_size is not None
         assert self.nixl_buffer_device is not None
 
+    if sysram_backend_config["enabled"]:
+        if not self.local_cpu:
+            raise ValueError("sysram_backend requires local_cpu=True")
+        if self.max_local_cpu_size <= 0:
+            raise ValueError(
+                "sysram_backend requires max_local_cpu_size to be greater than 0"
+            )
+
     return self
 
 
@@ -605,6 +614,63 @@ def _get_extra_config_value(self, key, default_value=None):
         return self.extra_config.get(key, default_value)
     else:
         return default_value
+
+
+def _get_sysram_backend_config(self) -> dict[str, Any]:
+    raw_config = self.get_extra_config_value("sysram_backend", None)
+    if raw_config is None:
+        return {
+            "enabled": False,
+            "pools": [],
+            "promote_on_get": False,
+        }
+
+    if not isinstance(raw_config, dict):
+        raise ValueError("extra_config['sysram_backend'] must be a dictionary")
+
+    enabled = bool(raw_config.get("enabled", False))
+    promote_on_get = bool(raw_config.get("promote_on_get", False))
+    raw_pools = raw_config.get("pools", [])
+    if raw_pools is None:
+        raw_pools = []
+    if not isinstance(raw_pools, list):
+        raise ValueError("sysram_backend.pools must be a list")
+
+    pools = []
+    for idx, pool in enumerate(raw_pools):
+        if not isinstance(pool, dict):
+            raise ValueError(f"sysram_backend.pools[{idx}] must be a dictionary")
+        if "numa_node" not in pool or "size_gb" not in pool:
+            raise ValueError(
+                f"sysram_backend.pools[{idx}] must contain numa_node and size_gb"
+            )
+
+        numa_node = int(pool["numa_node"])
+        size_gb = float(pool["size_gb"])
+        if numa_node < 0:
+            raise ValueError(
+                f"sysram_backend.pools[{idx}].numa_node must be >= 0, got {numa_node}"
+            )
+        if size_gb <= 0:
+            raise ValueError(
+                f"sysram_backend.pools[{idx}].size_gb must be > 0, got {size_gb}"
+            )
+
+        pools.append(
+            {
+                "numa_node": numa_node,
+                "size_gb": size_gb,
+            }
+        )
+
+    if enabled and not pools:
+        raise ValueError("sysram_backend.enabled=True requires at least one pool")
+
+    return {
+        "enabled": enabled,
+        "pools": pools,
+        "promote_on_get": promote_on_get,
+    }
 
 
 def _get_lmcache_worker_ids(self, use_mla, world_size):
@@ -764,6 +830,7 @@ LMCacheEngineConfig = create_config_class(
         "validate": _validate_config,
         "log_config": _log_config,
         "get_extra_config_value": _get_extra_config_value,
+        "get_sysram_backend_config": _get_sysram_backend_config,
         "get_lmcache_worker_ids": _get_lmcache_worker_ids,
         "get_lookup_server_worker_ids": _get_lookup_server_worker_ids,
         "from_legacy": classmethod(_from_legacy),
