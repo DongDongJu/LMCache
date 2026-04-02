@@ -41,6 +41,15 @@ def _round_up(x: int, align: int) -> int:
     return ((x + align - 1) // align) * align
 
 
+def _validate_per_tp_device_paths(per_tp_devices: Any) -> None:
+    """Validate per-TP device mapping and enforce unique paths."""
+    values = list(per_tp_devices.values())
+    if len(values) != len(set(values)):
+        raise ValueError(
+            "Duplicate device path configured in rust_raw_block.per_tp_device_paths"
+        )
+
+
 @dataclass
 class _Entry:
     """In-memory index entry for a stored chunk."""
@@ -121,6 +130,7 @@ class RustRawBlockBackend(StoragePluginInterface):
                     "For TP > 1, rust_raw_block.per_tp_device_paths is required. "
                     "Each TP worker must have an explicit device path configured."
                 )
+            _validate_per_tp_device_paths(per_tp_devices)
 
             # Use explicit per-TP device paths from config
             tp_rank_str = str(tp_rank)
@@ -136,7 +146,7 @@ class RustRawBlockBackend(StoragePluginInterface):
             )
         else:
             # TP=1: use single device path
-            self.device_path: str = extra.get("rust_raw_block.device_path", "")
+            self.device_path = extra.get("rust_raw_block.device_path", "")
             if not self.device_path:
                 raise ValueError(
                     "extra_config['rust_raw_block.device_path'] is required"
@@ -1178,6 +1188,21 @@ class RustRawBlockBackend(StoragePluginInterface):
                         pin_count=0,
                     )
                     self._index[key] = _Entry(offset=offset, size=size, meta=meta)
+
+            if self.metadata is not None and self._index:
+                first_loaded_key = next(iter(self._index))
+                expected_worker_id = int(self.metadata.worker_id)
+                loaded_worker_id = int(first_loaded_key.worker_id)
+                if loaded_worker_id != expected_worker_id:
+                    logger.warning(
+                        "RustRawBlockBackend: loaded metadata may belong to another "
+                        "worker (device=%s, current_worker_id=%d, "
+                        "first_entry_worker_id=%d, first_entry_key=%s)",
+                        self.device_path,
+                        expected_worker_id,
+                        loaded_worker_id,
+                        first_loaded_key.to_string(),
+                    )
 
             # Remove free-slot entries that overlap with loaded index slots.
             used_slots = {
