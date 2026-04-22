@@ -1,0 +1,290 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Standard
+import os
+import select
+import tempfile
+
+# Third Party
+import pytest
+import torch
+
+# First Party
+from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.internal_api import L2AdapterListener
+from lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter import (
+    RawBlockL2Adapter,
+    RawBlockL2AdapterConfig,
+)
+from lmcache.v1.memory_management import (
+    MemoryFormat,
+    MemoryObjMetadata,
+    TensorMemoryObj,
+)
+
+
+def _has_ext() -> bool:
+    try:
+        # Third Party
+        import lmcache_rust_raw_block_io  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
+
+
+class _RecordingListener(L2AdapterListener):
+    def __init__(self):
+        self.stored: list[list[ObjectKey]] = []
+        self.accessed: list[list[ObjectKey]] = []
+        self.deleted: list[list[ObjectKey]] = []
+
+    def on_l2_keys_stored(self, keys: list[ObjectKey]):
+        self.stored.append(list(keys))
+
+    def on_l2_keys_accessed(self, keys: list[ObjectKey]):
+        self.accessed.append(list(keys))
+
+    def on_l2_keys_deleted(self, keys: list[ObjectKey]):
+        self.deleted.append(list(keys))
+
+
+def _create_object_key(chunk_id: int, model_name: str = "test_model") -> ObjectKey:
+    return ObjectKey(
+        chunk_hash=ObjectKey.IntHash2Bytes(chunk_id),
+        model_name=model_name,
+        kv_rank=0,
+    )
+
+
+def _create_memory_obj(size: int = 1024, fill_value: float = 0.0) -> TensorMemoryObj:
+    raw_data = torch.empty(size, dtype=torch.float32)
+    raw_data.fill_(fill_value)
+    metadata = MemoryObjMetadata(
+        shape=torch.Size([size]),
+        dtype=torch.float32,
+        address=0,
+        phy_size=size * 4,
+        fmt=MemoryFormat.KV_2LTD,
+        ref_count=1,
+    )
+    return TensorMemoryObj(raw_data, metadata, parent_allocator=None)
+
+
+def _wait_event_fd(event_fd: int, timeout: float = 5.0) -> bool:
+    poll = select.poll()
+    poll.register(event_fd, select.POLLIN)
+    events = poll.poll(timeout * 1000)
+    if events:
+        try:
+            os.eventfd_read(event_fd)
+        except BlockingIOError:
+            pass
+        return True
+    return False
+
+
+def _make_config(
+    device_path: str,
+    *,
+    slot_bytes: int = 64 * 1024,
+    capacity_bytes: int = 0,
+) -> RawBlockL2AdapterConfig:
+    return RawBlockL2AdapterConfig(
+        device_path=device_path,
+        slot_bytes=slot_bytes,
+        capacity_bytes=capacity_bytes,
+        use_odirect=False,
+        block_align=4096,
+        header_bytes=4096,
+        meta_total_bytes=1 * 1024 * 1024,
+        meta_enable_periodic=False,
+        num_store_workers=2,
+        num_lookup_workers=1,
+        num_load_workers=2,
+    )
+
+
+def _run_store(adapter: RawBlockL2Adapter, keys, objects) -> bool:
+    task_id = adapter.submit_store_task(keys, objects)
+    assert _wait_event_fd(adapter.get_store_event_fd())
+    completed = adapter.pop_completed_store_tasks()
+    assert task_id in completed
+    return completed[task_id]
+
+
+def _run_lookup(adapter: RawBlockL2Adapter, keys):
+    task_id = adapter.submit_lookup_and_lock_task(keys)
+    assert _wait_event_fd(adapter.get_lookup_and_lock_event_fd())
+    return task_id, adapter.query_lookup_and_lock_result(task_id)
+
+
+def _run_load(adapter: RawBlockL2Adapter, keys, objects):
+    task_id = adapter.submit_load_task(keys, objects)
+    assert _wait_event_fd(adapter.get_load_event_fd())
+    return task_id, adapter.query_load_result(task_id)
+
+
+def test_raw_block_l2_adapter_store_lookup_load_roundtrip():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        adapter = RawBlockL2Adapter(_make_config(dev_path))
+        try:
+            key1 = _create_object_key(1)
+            key_miss = _create_object_key(2)
+            key3 = _create_object_key(3)
+            obj1 = _create_memory_obj(fill_value=1.0)
+            obj3 = _create_memory_obj(fill_value=3.0)
+
+            assert _run_store(adapter, [key1, key3], [obj1, obj3]) is True
+
+            lookup_task_id, lookup_bitmap = _run_lookup(
+                adapter,
+                [key1, key_miss, key3],
+            )
+            assert lookup_bitmap is not None
+            assert lookup_bitmap.get_indices_list() == [0, 2]
+            assert adapter.query_lookup_and_lock_result(lookup_task_id) is None
+
+            load_buffers = [
+                _create_memory_obj(fill_value=0.0),
+                _create_memory_obj(fill_value=0.0),
+                _create_memory_obj(fill_value=0.0),
+            ]
+            load_task_id, load_bitmap = _run_load(
+                adapter,
+                [key1, key_miss, key3],
+                load_buffers,
+            )
+            assert load_bitmap is not None
+            assert load_bitmap.get_indices_list() == [0, 2]
+            assert adapter.query_load_result(load_task_id) is None
+            assert torch.equal(load_buffers[0].tensor, obj1.tensor)
+            assert torch.equal(load_buffers[2].tensor, obj3.tensor)
+            assert torch.count_nonzero(load_buffers[1].tensor) == 0
+
+            adapter.submit_unlock([key1, key_miss, key3])
+        finally:
+            adapter.close()
+
+
+def test_raw_block_l2_adapter_delete_respects_lock_until_unlock():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        adapter = RawBlockL2Adapter(_make_config(dev_path))
+        try:
+            key = _create_object_key(11)
+            obj = _create_memory_obj(fill_value=11.0)
+            assert _run_store(adapter, [key], [obj]) is True
+
+            _, bitmap = _run_lookup(adapter, [key])
+            assert bitmap is not None
+            assert bitmap.get_indices_list() == [0]
+
+            adapter.delete([key])
+            _, still_present = _run_lookup(adapter, [key])
+            assert still_present is not None
+            assert still_present.get_indices_list() == [0]
+            adapter.submit_unlock([key, key])
+
+            adapter.delete([key])
+            _, after_delete = _run_lookup(adapter, [key])
+            assert after_delete is not None
+            assert after_delete.get_indices_list() == []
+            adapter.submit_unlock([key])
+        finally:
+            adapter.close()
+
+
+def test_raw_block_l2_adapter_listeners_usage_and_internal_eviction():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        slot_bytes = 64 * 1024
+        capacity_bytes = (1 * 1024 * 1024) + slot_bytes
+        adapter = RawBlockL2Adapter(
+            _make_config(
+                dev_path,
+                slot_bytes=slot_bytes,
+                capacity_bytes=capacity_bytes,
+            )
+        )
+        listener = _RecordingListener()
+        adapter.register_listener(listener)
+
+        try:
+            key1 = _create_object_key(21)
+            key2 = _create_object_key(22)
+            obj1 = _create_memory_obj(fill_value=21.0)
+            obj2 = _create_memory_obj(fill_value=22.0)
+
+            assert _run_store(adapter, [key1], [obj1]) is True
+            assert _run_store(adapter, [key2], [obj2]) is True
+
+            assert listener.stored[0] == [key1]
+            assert listener.deleted[-1] == [key1]
+            assert listener.stored[-1] == [key2]
+
+            current_usage, usage_after = adapter.get_usage()
+            assert current_usage > 0.0
+            assert usage_after == current_usage
+
+            status = adapter.report_status()
+            assert status["is_healthy"] is True
+            assert status["type"] == "RawBlockL2Adapter"
+            assert status["core"]["usable_capacity_bytes"] == slot_bytes
+
+            _, bitmap1 = _run_lookup(adapter, [key1])
+            assert bitmap1 is not None
+            assert bitmap1.get_indices_list() == []
+            _, bitmap2 = _run_lookup(adapter, [key2])
+            assert bitmap2 is not None
+            assert bitmap2.get_indices_list() == [0]
+            adapter.submit_unlock([key1, key2])
+        finally:
+            adapter.close()
+
+
+def test_raw_block_l2_adapter_recovery_from_checkpoint():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        config = _make_config(dev_path)
+        key = _create_object_key(31)
+        obj = _create_memory_obj(fill_value=31.0)
+
+        adapter1 = RawBlockL2Adapter(config)
+        try:
+            assert _run_store(adapter1, [key], [obj]) is True
+        finally:
+            adapter1.close()
+
+        adapter2 = RawBlockL2Adapter(config)
+        try:
+            _, lookup_bitmap = _run_lookup(adapter2, [key])
+            assert lookup_bitmap is not None
+            assert lookup_bitmap.get_indices_list() == [0]
+
+            load_buffer = _create_memory_obj(fill_value=0.0)
+            _, load_bitmap = _run_load(adapter2, [key], [load_buffer])
+            assert load_bitmap is not None
+            assert load_bitmap.get_indices_list() == [0]
+            assert torch.equal(load_buffer.tensor, obj.tensor)
+            adapter2.submit_unlock([key])
+        finally:
+            adapter2.close()
