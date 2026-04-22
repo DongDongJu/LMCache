@@ -1,6 +1,37 @@
 # LMCache Rust Raw Block I/O
 
-This crate provides raw block I/O for LMCache via Rust + PyO3.
+This crate provides the low-level raw device I/O layer for LMCache via Rust +
+PyO3. It is used by both:
+
+- the legacy non-MP `RustRawBlockBackend`
+- the MP `raw_block` L2 adapter (`RawBlockL2Adapter`) via `RawBlockCore`
+
+The Rust crate intentionally stays narrow: it owns the raw device handle and
+exposes blocking `pwrite_from_buffer` / `pread_into` primitives. Slotting,
+checkpointing, recovery, and MP task orchestration all live in Python.
+
+## MP Mode Integration
+
+In MP mode, the stack looks like this:
+
+```text
+StoreController / PrefetchController
+                |
+                v
+        RawBlockL2Adapter
+                |
+                v
+           RawBlockCore
+                |
+                v
+         lmcache_rust_raw_block_io
+                |
+                v
+         raw device / file
+```
+
+This split lets LMCache reuse the same on-device metadata and recovery model in
+both non-MP and MP mode without duplicating the raw-block implementation.
 
 ## What Changed vs `origin/dev`
 
@@ -209,3 +240,35 @@ dev.wait_iouring(batch_id)
 
 dev.close()
 ```
+
+## MP Adapter Example
+
+To use the MP adapter from `lmcache server`, pass a `raw_block` L2 adapter
+config:
+
+```bash
+lmcache server \
+  --l1-size-gb 10 \
+  --eviction-policy LRU \
+  --l1-align-bytes 4096 \
+  --l2-adapter '{
+    "type": "raw_block",
+    "device_path": "/dev/nvme0n1",
+    "slot_bytes": 1048576,
+    "block_align": 4096,
+    "header_bytes": 4096,
+    "meta_total_bytes": 268435456,
+    "use_odirect": true,
+    "num_store_workers": 2,
+    "num_lookup_workers": 1,
+    "num_load_workers": 4
+  }'
+```
+
+Notes:
+
+- `device_path` should point to an unmounted raw block device or a dedicated
+  file used only by LMCache.
+- With `use_odirect=true`, LMCache MP L1 alignment must be at least
+  `block_align`.
+- Restart recovery uses the metadata checkpoint region on the same device.
