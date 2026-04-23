@@ -283,6 +283,7 @@ class RawBlockCore:
         encoded_keys: Sequence[str],
         *,
         lock: bool = False,
+        skip_locked: set[str] | None = None,
     ) -> list[DiskCacheMetadata]:
         """Return leading-hit metadata and optionally lock those entries.
 
@@ -290,6 +291,8 @@ class RawBlockCore:
             encoded_keys: Ordered encoded raw-block keys to inspect.
             lock: If true, increment L2 lock refcounts for every returned
                 metadata entry while holding the index lock.
+            skip_locked: Encoded keys that are already protected by the caller
+                and should not receive an additional lock refcount.
 
         Returns:
             Metadata for the contiguous leading hit prefix. The returned list
@@ -302,7 +305,7 @@ class RawBlockCore:
                 if entry is None:
                     break
                 metas.append(entry.meta)
-                if lock:
+                if lock and (skip_locked is None or encoded_key not in skip_locked):
                     self._lock_refcnt[encoded_key] = (
                         self._lock_refcnt.get(encoded_key, 0) + 1
                     )
@@ -394,8 +397,10 @@ class RawBlockCore:
                 break
 
             with self._lock:
-                if key.encoded in self._index or key.encoded in self._inflight:
+                if key.encoded in self._index:
                     results[i] = True
+                    continue
+                if key.encoded in self._inflight:
                     continue
 
                 while True:
