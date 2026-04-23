@@ -350,6 +350,73 @@ def test_rust_raw_block_backend_pin_and_contains_are_idempotent(
 @pytest.mark.skipif(
     not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
 )
+def test_rust_raw_block_backend_close_is_thread_safe(memory_allocator, loop_in_thread):
+    """Concurrent close calls should not double-clean raw-block resources."""
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(64 * 1024 * 1024)
+
+        config = LMCacheEngineConfig.from_defaults(
+            chunk_size=256,
+            local_cpu=True,
+            max_local_cpu_size=0.1,
+            lmcache_instance_id="test_rust_raw_block_backend_concurrent_close",
+        )
+        config.storage_plugins = []
+        config.extra_config = {
+            "rust_raw_block.device_path": dev_path,
+            "rust_raw_block.block_align": 4096,
+            "rust_raw_block.header_bytes": 4096,
+            "rust_raw_block.meta_total_bytes": 4 * 1024 * 1024,
+            "rust_raw_block.meta_enable_periodic": False,
+        }
+        metadata = LMCacheMetadata(
+            model_name="test_model",
+            world_size=1,
+            local_world_size=1,
+            worker_id=0,
+            local_worker_id=0,
+            kv_dtype=torch.bfloat16,
+            kv_shape=(4, 2, 256, 8, 128),
+        )
+        local_cpu = LocalCPUBackend(
+            config=config,
+            metadata=metadata,
+            dst_device="cpu",
+            memory_allocator=memory_allocator,
+        )
+        backend = RustRawBlockBackend(
+            config=config,
+            metadata=metadata,
+            local_cpu_backend=local_cpu,
+            loop=loop_in_thread,
+            dst_device="cpu",
+        )
+
+        errors: list[BaseException] = []
+        errors_lock = threading.Lock()
+
+        def close_backend() -> None:
+            try:
+                backend.close()
+            except BaseException as e:
+                with errors_lock:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=close_backend) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert errors == []
+        backend.close()
+
+
+@pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
 def test_rust_raw_block_backend_batched_get_resets_inflight_on_rawdev_error(
     memory_allocator, loop_in_thread
 ):

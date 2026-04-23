@@ -667,8 +667,10 @@ class RawBlockCore:
 
     def close(self) -> None:
         """Stop checkpointing, write a final checkpoint, and close the device."""
-        if self._closed:
-            return
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
 
         self._meta_stop_evt.set()
         if self._meta_thread is not None:
@@ -689,8 +691,6 @@ class RawBlockCore:
                 )
             finally:
                 self._raw = None
-
-        self._closed = True
 
     def _cleanup_after_init_failure(self) -> None:
         """Close resources that may have been opened before init failed."""
