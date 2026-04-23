@@ -45,6 +45,14 @@ from lmcache.v1.storage_backend.raw_block import (
 
 logger = init_logger(__name__)
 
+RawBlockStoreTaskResult = tuple[
+    bool,
+    list[ObjectKey],
+    list[int],
+    list[ObjectKey],
+    list[int],
+]
+
 
 def _make_bitmap(size: int) -> "Bitmap":
     # First Party
@@ -542,7 +550,22 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self,
         keys: list[ObjectKey],
         objects: list[MemoryObj],
-    ) -> tuple[bool, list[ObjectKey], list[int], list[ObjectKey], list[int]]:
+    ) -> RawBlockStoreTaskResult:
+        """Persist one submitted store batch in the worker pool.
+
+        Args:
+            keys: Object keys submitted for storage.
+            objects: Payload buffers aligned with ``keys``.
+
+        Returns:
+            A 5-tuple containing:
+
+            - task success for the whole batch
+            - newly stored object keys
+            - byte sizes aligned with the newly stored keys
+            - object keys evicted by raw-block internal recycling
+            - byte sizes aligned with the evicted keys
+        """
         specs = [encode_object_key(key) for key in keys]
         put_result = self._core.put_many(specs, objects)
         stored_encoded = set(put_result.stored_keys)
@@ -576,7 +599,11 @@ class RawBlockL2Adapter(L2AdapterInterface):
             evicted_sizes,
         )
 
-    def _finish_store_task(self, task_id: L2TaskId, future: Future[Any]) -> None:
+    def _finish_store_task(
+        self,
+        task_id: L2TaskId,
+        future: Future[RawBlockStoreTaskResult],
+    ) -> None:
         success = False
         stored_keys: list[ObjectKey] = []
         stored_sizes: list[int] = []
