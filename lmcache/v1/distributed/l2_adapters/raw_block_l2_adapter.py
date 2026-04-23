@@ -52,6 +52,8 @@ def _make_bitmap(size: int) -> "Bitmap":
 
 
 class RawBlockL2AdapterConfig(L2AdapterConfigBase):
+    """Configuration object for the built-in raw-block MP L2 adapter."""
+
     def __init__(
         self,
         *,
@@ -74,6 +76,29 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         num_load_workers: int = 4,
         internal_eviction_policy: str = "lru",
     ):
+        """Initialize raw-block MP adapter configuration.
+
+        Args:
+            device_path: Raw device path or pre-sized file path used for L2.
+            slot_bytes: Fixed data-slot size in bytes.
+            capacity_bytes: Optional cap on usable bytes; zero uses device size.
+            use_odirect: Whether to open the raw path with O_DIRECT.
+            block_align: Required block alignment in bytes.
+            header_bytes: Per-slot header reservation in bytes.
+            meta_total_bytes: Reserved metadata checkpoint region size.
+            meta_magic: Eight-byte ASCII metadata checkpoint magic.
+            meta_version: Metadata checkpoint version.
+            meta_checkpoint_interval_sec: Periodic checkpoint interval.
+            meta_idle_quiet_ms: Quiet period before periodic checkpoints.
+            meta_enable_periodic: Whether to run the checkpoint thread.
+            meta_verify_on_load: Whether recovery verifies slot headers.
+            enable_zero_copy: Whether to use aligned direct-buffer I/O.
+            num_store_workers: Number of store worker threads.
+            num_lookup_workers: Number of lookup worker threads.
+            num_load_workers: Number of load worker threads.
+            internal_eviction_policy: Internal slot-reuse policy. PR1 supports
+                only ``"lru"``.
+        """
         self.device_path = device_path
         self.slot_bytes = int(slot_bytes)
         self.capacity_bytes = int(capacity_bytes)
@@ -95,11 +120,14 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
 
     @classmethod
     def from_dict(cls, d: dict) -> "RawBlockL2AdapterConfig":
+        """Build and validate a raw-block config from ``--l2-adapter`` JSON."""
         device_path = d.get("device_path")
         if not isinstance(device_path, str) or not device_path:
             raise ValueError("device_path must be a non-empty string")
         if "per_tp_device_paths" in d:
-            raise ValueError("per_tp_device_paths is not supported in MP raw_block mode")
+            raise ValueError(
+                "per_tp_device_paths is not supported in MP raw_block mode"
+            )
         if not bool(d.get("persist_enabled", True)):
             raise ValueError("raw_block requires persist_enabled=true")
 
@@ -129,8 +157,13 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         if internal_eviction_policy != "lru":
             raise ValueError("internal_eviction_policy must be 'lru' in PR1")
 
-        for field_name in ("num_store_workers", "num_lookup_workers", "num_load_workers"):
-            value = int(d.get(field_name, 1 if field_name == "num_lookup_workers" else 2))
+        worker_defaults = {
+            "num_store_workers": 2,
+            "num_lookup_workers": 1,
+            "num_load_workers": 4,
+        }
+        for field_name, default in worker_defaults.items():
+            value = int(d.get(field_name, default))
             if value <= 0:
                 raise ValueError(f"{field_name} must be > 0")
 
@@ -144,9 +177,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             meta_total_bytes=meta_total_bytes,
             meta_magic=str(d.get("meta_magic", "LMCIDX01")),
             meta_version=int(d.get("meta_version", 1)),
-            meta_checkpoint_interval_sec=int(
-                d.get("meta_checkpoint_interval_sec", 60)
-            ),
+            meta_checkpoint_interval_sec=int(d.get("meta_checkpoint_interval_sec", 60)),
             meta_idle_quiet_ms=int(d.get("meta_idle_quiet_ms", 100)),
             meta_enable_periodic=bool(d.get("meta_enable_periodic", True)),
             meta_verify_on_load=bool(d.get("meta_verify_on_load", True)),
@@ -159,22 +190,30 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
 
     @classmethod
     def help(cls) -> str:
+        """Return human-readable raw-block adapter configuration help."""
         return (
             "raw_block L2 adapter config fields:\n"
             "- device_path (str): raw device or file path (required)\n"
-            "- slot_bytes (int): slot size in bytes, aligned to block_align (required)\n"
-            "- capacity_bytes (int): optional usable capacity cap (default 0 = device size)\n"
+            "- slot_bytes (int): slot size in bytes, aligned to block_align "
+            "(required)\n"
+            "- capacity_bytes (int): optional usable capacity cap "
+            "(default 0 = device size)\n"
             "- use_odirect (bool): enable O_DIRECT raw I/O (default true)\n"
             "- block_align (int): required block alignment in bytes (default 4096)\n"
             "- header_bytes (int): per-slot header reservation (default 4096)\n"
-            "- meta_total_bytes (int): reserved metadata checkpoint region (default 256MiB)\n"
+            "- meta_total_bytes (int): reserved metadata checkpoint region "
+            "(default 256MiB)\n"
             "- meta_magic (str): 8-byte metadata magic (default LMCIDX01)\n"
             "- meta_version (int): metadata version (default 1)\n"
-            "- meta_checkpoint_interval_sec (int): periodic checkpoint interval (default 60)\n"
+            "- meta_checkpoint_interval_sec (int): periodic checkpoint interval "
+            "(default 60)\n"
             "- meta_idle_quiet_ms (int): quiet period before checkpoint (default 100)\n"
-            "- meta_enable_periodic (bool): enable periodic checkpointing (default true)\n"
-            "- meta_verify_on_load (bool): validate slot headers on recovery (default true)\n"
-            "- enable_zero_copy (bool): use aligned direct buffers when possible (default true)\n"
+            "- meta_enable_periodic (bool): enable periodic checkpointing "
+            "(default true)\n"
+            "- meta_verify_on_load (bool): validate slot headers on recovery "
+            "(default true)\n"
+            "- enable_zero_copy (bool): use aligned direct buffers when possible "
+            "(default true)\n"
             "- num_store_workers (int): store worker threads (default 2)\n"
             "- num_lookup_workers (int): lookup worker threads (default 1)\n"
             "- num_load_workers (int): load worker threads (default 4)\n"
@@ -182,6 +221,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         )
 
     def to_core_config(self) -> RawBlockCoreConfig:
+        """Convert this adapter config to the shared RawBlockCore config."""
         return RawBlockCoreConfig(
             device_path=self.device_path,
             capacity_bytes=self.capacity_bytes,
@@ -201,11 +241,29 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
 
 
 class RawBlockL2Adapter(L2AdapterInterface):
+    """MP L2 adapter that persists KV objects into raw-block slots."""
+
     def __init__(
         self,
         config: RawBlockL2AdapterConfig,
         l1_memory_desc: "Optional[L1MemoryDesc]" = None,
     ):
+        """Initialize the MP raw-block L2 adapter.
+
+        Args:
+            config: Validated raw-block adapter configuration.
+            l1_memory_desc: Optional L1 allocation descriptor used to validate
+                O_DIRECT alignment compatibility.
+
+        Raises:
+            ValueError: If O_DIRECT is enabled and L1 alignment is insufficient.
+            RuntimeError: If the shared core cannot open or recover the raw
+                device.
+
+        Notes:
+            Resources created before an initialization failure are closed before
+            the exception is re-raised.
+        """
         super().__init__()
         if (
             config.use_odirect
@@ -216,28 +274,40 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 "raw_block requires l1_align_bytes >= block_align when use_odirect=true"
             )
 
-        self._core = RawBlockCore(config.to_core_config(), key_namespace="object")
+        self._closed = False
+        self._core = None
+        self._store_efd = -1
+        self._lookup_efd = -1
+        self._load_efd = -1
+        self._store_pool = None
+        self._lookup_pool = None
+        self._load_pool = None
 
-        self._store_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
-        self._lookup_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
-        self._load_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        try:
+            self._core = RawBlockCore(config.to_core_config(), key_namespace="object")
 
-        self._store_pool = ThreadPoolExecutor(
-            max_workers=config.num_store_workers,
-            thread_name_prefix="rawblk-store",
-        )
-        self._lookup_pool = ThreadPoolExecutor(
-            max_workers=config.num_lookup_workers,
-            thread_name_prefix="rawblk-lookup",
-        )
-        self._load_pool = ThreadPoolExecutor(
-            max_workers=config.num_load_workers,
-            thread_name_prefix="rawblk-load",
-        )
+            self._store_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+            self._lookup_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+            self._load_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+
+            self._store_pool = ThreadPoolExecutor(
+                max_workers=config.num_store_workers,
+                thread_name_prefix="rawblk-store",
+            )
+            self._lookup_pool = ThreadPoolExecutor(
+                max_workers=config.num_lookup_workers,
+                thread_name_prefix="rawblk-lookup",
+            )
+            self._load_pool = ThreadPoolExecutor(
+                max_workers=config.num_load_workers,
+                thread_name_prefix="rawblk-load",
+            )
+        except Exception:
+            self._cleanup_after_init_failure()
+            raise
 
         self._lock = threading.Lock()
         self._next_task_id: L2TaskId = 0
-        self._closed = False
 
         self._completed_store_tasks: dict[L2TaskId, bool] = {}
         self._completed_lookup_tasks: dict[L2TaskId, Bitmap] = {}
@@ -248,12 +318,15 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._load_inflight_tasks: int = 0
 
     def get_store_event_fd(self) -> int:
+        """Return the eventfd signaled when store tasks complete."""
         return self._store_efd
 
     def get_lookup_and_lock_event_fd(self) -> int:
+        """Return the eventfd signaled when lookup-and-lock tasks complete."""
         return self._lookup_efd
 
     def get_load_event_fd(self) -> int:
+        """Return the eventfd signaled when load tasks complete."""
         return self._load_efd
 
     def submit_store_task(
@@ -261,39 +334,84 @@ class RawBlockL2Adapter(L2AdapterInterface):
         keys: list[ObjectKey],
         objects: list[MemoryObj],
     ) -> L2TaskId:
+        """Submit a non-blocking raw-block store task.
+
+        Args:
+            keys: Object keys to persist.
+            objects: Memory objects containing payloads for ``keys``.
+
+        Returns:
+            Task ID that can be observed through ``pop_completed_store_tasks``.
+
+        Raises:
+            ValueError: If either list is empty or the lengths differ.
+        """
+        if not keys or not objects:
+            raise ValueError("keys and objects must be non-empty")
         if len(keys) != len(objects):
             raise ValueError("keys and objects must have the same length")
 
         with self._lock:
+            self._raise_if_closed_locked()
             task_id = self._get_next_task_id_locked()
             self._store_inflight_tasks += 1
-        future = self._store_pool.submit(self._run_store_task, list(keys), list(objects))
+        try:
+            future = self._store_pool.submit(
+                self._run_store_task, list(keys), list(objects)
+            )
+        except Exception:
+            with self._lock:
+                self._store_inflight_tasks -= 1
+            raise
         future.add_done_callback(
             lambda fut, task_id=task_id: self._finish_store_task(task_id, fut)
         )
         return task_id
 
     def pop_completed_store_tasks(self) -> dict[L2TaskId, bool]:
+        """Drain and return completed store task results."""
         with self._lock:
             completed = self._completed_store_tasks
             self._completed_store_tasks = {}
         return completed
 
     def submit_lookup_and_lock_task(self, keys: list[ObjectKey]) -> L2TaskId:
+        """Submit a non-blocking lookup-and-lock task.
+
+        Args:
+            keys: Object keys to look up in raw-block L2.
+
+        Returns:
+            Task ID whose bitmap can be queried with
+            ``query_lookup_and_lock_result``.
+
+        Raises:
+            ValueError: If ``keys`` is empty.
+        """
+        if not keys:
+            raise ValueError("keys must be non-empty")
         with self._lock:
+            self._raise_if_closed_locked()
             task_id = self._get_next_task_id_locked()
             self._lookup_inflight_tasks += 1
-        future = self._lookup_pool.submit(self._run_lookup_task, list(keys))
+        try:
+            future = self._lookup_pool.submit(self._run_lookup_task, list(keys))
+        except Exception:
+            with self._lock:
+                self._lookup_inflight_tasks -= 1
+            raise
         future.add_done_callback(
             lambda fut, task_id=task_id: self._finish_lookup_task(task_id, fut)
         )
         return task_id
 
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
+        """Return and remove a completed lookup bitmap if available."""
         with self._lock:
             return self._completed_lookup_tasks.pop(task_id, None)
 
     def submit_unlock(self, keys: list[ObjectKey]) -> None:
+        """Release L2 locks acquired by lookup-and-lock."""
         encoded_keys = [encode_object_key(key).encoded for key in keys]
         self._core.unlock_many(encoded_keys)
 
@@ -302,23 +420,47 @@ class RawBlockL2Adapter(L2AdapterInterface):
         keys: list[ObjectKey],
         objects: list[MemoryObj],
     ) -> L2TaskId:
+        """Submit a non-blocking raw-block load task.
+
+        Args:
+            keys: Object keys to load.
+            objects: Caller-provided destination buffers.
+
+        Returns:
+            Task ID whose bitmap can be queried with ``query_load_result``.
+
+        Raises:
+            ValueError: If either list is empty or the lengths differ.
+        """
+        if not keys or not objects:
+            raise ValueError("keys and objects must be non-empty")
         if len(keys) != len(objects):
             raise ValueError("keys and objects must have the same length")
 
         with self._lock:
+            self._raise_if_closed_locked()
             task_id = self._get_next_task_id_locked()
             self._load_inflight_tasks += 1
-        future = self._load_pool.submit(self._run_load_task, list(keys), list(objects))
+        try:
+            future = self._load_pool.submit(
+                self._run_load_task, list(keys), list(objects)
+            )
+        except Exception:
+            with self._lock:
+                self._load_inflight_tasks -= 1
+            raise
         future.add_done_callback(
             lambda fut, task_id=task_id: self._finish_load_task(task_id, fut)
         )
         return task_id
 
     def query_load_result(self, task_id: L2TaskId) -> Bitmap | None:
+        """Return and remove a completed load bitmap if available."""
         with self._lock:
             return self._completed_load_tasks.pop(task_id, None)
 
     def delete(self, keys: list[ObjectKey]) -> None:
+        """Delete keys from raw-block L2 and notify listeners for removals."""
         encoded_keys = [encode_object_key(key).encoded for key in keys]
         deleted_bitmap = self._core.delete_many(encoded_keys, force=False)
         deleted_keys = [
@@ -328,9 +470,11 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._notify_keys_deleted(deleted_keys)
 
     def get_usage(self) -> tuple[float, float]:
+        """Return current and projected raw-block usage fractions."""
         return self._core.usage()
 
     def close(self) -> None:
+        """Wait for worker pools, close the core, and close eventfds."""
         if self._closed:
             return
         self._closed = True
@@ -346,6 +490,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
         os.close(self._load_efd)
 
     def report_status(self) -> dict:
+        """Return adapter health, task counters, and core status."""
         core_status = self._core.report_status()
         with self._lock:
             return {
@@ -360,6 +505,10 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 "core": core_status,
             }
 
+    def _raise_if_closed_locked(self) -> None:
+        if self._closed:
+            raise RuntimeError("RawBlockL2Adapter is closed")
+
     def _get_next_task_id_locked(self) -> L2TaskId:
         task_id = self._next_task_id
         self._next_task_id += 1
@@ -372,8 +521,11 @@ class RawBlockL2Adapter(L2AdapterInterface):
     ) -> tuple[bool, list[ObjectKey], list[ObjectKey]]:
         specs = [encode_object_key(key) for key in keys]
         put_result = self._core.put_many(specs, objects)
+        stored_encoded = set(put_result.stored_keys)
         stored_keys = [
-            key for key, ok in zip(keys, put_result.results, strict=False) if ok
+            key
+            for key, spec in zip(keys, specs, strict=False)
+            if spec.encoded in stored_encoded
         ]
         evicted_keys = [
             decode_object_key(encoded_key) for encoded_key in put_result.evicted_keys
@@ -451,6 +603,26 @@ class RawBlockL2Adapter(L2AdapterInterface):
             os.eventfd_write(event_fd, 1)
         except OSError:
             logger.debug("eventfd %d was closed before signaling", event_fd)
+
+    def _cleanup_after_init_failure(self) -> None:
+        for pool_name in ("_store_pool", "_lookup_pool", "_load_pool"):
+            pool = getattr(self, pool_name, None)
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+                setattr(self, pool_name, None)
+
+        core = getattr(self, "_core", None)
+        if core is not None:
+            core.close()
+            self._core = None
+
+        for fd_name in ("_store_efd", "_lookup_efd", "_load_efd"):
+            fd = int(getattr(self, fd_name, -1))
+            if fd >= 0:
+                os.close(fd)
+                setattr(self, fd_name, -1)
+
+        self._closed = True
 
 
 register_l2_adapter_type("raw_block", RawBlockL2AdapterConfig)

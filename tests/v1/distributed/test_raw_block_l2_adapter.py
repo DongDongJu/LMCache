@@ -258,6 +258,28 @@ def test_raw_block_l2_adapter_listeners_usage_and_internal_eviction():
             adapter.close()
 
 
+def test_raw_block_l2_adapter_does_not_notify_duplicate_store():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        adapter = RawBlockL2Adapter(_make_config(dev_path))
+        listener = _RecordingListener()
+        adapter.register_listener(listener)
+
+        try:
+            key = _create_object_key(25)
+            obj = _create_memory_obj(fill_value=25.0)
+
+            assert _run_store(adapter, [key], [obj]) is True
+            assert _run_store(adapter, [key], [obj]) is True
+
+            assert listener.stored == [[key]]
+        finally:
+            adapter.close()
+
+
 def test_raw_block_l2_adapter_recovery_from_checkpoint():
     with tempfile.TemporaryDirectory() as td:
         dev_path = os.path.join(td, "dev.bin")
