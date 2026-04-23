@@ -286,15 +286,16 @@ def test_raw_block_l2_adapter_listeners_usage_and_internal_eviction():
             assert _run_store(adapter, [key2], [obj2]) is True
 
             assert listener.stored[0] == [key1]
-            assert listener.stored_sizes[0] == [obj1.get_size()]
+            assert listener.stored_sizes[0] is None
             assert listener.deleted[-1] == [key1]
-            assert listener.deleted_sizes[-1] == [obj1.get_size()]
+            assert listener.deleted_sizes[-1] is None
             assert listener.stored[-1] == [key2]
-            assert listener.stored_sizes[-1] == [obj2.get_size()]
+            assert listener.stored_sizes[-1] is None
 
-            current_usage, usage_after = adapter.get_usage()
-            assert current_usage > 0.0
-            assert usage_after == current_usage
+            usage = adapter.get_usage()
+            assert usage.total_bytes_used == obj2.get_size()
+            assert usage.total_capacity_bytes == slot_bytes
+            assert 0.0 < usage.usage_fraction <= 1.0
             assert adapter.supports_global_eviction is False
 
             status = adapter.report_status()

@@ -298,6 +298,9 @@ class RawBlockL2Adapter(L2AdapterInterface):
 
         try:
             self._core = RawBlockCore(config.to_core_config(), key_namespace="object")
+            self._max_capacity_bytes = int(
+                self._core.report_status().get("usable_capacity_bytes", 0)
+            )
 
             self._store_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
             self._lookup_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
@@ -490,10 +493,6 @@ class RawBlockL2Adapter(L2AdapterInterface):
             should not register a second global L2 eviction policy.
         """
         return False
-
-    def get_usage(self) -> tuple[float, float]:
-        """Return current and projected raw-block usage fractions."""
-        return self._core.usage()
 
     def close(self) -> None:
         """Wait for worker pools, close the core, and close eventfds."""
