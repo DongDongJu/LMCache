@@ -22,14 +22,14 @@ from lmcache.v1.storage_backend.abstract_backend import (
 from lmcache.v1.storage_backend.raw_block import (
     RawBlockCore,
     RawBlockCoreConfig,
-    _DEFAULT_META_MAGIC,  # noqa: F401
-    _DEFAULT_META_VERSION,
-    _round_up,
     decode_legacy_key,
     encode_legacy_key,
 )
 
 logger = init_logger(__name__)
+
+_DEFAULT_META_MAGIC = b"LMCIDX01"
+_DEFAULT_META_VERSION = 1
 
 TPRankKey = int | str
 PerTPDevicePaths = Mapping[TPRankKey, str]
@@ -47,6 +47,10 @@ def _get_per_tp_device_path(
     per_tp_devices: PerTPDevicePaths, tp_rank: int
 ) -> Optional[str]:
     return per_tp_devices.get(str(tp_rank), per_tp_devices.get(tp_rank))
+
+
+def _round_up(x: int, align: int) -> int:
+    return ((x + align - 1) // align) * align
 
 
 class RustRawBlockBackend(StoragePluginInterface):
@@ -330,9 +334,13 @@ class RustRawBlockBackend(StoragePluginInterface):
                 continue
 
             obj.ref_count_up()
+            loop = self.loop
+            if loop is None:
+                obj.ref_count_down()
+                raise RuntimeError("RustRawBlockBackend requires an asyncio event loop")
             fut = asyncio.run_coroutine_threadsafe(
                 self._submit_put_one(key, spec.encoded, obj, on_complete_callback),
-                self.loop,
+                loop,
             )
             futures.append(fut)
         return futures or None
@@ -491,7 +499,8 @@ class RustRawBlockBackend(StoragePluginInterface):
             return False
         if encoded_key in self._pinned_keys:
             return True
-        self._core.exists_many([encoded_key], lock=True)
+        if not self._core.exists_many([encoded_key], lock=True)[0]:
+            return False
         self._pinned_keys.add(encoded_key)
         return True
 

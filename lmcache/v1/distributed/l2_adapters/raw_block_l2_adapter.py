@@ -12,7 +12,8 @@ from __future__ import annotations
 
 # Standard
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Optional
+from functools import partial
+from typing import TYPE_CHECKING, Any, Optional
 import os
 import threading
 
@@ -46,6 +47,7 @@ logger = init_logger(__name__)
 
 
 def _make_bitmap(size: int) -> "Bitmap":
+    # First Party
     from lmcache.native_storage_ops import Bitmap
 
     return Bitmap(size)
@@ -275,13 +277,13 @@ class RawBlockL2Adapter(L2AdapterInterface):
             )
 
         self._closed = False
-        self._core = None
+        self._core: RawBlockCore
         self._store_efd = -1
         self._lookup_efd = -1
         self._load_efd = -1
-        self._store_pool = None
-        self._lookup_pool = None
-        self._load_pool = None
+        self._store_pool: ThreadPoolExecutor
+        self._lookup_pool: ThreadPoolExecutor
+        self._load_pool: ThreadPoolExecutor
 
         try:
             self._core = RawBlockCore(config.to_core_config(), key_namespace="object")
@@ -363,9 +365,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
             with self._lock:
                 self._store_inflight_tasks -= 1
             raise
-        future.add_done_callback(
-            lambda fut, task_id=task_id: self._finish_store_task(task_id, fut)
-        )
+        future.add_done_callback(partial(self._finish_store_task, task_id))
         return task_id
 
     def pop_completed_store_tasks(self) -> dict[L2TaskId, bool]:
@@ -400,9 +400,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
             with self._lock:
                 self._lookup_inflight_tasks -= 1
             raise
-        future.add_done_callback(
-            lambda fut, task_id=task_id: self._finish_lookup_task(task_id, fut)
-        )
+        future.add_done_callback(partial(self._finish_lookup_task, task_id))
         return task_id
 
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
@@ -449,9 +447,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
             with self._lock:
                 self._load_inflight_tasks -= 1
             raise
-        future.add_done_callback(
-            lambda fut, task_id=task_id: self._finish_load_task(task_id, fut)
-        )
+        future.add_done_callback(partial(self._finish_load_task, task_id))
         return task_id
 
     def query_load_result(self, task_id: L2TaskId) -> Bitmap | None:
@@ -532,7 +528,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
         ]
         return (all(put_result.results), stored_keys, evicted_keys)
 
-    def _finish_store_task(self, task_id: L2TaskId, future: Future) -> None:
+    def _finish_store_task(self, task_id: L2TaskId, future: Future[Any]) -> None:
         success = False
         stored_keys: list[ObjectKey] = []
         evicted_keys: list[ObjectKey] = []
@@ -558,7 +554,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 bitmap.set(i)
         return bitmap
 
-    def _finish_lookup_task(self, task_id: L2TaskId, future: Future) -> None:
+    def _finish_lookup_task(self, task_id: L2TaskId, future: Future[Any]) -> None:
         bitmap = _make_bitmap(0)
         try:
             bitmap = future.result()
@@ -584,7 +580,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 accessed_keys.append(keys[i])
         return bitmap, accessed_keys
 
-    def _finish_load_task(self, task_id: L2TaskId, future: Future) -> None:
+    def _finish_load_task(self, task_id: L2TaskId, future: Future[Any]) -> None:
         bitmap = _make_bitmap(0)
         accessed_keys: list[ObjectKey] = []
         try:
@@ -614,7 +610,6 @@ class RawBlockL2Adapter(L2AdapterInterface):
         core = getattr(self, "_core", None)
         if core is not None:
             core.close()
-            self._core = None
 
         for fd_name in ("_store_efd", "_lookup_efd", "_load_efd"):
             fd = int(getattr(self, fd_name, -1))

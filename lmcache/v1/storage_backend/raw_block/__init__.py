@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# First Party
 from lmcache.v1.storage_backend.raw_block.core import (
     RawBlockCore,
     RawBlockCoreConfig,
     RawBlockPutManyResult,
-    _DEFAULT_META_MAGIC,
-    _DEFAULT_META_VERSION,
-    _round_up,
 )
 from lmcache.v1.storage_backend.raw_block.key_codec import (
     RawBlockKeyNamespace,
@@ -25,9 +23,6 @@ __all__ = [
     "RawBlockKeyNamespace",
     "RawBlockKeySpec",
     "RawBlockPutManyResult",
-    "_DEFAULT_META_MAGIC",
-    "_DEFAULT_META_VERSION",
-    "_round_up",
     "decode_legacy_key",
     "decode_object_key",
     "encode_legacy_key",

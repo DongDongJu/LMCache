@@ -21,9 +21,9 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import (
-    DiskCacheMetadata,
     STR_DTYPE_TO_TORCH_DTYPE,
     TORCH_DTYPE_TO_STR_DTYPE,
+    DiskCacheMetadata,
 )
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.storage_backend.raw_block.key_codec import (
@@ -495,7 +495,7 @@ class RawBlockCore:
                         if self.use_odirect
                         else payload_len
                     )
-                    buf = objs[i].byte_array
+                    buf = memoryview(objs[i].byte_array)
                     try:
                         buf = buf.cast("B")
                     except Exception:
