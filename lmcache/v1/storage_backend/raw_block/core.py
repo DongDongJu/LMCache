@@ -278,6 +278,36 @@ class RawBlockCore:
                 metas.append(entry.meta if entry is not None else None)
             return metas
 
+    def get_metadata_prefix(
+        self,
+        encoded_keys: Sequence[str],
+        *,
+        lock: bool = False,
+    ) -> list[DiskCacheMetadata]:
+        """Return leading-hit metadata and optionally lock those entries.
+
+        Args:
+            encoded_keys: Ordered encoded raw-block keys to inspect.
+            lock: If true, increment L2 lock refcounts for every returned
+                metadata entry while holding the index lock.
+
+        Returns:
+            Metadata for the contiguous leading hit prefix. The returned list
+            stops at the first missing key.
+        """
+        with self._lock:
+            metas: list[DiskCacheMetadata] = []
+            for encoded_key in encoded_keys:
+                entry = self._index.get(encoded_key)
+                if entry is None:
+                    break
+                metas.append(entry.meta)
+                if lock:
+                    self._lock_refcnt[encoded_key] = (
+                        self._lock_refcnt.get(encoded_key, 0) + 1
+                    )
+            return metas
+
     def first_encoded_key(self) -> str | None:
         """Return one indexed encoded key for diagnostics.
 
