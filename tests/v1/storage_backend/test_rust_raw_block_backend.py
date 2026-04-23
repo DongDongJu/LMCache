@@ -319,6 +319,30 @@ def test_rust_raw_block_backend_pin_and_contains_are_idempotent(
             assert backend.lock_refcount(encoded_key) == 0
             assert backend.unpin(key) is True
             assert backend.lock_refcount(encoded_key) == 0
+
+            barrier = threading.Barrier(8)
+            pin_results: list[bool] = []
+            result_lock = threading.Lock()
+
+            def pin_concurrently() -> None:
+                barrier.wait(timeout=5)
+                pinned = backend.pin(key)
+                with result_lock:
+                    pin_results.append(pinned)
+
+            threads = [
+                threading.Thread(target=pin_concurrently, daemon=True) for _ in range(8)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+            assert pin_results == [True] * 8
+            assert backend.lock_refcount(encoded_key) == 1
+
+            assert backend.unpin(key) is True
+            assert backend.lock_refcount(encoded_key) == 0
         finally:
             backend.close()
 

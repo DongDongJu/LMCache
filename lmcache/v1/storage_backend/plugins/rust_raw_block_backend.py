@@ -25,6 +25,7 @@ from lmcache.v1.storage_backend.raw_block import (
     RawBlockKeySpec,
     decode_legacy_key,
     encode_legacy_key,
+    round_up,
 )
 
 logger = init_logger(__name__)
@@ -65,19 +66,6 @@ def _get_per_tp_device_path(
         The configured path, or None when the rank is absent.
     """
     return per_tp_devices.get(str(tp_rank), per_tp_devices.get(tp_rank))
-
-
-def _round_up(x: int, align: int) -> int:
-    """Round a value up to the nearest alignment boundary.
-
-    Args:
-        x: Value to align.
-        align: Positive alignment in bytes.
-
-    Returns:
-        ``x`` rounded up to a multiple of ``align``.
-    """
-    return ((x + align - 1) // align) * align
 
 
 class RustRawBlockBackend(StoragePluginInterface):
@@ -152,6 +140,7 @@ class RustRawBlockBackend(StoragePluginInterface):
 
         self._put_lock = threading.Lock()
         self._put_tasks: set[CacheEngineKey] = set()
+        self._pin_lock = threading.Lock()
         self._pinned_keys: set[str] = set()
 
     def __str__(self) -> str:
@@ -253,7 +242,7 @@ class RustRawBlockBackend(StoragePluginInterface):
                     "or get_full_chunk_size()"
                 )
             full_chunk_bytes = int(get_full_chunk_size())
-        default_slot_bytes = _round_up(header_bytes + full_chunk_bytes, block_align)
+        default_slot_bytes = round_up(header_bytes + full_chunk_bytes, block_align)
         slot_bytes = int(extra.get("rust_raw_block.slot_bytes", default_slot_bytes))
 
         return RawBlockCoreConfig(
@@ -330,9 +319,10 @@ class RustRawBlockBackend(StoragePluginInterface):
 
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
         spec = encode_legacy_key(key)
-        removed = self._core.delete_many([spec.encoded], force=force)[0]
-        if removed:
-            self._pinned_keys.discard(spec.encoded)
+        with self._pin_lock:
+            removed = self._core.delete_many([spec.encoded], force=force)[0]
+            if removed:
+                self._pinned_keys.discard(spec.encoded)
         return removed
 
     def batched_submit_put_task(
@@ -523,19 +513,18 @@ class RustRawBlockBackend(StoragePluginInterface):
         self._core.close()
 
     def _pin_if_needed(self, encoded_key: str) -> bool:
-        if not self._core.contains_key(encoded_key, lock=False):
-            return False
-        if encoded_key in self._pinned_keys:
+        with self._pin_lock:
+            if encoded_key in self._pinned_keys:
+                return True
+            if not self._core.exists_many([encoded_key], lock=True)[0]:
+                return False
+            self._pinned_keys.add(encoded_key)
             return True
-        if not self._core.exists_many([encoded_key], lock=True)[0]:
-            return False
-        self._pinned_keys.add(encoded_key)
-        return True
 
     def _unpin_if_needed(self, encoded_key: str) -> bool:
-        existed = self._core.contains_key(encoded_key, lock=False)
-        if encoded_key in self._pinned_keys:
-            self._core.unlock_many([encoded_key])
-            self._pinned_keys.discard(encoded_key)
-            return True
-        return existed
+        with self._pin_lock:
+            if encoded_key in self._pinned_keys:
+                self._core.unlock_many([encoded_key])
+                self._pinned_keys.discard(encoded_key)
+                return True
+            return self._core.contains_key(encoded_key, lock=False)

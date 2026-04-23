@@ -41,8 +41,16 @@ _DEFAULT_META_VERSION = 1
 _META_HEADER_STRUCT = struct.Struct("<8sIQQI")
 
 
-def _round_up(x: int, align: int) -> int:
-    """Round up to nearest multiple of alignment."""
+def round_up(x: int, align: int) -> int:
+    """Round a value up to the nearest alignment boundary.
+
+    Args:
+        x: Value to align.
+        align: Positive alignment in bytes.
+
+    Returns:
+        ``x`` rounded up to a multiple of ``align``.
+    """
     return ((x + align - 1) // align) * align
 
 
@@ -493,7 +501,7 @@ class RawBlockCore:
                 try:
                     payload_len = int(entry.size)
                     total_len = (
-                        _round_up(payload_len, self.block_align)
+                        round_up(payload_len, self.block_align)
                         if self.use_odirect
                         else payload_len
                     )
@@ -775,7 +783,7 @@ class RawBlockCore:
         payload_len = len(memory_obj.byte_array)
         total_len = payload_len
         if self.use_odirect:
-            total_len = _round_up(payload_len, self.block_align)
+            total_len = round_up(payload_len, self.block_align)
             if total_len > (self.slot_bytes - self.header_bytes):
                 raise RuntimeError(
                     f"O_DIRECT payload {total_len} exceeds slot capacity"
@@ -813,7 +821,7 @@ class RawBlockCore:
             try:
                 raw_dev = self._rawdev()
                 hdr_total = (
-                    _round_up(len(header), self.block_align)
+                    round_up(len(header), self.block_align)
                     if self.use_odirect
                     else len(header)
                 )
@@ -987,7 +995,7 @@ class RawBlockCore:
         """Load and CRC-validate a checkpoint payload for a metadata header."""
         payload_len = int(header["payload_len"])
         payload_off = int(header["container_offset"]) + self.block_align
-        total_len = _round_up(payload_len, self.block_align)
+        total_len = round_up(payload_len, self.block_align)
         buf = bytearray(total_len)
         try:
             self._rawdev().pread_into(payload_off, buf, payload_len, total_len)
@@ -1085,7 +1093,7 @@ class RawBlockCore:
         target = self._meta_container_offsets()[target_idx]
 
         payload_len = len(payload)
-        payload_total_len = _round_up(payload_len, self.block_align)
+        payload_total_len = round_up(payload_len, self.block_align)
         payload_off = target + self.block_align
         crc = zlib.crc32(payload) & 0xFFFFFFFF
 

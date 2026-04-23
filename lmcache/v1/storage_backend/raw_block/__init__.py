@@ -5,6 +5,7 @@ from lmcache.v1.storage_backend.raw_block.core import (
     RawBlockCore,
     RawBlockCoreConfig,
     RawBlockPutManyResult,
+    round_up,
 )
 from lmcache.v1.storage_backend.raw_block.key_codec import (
     RawBlockKeyNamespace,
@@ -28,5 +29,6 @@ __all__ = [
     "encode_legacy_key",
     "encode_object_key",
     "object_key_to_string",
+    "round_up",
     "slot_identity_from_encoded_key",
 ]
