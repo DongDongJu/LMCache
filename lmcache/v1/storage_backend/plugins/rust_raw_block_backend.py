@@ -377,6 +377,12 @@ class RustRawBlockBackend(StoragePluginInterface):
             )
             if not put_result.results or not put_result.results[0]:
                 raise RuntimeError(f"Failed to persist raw-block key {spec.encoded}")
+            if put_result.evicted_keys:
+                logger.info(
+                    "RustRawBlockBackend evicted %d raw-block keys while storing %s",
+                    len(put_result.evicted_keys),
+                    spec.encoded,
+                )
             if on_complete_callback is not None:
                 try:
                     on_complete_callback(key)

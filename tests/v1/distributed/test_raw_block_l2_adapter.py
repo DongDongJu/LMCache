@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from unittest.mock import patch
 import os
 import select
 import tempfile
@@ -310,3 +311,35 @@ def test_raw_block_l2_adapter_recovery_from_checkpoint():
             adapter2.submit_unlock([key])
         finally:
             adapter2.close()
+
+
+def test_raw_block_l2_adapter_error_bitmaps_keep_submitted_size():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        adapter = RawBlockL2Adapter(_make_config(dev_path))
+        try:
+            keys = [_create_object_key(41), _create_object_key(42)]
+            objects = [_create_memory_obj(), _create_memory_obj()]
+
+            with patch.object(
+                adapter, "_run_lookup_task", side_effect=RuntimeError("lookup failed")
+            ):
+                lookup_task_id = adapter.submit_lookup_and_lock_task(keys)
+                assert _wait_event_fd(adapter.get_lookup_and_lock_event_fd())
+                lookup_bitmap = adapter.query_lookup_and_lock_result(lookup_task_id)
+            assert lookup_bitmap is not None
+            assert str(lookup_bitmap) == "00"
+
+            with patch.object(
+                adapter, "_run_load_task", side_effect=RuntimeError("load failed")
+            ):
+                load_task_id = adapter.submit_load_task(keys, objects)
+                assert _wait_event_fd(adapter.get_load_event_fd())
+                load_bitmap = adapter.query_load_result(load_task_id)
+            assert load_bitmap is not None
+            assert str(load_bitmap) == "00"
+        finally:
+            adapter.close()

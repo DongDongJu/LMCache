@@ -400,7 +400,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
             with self._lock:
                 self._lookup_inflight_tasks -= 1
             raise
-        future.add_done_callback(partial(self._finish_lookup_task, task_id))
+        future.add_done_callback(partial(self._finish_lookup_task, task_id, len(keys)))
         return task_id
 
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
@@ -447,7 +447,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
             with self._lock:
                 self._load_inflight_tasks -= 1
             raise
-        future.add_done_callback(partial(self._finish_load_task, task_id))
+        future.add_done_callback(partial(self._finish_load_task, task_id, len(keys)))
         return task_id
 
     def query_load_result(self, task_id: L2TaskId) -> Bitmap | None:
@@ -554,8 +554,10 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 bitmap.set(i)
         return bitmap
 
-    def _finish_lookup_task(self, task_id: L2TaskId, future: Future[Any]) -> None:
-        bitmap = _make_bitmap(0)
+    def _finish_lookup_task(
+        self, task_id: L2TaskId, bitmap_size: int, future: Future[Any]
+    ) -> None:
+        bitmap = _make_bitmap(bitmap_size)
         try:
             bitmap = future.result()
         except Exception as e:
@@ -580,8 +582,10 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 accessed_keys.append(keys[i])
         return bitmap, accessed_keys
 
-    def _finish_load_task(self, task_id: L2TaskId, future: Future[Any]) -> None:
-        bitmap = _make_bitmap(0)
+    def _finish_load_task(
+        self, task_id: L2TaskId, bitmap_size: int, future: Future[Any]
+    ) -> None:
+        bitmap = _make_bitmap(bitmap_size)
         accessed_keys: list[ObjectKey] = []
         try:
             bitmap, accessed_keys = future.result()
