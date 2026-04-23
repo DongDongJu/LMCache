@@ -545,16 +545,16 @@ class RawBlockL2Adapter(L2AdapterInterface):
         with self._lock:
             self._store_inflight_tasks -= 1
             self._completed_store_tasks[task_id] = success
-        if evicted_keys:
-            try:
-                self._notify_keys_deleted(evicted_keys)
-            except Exception as e:
-                logger.warning("RawBlockL2Adapter delete notification failed: %s", e)
         if stored_keys:
             try:
                 self._notify_keys_stored(stored_keys)
             except Exception as e:
                 logger.warning("RawBlockL2Adapter store notification failed: %s", e)
+        if evicted_keys:
+            try:
+                self._notify_keys_deleted(evicted_keys)
+            except Exception as e:
+                logger.warning("RawBlockL2Adapter delete notification failed: %s", e)
         self._signal_event_fd(self._store_efd)
 
     def _run_lookup_task(self, keys: list[ObjectKey]) -> Bitmap:

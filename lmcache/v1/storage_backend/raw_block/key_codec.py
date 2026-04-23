@@ -156,5 +156,13 @@ def slot_identity_from_encoded_key(
 
 
 def _object_slot_identity(encoded: str) -> int:
+    """Return the stable 64-bit slot identity for an encoded ObjectKey.
+
+    Args:
+        encoded: Raw-block ObjectKey string produced by ``object_key_to_string``.
+
+    Returns:
+        Unsigned 64-bit identity stored in the raw-block slot header.
+    """
     digest = hashlib.blake2b(encoded.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "little", signed=False)
