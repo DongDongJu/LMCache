@@ -467,6 +467,19 @@ class RustRawBlockBackend(StoragePluginInterface):
         self,
         keys: List[CacheEngineKey],
     ) -> List[Optional[MemoryObj]]:
+        """Synchronously load the leading raw-block hit prefix.
+
+        Args:
+            keys: Ordered legacy cache keys to load.
+
+        Returns:
+            A list aligned with ``keys`` containing loaded memory objects for
+            the contiguous hit prefix and ``None`` for the remaining suffix.
+
+        Raises:
+            RuntimeError: If the local CPU allocator backend is unavailable.
+            Exception: Propagates raw-device load failures from the core.
+        """
         if not keys:
             return []
         loaded = self._batched_get_prefix(keys)
@@ -502,6 +515,20 @@ class RustRawBlockBackend(StoragePluginInterface):
         keys: list[CacheEngineKey],
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
+        """Asynchronously load the leading raw-block hit prefix.
+
+        Args:
+            lookup_id: Lookup identifier supplied by the storage manager.
+            keys: Ordered legacy cache keys to load.
+            transfer_spec: Optional transfer metadata; unused by raw-block.
+
+        Returns:
+            Loaded memory objects for the contiguous hit prefix only.
+
+        Raises:
+            RuntimeError: If the local CPU allocator backend is unavailable.
+            Exception: Propagates raw-device load failures from the core.
+        """
         del lookup_id, transfer_spec
         return await asyncio.to_thread(self._batched_get_prefix, keys)
 

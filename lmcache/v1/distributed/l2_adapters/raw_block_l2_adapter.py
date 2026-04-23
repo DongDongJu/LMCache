@@ -523,9 +523,15 @@ class RawBlockL2Adapter(L2AdapterInterface):
             for key, spec in zip(keys, specs, strict=False)
             if spec.encoded in stored_encoded
         ]
-        evicted_keys = [
-            decode_object_key(encoded_key) for encoded_key in put_result.evicted_keys
-        ]
+        evicted_keys: list[ObjectKey] = []
+        for encoded_key in put_result.evicted_keys:
+            try:
+                evicted_keys.append(decode_object_key(encoded_key))
+            except ValueError:
+                logger.warning(
+                    "RawBlockL2Adapter skipped evicted non-object key %s",
+                    encoded_key,
+                )
         return (all(put_result.results), stored_keys, evicted_keys)
 
     def _finish_store_task(self, task_id: L2TaskId, future: Future[Any]) -> None:
