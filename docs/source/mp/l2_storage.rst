@@ -222,6 +222,9 @@ caller-provided load buffers during prefetch.
 
 - ``raw_block`` is a server-owned MP adapter. It does **not** support
   per-TP device-path mappings in MP mode.
+- ``raw_block`` manages capacity with its own internal slot-recycling policy.
+  The shared/global L2 eviction controller is not attached to this adapter, so
+  adapter-level ``"eviction"`` config does not apply here.
 - If ``use_odirect`` is enabled, the server's ``--l1-align-bytes`` should be
   at least ``block_align``.
 - ``persist_enabled`` must remain ``true`` for this adapter.

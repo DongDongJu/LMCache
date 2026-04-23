@@ -295,6 +295,7 @@ def test_raw_block_l2_adapter_listeners_usage_and_internal_eviction():
             current_usage, usage_after = adapter.get_usage()
             assert current_usage > 0.0
             assert usage_after == current_usage
+            assert adapter.supports_global_eviction is False
 
             status = adapter.report_status()
             assert status["is_healthy"] is True

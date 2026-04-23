@@ -473,6 +473,16 @@ class RawBlockL2Adapter(L2AdapterInterface):
         if deleted_keys:
             self._notify_keys_deleted(deleted_keys, deleted_sizes)
 
+    @property
+    def supports_global_eviction(self) -> bool:
+        """Return whether the shared L2 eviction controller should manage this adapter.
+
+        Returns:
+            ``False`` because raw-block uses its own internal slot recycling and
+            should not register a second global L2 eviction policy.
+        """
+        return False
+
     def get_usage(self) -> tuple[float, float]:
         """Return current and projected raw-block usage fractions."""
         return self._core.usage()
