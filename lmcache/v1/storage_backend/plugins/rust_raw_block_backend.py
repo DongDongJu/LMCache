@@ -22,7 +22,7 @@ from lmcache.v1.storage_backend.abstract_backend import (
 from lmcache.v1.storage_backend.raw_block import (
     RawBlockCore,
     RawBlockCoreConfig,
-    _DEFAULT_META_MAGIC,
+    _DEFAULT_META_MAGIC,  # noqa: F401
     _DEFAULT_META_VERSION,
     _round_up,
     decode_legacy_key,
@@ -123,14 +123,72 @@ class RustRawBlockBackend(StoragePluginInterface):
         self._put_tasks: set[CacheEngineKey] = set()
         self._pinned_keys: set[str] = set()
 
-    def __getattr__(self, name: str) -> Any:
-        core = self.__dict__.get("_core")
-        if core is not None and hasattr(core, name):
-            return getattr(core, name)
-        raise AttributeError(name)
-
     def __str__(self) -> str:
         return "RustRawBlockBackend"
+
+    @property
+    def capacity_bytes(self) -> int:
+        """Return the effective raw-block capacity in bytes."""
+        return int(self._core.capacity_bytes)
+
+    @property
+    def block_align(self) -> int:
+        """Return the configured raw-device block alignment."""
+        return int(self._core.block_align)
+
+    @property
+    def header_bytes(self) -> int:
+        """Return the per-slot header reservation in bytes."""
+        return int(self._core.header_bytes)
+
+    @property
+    def slot_bytes(self) -> int:
+        """Return the configured raw-block slot size in bytes."""
+        return int(self._core.slot_bytes)
+
+    @property
+    def meta_total_bytes(self) -> int:
+        """Return the reserved metadata checkpoint region size."""
+        return int(self._core.meta_total_bytes)
+
+    @property
+    def meta_magic_text(self) -> str:
+        """Return the ASCII metadata checkpoint magic."""
+        return str(self._core.meta_magic_text)
+
+    @property
+    def meta_version(self) -> int:
+        """Return the metadata checkpoint format version."""
+        return int(self._core.meta_version)
+
+    @property
+    def data_base_offset(self) -> int:
+        """Return the byte offset where data slots begin."""
+        return self._core.data_base_offset()
+
+    def lock_refcount(self, encoded_key: str) -> int:
+        """Return the L2 lock refcount for a legacy encoded key."""
+        return self._core.lock_refcount(encoded_key)
+
+    def inflight_io_count(self) -> int:
+        """Return the number of active raw-device I/O operations."""
+        return self._core.inflight_io_count()
+
+    def indexed_key_count(self) -> int:
+        """Return the number of keys currently indexed by raw-block."""
+        return self._core.indexed_key_count()
+
+    def entry_offset(self, key: CacheEngineKey) -> int | None:
+        """Return the raw-block slot offset for a legacy key."""
+        return self._core.entry_offset(encode_legacy_key(key).encoded)
+
+    def metadata_container_offsets(self) -> list[int]:
+        """Return checkpoint metadata container offsets in bytes."""
+        return self._core.metadata_container_offsets()
+
+    def apply_loaded_state(self, data: dict[str, Any]) -> bool:
+        """Validate and apply a raw-block metadata checkpoint payload."""
+        return self._core.apply_loaded_state(data)
 
     def _build_core_config(self, extra: Mapping[str, Any]) -> RawBlockCoreConfig:
         block_align = int(extra.get("rust_raw_block.block_align", 4096))
@@ -183,9 +241,7 @@ class RustRawBlockBackend(StoragePluginInterface):
             meta_checkpoint_interval_sec=int(
                 extra.get("rust_raw_block.meta_checkpoint_interval_sec", 60)
             ),
-            meta_idle_quiet_ms=int(
-                extra.get("rust_raw_block.meta_idle_quiet_ms", 100)
-            ),
+            meta_idle_quiet_ms=int(extra.get("rust_raw_block.meta_idle_quiet_ms", 100)),
             meta_enable_periodic=bool(
                 extra.get("rust_raw_block.meta_enable_periodic", True)
             ),
@@ -194,13 +250,12 @@ class RustRawBlockBackend(StoragePluginInterface):
             ),
         )
 
-    def _rawdev(self):
-        return self._core._rawdev()
-
     def _warn_if_loaded_metadata_looks_cross_rank(self) -> None:
-        if self.metadata is None or not self._core._index:
+        if self.metadata is None:
             return
-        first_encoded_key = next(iter(self._core._index))
+        first_encoded_key = self._core.first_encoded_key()
+        if first_encoded_key is None:
+            return
         try:
             first_loaded_key = decode_legacy_key(first_encoded_key)
         except Exception:
@@ -221,9 +276,13 @@ class RustRawBlockBackend(StoragePluginInterface):
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         spec = encode_legacy_key(key)
-        return self._pin_if_needed(spec.encoded) if pin else self._core.contains_key(
-            spec.encoded,
-            lock=False,
+        return (
+            self._pin_if_needed(spec.encoded)
+            if pin
+            else self._core.contains_key(
+                spec.encoded,
+                lock=False,
+            )
         )
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -261,9 +320,11 @@ class RustRawBlockBackend(StoragePluginInterface):
                 self._put_tasks.add(key)
 
             spec = encode_legacy_key(key)
-            if self._core.contains_key(spec.encoded, lock=False) or self._core.exists_inflight(
-                spec.encoded
-            ):
+            exists = self._core.contains_key(
+                spec.encoded,
+                lock=False,
+            ) or self._core.exists_inflight(spec.encoded)
+            if exists:
                 with self._put_lock:
                     self._put_tasks.discard(key)
                 continue
@@ -285,7 +346,11 @@ class RustRawBlockBackend(StoragePluginInterface):
     ) -> None:
         try:
             spec = encode_legacy_key(key)
-            put_result = await asyncio.to_thread(self._core.put_many, [spec], [memory_obj])
+            put_result = await asyncio.to_thread(
+                self._core.put_many,
+                [spec],
+                [memory_obj],
+            )
             if not put_result.results or not put_result.results[0]:
                 raise RuntimeError(f"Failed to persist raw-block key {encoded_key}")
             if on_complete_callback is not None:
@@ -323,12 +388,18 @@ class RustRawBlockBackend(StoragePluginInterface):
         for spec, meta in zip(prefix_specs, prefix_metas, strict=False):
             if meta.shape is None or meta.dtype is None:
                 logger.warning(
-                    "Raw-block metadata missing shape/dtype for key %s; aborting prefix load",
+                    "Raw-block metadata missing shape/dtype for key %s; "
+                    "aborting prefix load",
                     spec.encoded,
                 )
                 break
-            assert self.local_cpu_backend is not None
-            memory_obj = self.local_cpu_backend.allocate(meta.shape, meta.dtype, meta.fmt)
+            if self.local_cpu_backend is None:
+                raise RuntimeError("RustRawBlockBackend requires local_cpu_backend")
+            memory_obj = self.local_cpu_backend.allocate(
+                meta.shape,
+                meta.dtype,
+                meta.fmt,
+            )
             if memory_obj is None:
                 logger.error("Failed to allocate memory for key %s", spec.encoded)
                 break
@@ -401,7 +472,8 @@ class RustRawBlockBackend(StoragePluginInterface):
         return await asyncio.to_thread(self._batched_get_prefix, keys)
 
     def get_allocator_backend(self) -> AllocatorBackendInterface:
-        assert self.local_cpu_backend is not None
+        if self.local_cpu_backend is None:
+            raise RuntimeError("RustRawBlockBackend requires local_cpu_backend")
         return self.local_cpu_backend
 
     def close(self) -> None:

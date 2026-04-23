@@ -309,16 +309,16 @@ def test_rust_raw_block_backend_pin_and_contains_are_idempotent(
 
             encoded_key = key.to_string()
             assert backend.contains(key, pin=True) is True
-            assert backend._lock_refcnt[encoded_key] == 1
+            assert backend.lock_refcount(encoded_key) == 1
             assert backend.contains(key, pin=True) is True
-            assert backend._lock_refcnt[encoded_key] == 1
+            assert backend.lock_refcount(encoded_key) == 1
             assert backend.pin(key) is True
-            assert backend._lock_refcnt[encoded_key] == 1
+            assert backend.lock_refcount(encoded_key) == 1
 
             assert backend.unpin(key) is True
-            assert encoded_key not in backend._lock_refcnt
+            assert backend.lock_refcount(encoded_key) == 0
             assert backend.unpin(key) is True
-            assert encoded_key not in backend._lock_refcnt
+            assert backend.lock_refcount(encoded_key) == 0
         finally:
             backend.close()
 
@@ -385,10 +385,12 @@ def test_rust_raw_block_backend_batched_get_resets_inflight_on_rawdev_error(
             futs[0].result(timeout=10)
             obj.ref_count_down()
 
-            with patch.object(backend._core, "_rawdev", side_effect=RuntimeError("boom")):
+            with patch.object(
+                backend._core, "_rawdev", side_effect=RuntimeError("boom")
+            ):
                 with pytest.raises(RuntimeError, match="boom"):
                     backend.get_blocking(key)
-            assert backend._inflight_io_count == 0
+            assert backend.inflight_io_count() == 0
         finally:
             backend.close()
 
@@ -458,7 +460,7 @@ def test_rust_raw_block_backend_batched_get_handles_allocator_exhaustion(
             with patch.object(local_cpu, "allocate", return_value=None):
                 assert backend.get_blocking(key) is None
                 assert backend.batched_get_blocking([key]) == [None]
-            assert backend._inflight_io_count == 0
+            assert backend.inflight_io_count() == 0
         finally:
             backend.close()
 
@@ -541,7 +543,7 @@ def test_rust_raw_block_backend_batched_get_releases_allocation_on_read_error(
                         backend.get_blocking(key)
 
             assert leaked_obj.get_ref_count() == 0
-            assert backend._inflight_io_count == 0
+            assert backend.inflight_io_count() == 0
         finally:
             backend.close()
 
@@ -638,7 +640,7 @@ def test_rust_raw_block_backend_batched_get_releases_loaded_prefix_on_read_error
 
             assert loaded_obj.get_ref_count() == 0
             assert failed_obj.get_ref_count() == 0
-            assert backend._inflight_io_count == 0
+            assert backend.inflight_io_count() == 0
         finally:
             backend.close()
 
@@ -876,10 +878,9 @@ def test_rust_raw_block_backend_data_offsets_start_after_metadata(
             assert futs is not None
             futs[0].result(timeout=10)
 
-            with backend._lock:
-                entry = backend._index.get(key.to_string())
-                assert entry is not None
-                assert entry.offset >= 8 * 1024 * 1024
+            entry_offset = backend.entry_offset(key)
+            assert entry_offset is not None
+            assert entry_offset >= 8 * 1024 * 1024
         finally:
             backend.close()
 
@@ -949,7 +950,7 @@ def test_rust_raw_block_backend_ignores_torn_newer_checkpoint(
             fut = backend1.batched_submit_put_task([key], [obj])[0]
             fut.result(timeout=10)
         finally:
-            torn_offset = backend1._meta_container_offsets()[1]
+            torn_offset = backend1.metadata_container_offsets()[1]
             backend1.close()
 
         # Corrupt the newer checkpoint copy with invalid CRC.
@@ -1032,10 +1033,10 @@ def test_rust_raw_block_backend_skips_invalid_checkpoint_entries(
         try:
             entries = {}
             for chunk_hash, (offset, size) in {
-                1: (backend._data_base_offset - backend.slot_bytes, 1024),
-                2: (backend._data_base_offset + 1, 1024),
+                1: (backend.data_base_offset - backend.slot_bytes, 1024),
+                2: (backend.data_base_offset + 1, 1024),
                 3: (
-                    backend._data_base_offset,
+                    backend.data_base_offset,
                     backend.slot_bytes - backend.header_bytes + 1,
                 ),
             }.items():
@@ -1049,7 +1050,7 @@ def test_rust_raw_block_backend_skips_invalid_checkpoint_entries(
                     "cached_positions": None,
                 }
 
-            applied = backend._apply_loaded_state(
+            applied = backend.apply_loaded_state(
                 {
                     "version": 1,
                     "device_path": dev_path,
@@ -1060,7 +1061,7 @@ def test_rust_raw_block_backend_skips_invalid_checkpoint_entries(
                     "meta_total_bytes": backend.meta_total_bytes,
                     "meta_magic": backend.meta_magic_text,
                     "meta_version": backend.meta_version,
-                    "data_base_offset": backend._data_base_offset,
+                    "data_base_offset": backend.data_base_offset,
                     "next_slot": 0,
                     "free_slots": [],
                     "lru_keys": [],
@@ -1068,7 +1069,7 @@ def test_rust_raw_block_backend_skips_invalid_checkpoint_entries(
                 }
             )
             assert applied is True
-            assert backend._index == {}
+            assert backend.indexed_key_count() == 0
         finally:
             backend.close()
 
