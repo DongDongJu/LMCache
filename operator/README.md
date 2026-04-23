@@ -257,9 +257,7 @@ spec:
 
 ### L2 Storage: Other Adapters (Raw Escape Hatch)
 
-For adapter types not yet natively supported by the operator (e.g.
-`nixl_store`, `fs`, `mock`, `raw_block`), use the `raw` escape hatch. The
-JSON is passed through to `--l2-adapter` as-is:
+For adapter types not yet natively supported by the operator (e.g. `nixl_store`, `fs`, `mock`, `raw_block`), use the `raw` escape hatch. The JSON is passed through to `--l2-adapter` as-is:
 
 ```yaml
 spec:
@@ -293,9 +291,7 @@ spec:
         num_load_workers: 4
 ```
 
-Use an unmounted raw block device or a dedicated file path reserved for
-LMCache. With `use_odirect: true`, the LMCache server's `--l1-align-bytes`
-setting must be at least `block_align`.
+Use an unmounted raw block device or a dedicated file path reserved for LMCache. With `use_odirect: true`, the LMCache server's `--l1-align-bytes` setting must be at least `block_align`.
 
 > [!NOTE]
 > Currently only a single L2 adapter is supported at a time. While LMCache multiprocess mode is designed to support multiple L2 adapters in cascade, this functionality is not yet fully tested. Once the multi-adapter pipeline is validated and performance is confirmed, the operator will be updated to support multiple adapters.
