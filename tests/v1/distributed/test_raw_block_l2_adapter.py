@@ -55,6 +55,17 @@ class _RecordingListener(L2AdapterListener):
         self.deleted.append(list(keys))
 
 
+class _FailingListener(L2AdapterListener):
+    def on_l2_keys_stored(self, keys: list[ObjectKey]):
+        raise RuntimeError("store listener failed")
+
+    def on_l2_keys_accessed(self, keys: list[ObjectKey]):
+        raise RuntimeError("access listener failed")
+
+    def on_l2_keys_deleted(self, keys: list[ObjectKey]):
+        raise RuntimeError("delete listener failed")
+
+
 def _create_object_key(chunk_id: int, model_name: str = "test_model") -> ObjectKey:
     return ObjectKey(
         chunk_hash=ObjectKey.IntHash2Bytes(chunk_id),
@@ -71,6 +82,23 @@ def _create_memory_obj(size: int = 1024, fill_value: float = 0.0) -> TensorMemor
         dtype=torch.float32,
         address=0,
         phy_size=size * 4,
+        fmt=MemoryFormat.KV_2LTD,
+        ref_count=1,
+    )
+    return TensorMemoryObj(raw_data, metadata, parent_allocator=None)
+
+
+def _create_complex_memory_obj(
+    size: int = 1024,
+    fill_value: complex = 0j,
+) -> TensorMemoryObj:
+    raw_data = torch.empty(size, dtype=torch.complex64)
+    raw_data.fill_(fill_value)
+    metadata = MemoryObjMetadata(
+        shape=torch.Size([size]),
+        dtype=torch.complex64,
+        address=0,
+        phy_size=raw_data.numel() * raw_data.element_size(),
         fmt=MemoryFormat.KV_2LTD,
         ref_count=1,
     )
@@ -281,6 +309,33 @@ def test_raw_block_l2_adapter_does_not_notify_duplicate_store():
             adapter.close()
 
 
+def test_raw_block_l2_adapter_listener_errors_do_not_block_eventfds():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        adapter = RawBlockL2Adapter(_make_config(dev_path))
+        adapter.register_listener(_FailingListener())
+
+        try:
+            key = _create_object_key(29)
+            obj = _create_memory_obj(fill_value=29.0)
+
+            store_task_id = adapter.submit_store_task([key], [obj])
+            assert _wait_event_fd(adapter.get_store_event_fd())
+            assert adapter.pop_completed_store_tasks()[store_task_id] is True
+
+            load_buffer = _create_memory_obj(fill_value=0.0)
+            load_task_id = adapter.submit_load_task([key], [load_buffer])
+            assert _wait_event_fd(adapter.get_load_event_fd())
+            load_bitmap = adapter.query_load_result(load_task_id)
+            assert load_bitmap is not None
+            assert load_bitmap.get_indices_list() == [0]
+        finally:
+            adapter.close()
+
+
 def test_raw_block_l2_adapter_recovery_from_checkpoint():
     with tempfile.TemporaryDirectory() as td:
         dev_path = os.path.join(td, "dev.bin")
@@ -309,6 +364,34 @@ def test_raw_block_l2_adapter_recovery_from_checkpoint():
             assert load_bitmap.get_indices_list() == [0]
             assert torch.equal(load_buffer.tensor, obj.tensor)
             adapter2.submit_unlock([key])
+        finally:
+            adapter2.close()
+
+
+def test_raw_block_l2_adapter_recovers_unknown_checkpoint_dtype():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        config = _make_config(dev_path)
+        key = _create_object_key(35)
+        obj = _create_complex_memory_obj(fill_value=1 + 2j)
+
+        adapter1 = RawBlockL2Adapter(config)
+        try:
+            assert _run_store(adapter1, [key], [obj]) is True
+        finally:
+            adapter1.close()
+
+        adapter2 = RawBlockL2Adapter(config)
+        try:
+            load_buffer = _create_complex_memory_obj(fill_value=0j)
+            _, load_bitmap = _run_load(adapter2, [key], [load_buffer])
+            assert load_bitmap is not None
+            assert load_bitmap.get_indices_list() == [0]
+            assert load_buffer.metadata.dtype is torch.complex64
+            assert torch.equal(load_buffer.tensor, obj.tensor)
         finally:
             adapter2.close()
 

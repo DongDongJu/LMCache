@@ -1081,11 +1081,7 @@ class RawBlockCore:
                         "shape": list(entry.meta.shape)
                         if entry.meta.shape is not None
                         else None,
-                        "dtype": (
-                            TORCH_DTYPE_TO_STR_DTYPE.get(entry.meta.dtype)
-                            if entry.meta.dtype is not None
-                            else None
-                        ),
+                        "dtype": self._checkpoint_dtype_name(entry.meta.dtype),
                         "fmt": (
                             entry.meta.fmt.name
                             if entry.meta.fmt is not None
@@ -1105,6 +1101,20 @@ class RawBlockCore:
                 },
             }
         return snapshot, dirty_total
+
+    def _checkpoint_dtype_name(self, dtype: torch.dtype | None) -> str | None:
+        """Return a durable checkpoint string for a torch dtype.
+
+        Args:
+            dtype: Torch dtype from recovered or live memory metadata.
+
+        Returns:
+            Stable LMCache dtype name when known, ``str(dtype)`` for unknown
+            torch dtypes, or None when no dtype is available.
+        """
+        if dtype is None:
+            return None
+        return TORCH_DTYPE_TO_STR_DTYPE.get(dtype, str(dtype))
 
     def _write_checkpoint(self, payload: bytes, dirty_total_snapshot: int) -> bool:
         """Write one checkpoint copy and advance persisted metadata counters."""
@@ -1341,11 +1351,13 @@ class RawBlockCore:
 
             torch_prefix = "torch."
             if dtype_name.startswith(torch_prefix):
-                dtype = STR_DTYPE_TO_TORCH_DTYPE.get(
-                    dtype_name.removeprefix(torch_prefix)
-                )
+                dtype_attr = dtype_name.removeprefix(torch_prefix)
+                dtype = STR_DTYPE_TO_TORCH_DTYPE.get(dtype_attr)
                 if dtype is not None:
                     return dtype
+                torch_dtype = getattr(torch, dtype_attr, None)
+                if isinstance(torch_dtype, torch.dtype):
+                    return torch_dtype
 
         if self.key_namespace != "legacy":
             return None
