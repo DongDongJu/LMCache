@@ -501,18 +501,20 @@ class RawBlockL2Adapter(L2AdapterInterface):
             if self._closed:
                 return
             self._closed = True
-            store_efd = self._store_efd
-            lookup_efd = self._lookup_efd
-            load_efd = self._load_efd
-            self._store_efd = -1
-            self._lookup_efd = -1
-            self._load_efd = -1
 
         self._store_pool.shutdown(wait=True)
         self._lookup_pool.shutdown(wait=True)
         self._load_pool.shutdown(wait=True)
 
         self._core.close()
+
+        with self._lock:
+            store_efd = self._store_efd
+            lookup_efd = self._lookup_efd
+            load_efd = self._load_efd
+            self._store_efd = -1
+            self._lookup_efd = -1
+            self._load_efd = -1
 
         if store_efd >= 0:
             os.close(store_efd)
@@ -618,6 +620,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
         with self._lock:
             self._store_inflight_tasks -= 1
             self._completed_store_tasks[task_id] = success
+            event_fd = self._store_efd
         if stored_keys:
             try:
                 self._notify_keys_stored(stored_keys, stored_sizes)
@@ -628,7 +631,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 self._notify_keys_deleted(evicted_keys, evicted_sizes)
             except Exception as e:
                 logger.warning("RawBlockL2Adapter delete notification failed: %s", e)
-        self._signal_event_fd(self._store_efd)
+        self._signal_event_fd(event_fd)
 
     def _run_lookup_task(self, keys: list[ObjectKey]) -> Bitmap:
         specs = [encode_object_key(key) for key in keys]
@@ -650,7 +653,8 @@ class RawBlockL2Adapter(L2AdapterInterface):
         with self._lock:
             self._lookup_inflight_tasks -= 1
             self._completed_lookup_tasks[task_id] = bitmap
-        self._signal_event_fd(self._lookup_efd)
+            event_fd = self._lookup_efd
+        self._signal_event_fd(event_fd)
 
     def _run_load_task(
         self,
@@ -679,12 +683,13 @@ class RawBlockL2Adapter(L2AdapterInterface):
         with self._lock:
             self._load_inflight_tasks -= 1
             self._completed_load_tasks[task_id] = bitmap
+            event_fd = self._load_efd
         if accessed_keys:
             try:
                 self._notify_keys_accessed(accessed_keys)
             except Exception as e:
                 logger.warning("RawBlockL2Adapter access notification failed: %s", e)
-        self._signal_event_fd(self._load_efd)
+        self._signal_event_fd(event_fd)
 
     def _signal_event_fd(self, event_fd: int) -> None:
         try:
