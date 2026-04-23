@@ -474,9 +474,16 @@ class RawBlockL2Adapter(L2AdapterInterface):
 
     def close(self) -> None:
         """Wait for worker pools, close the core, and close eventfds."""
-        if self._closed:
-            return
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            store_efd = self._store_efd
+            lookup_efd = self._lookup_efd
+            load_efd = self._load_efd
+            self._store_efd = -1
+            self._lookup_efd = -1
+            self._load_efd = -1
 
         self._store_pool.shutdown(wait=True)
         self._lookup_pool.shutdown(wait=True)
@@ -484,9 +491,12 @@ class RawBlockL2Adapter(L2AdapterInterface):
 
         self._core.close()
 
-        os.close(self._store_efd)
-        os.close(self._lookup_efd)
-        os.close(self._load_efd)
+        if store_efd >= 0:
+            os.close(store_efd)
+        if lookup_efd >= 0:
+            os.close(lookup_efd)
+        if load_efd >= 0:
+            os.close(load_efd)
 
     def report_status(self) -> dict:
         """Return adapter health, task counters, and core status."""
