@@ -22,6 +22,7 @@ from lmcache.v1.storage_backend.abstract_backend import (
 from lmcache.v1.storage_backend.raw_block import (
     RawBlockCore,
     RawBlockCoreConfig,
+    RawBlockKeySpec,
     decode_legacy_key,
     encode_legacy_key,
 )
@@ -365,7 +366,7 @@ class RustRawBlockBackend(StoragePluginInterface):
                 obj.ref_count_down()
                 raise RuntimeError("RustRawBlockBackend requires an asyncio event loop")
             fut = asyncio.run_coroutine_threadsafe(
-                self._submit_put_one(key, spec.encoded, obj, on_complete_callback),
+                self._submit_put_one(key, spec, obj, on_complete_callback),
                 loop,
             )
             futures.append(fut)
@@ -374,19 +375,18 @@ class RustRawBlockBackend(StoragePluginInterface):
     async def _submit_put_one(
         self,
         key: CacheEngineKey,
-        encoded_key: str,
+        spec: RawBlockKeySpec,
         memory_obj: MemoryObj,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
     ) -> None:
         try:
-            spec = encode_legacy_key(key)
             put_result = await asyncio.to_thread(
                 self._core.put_many,
                 [spec],
                 [memory_obj],
             )
             if not put_result.results or not put_result.results[0]:
-                raise RuntimeError(f"Failed to persist raw-block key {encoded_key}")
+                raise RuntimeError(f"Failed to persist raw-block key {spec.encoded}")
             if on_complete_callback is not None:
                 try:
                     on_complete_callback(key)
@@ -490,8 +490,12 @@ class RustRawBlockBackend(StoragePluginInterface):
                 break
             prefix_hits += 1
         if pin and prefix_hits > 0:
+            pinned_hits = 0
             for encoded_key in encoded_keys[:prefix_hits]:
-                self._pin_if_needed(encoded_key)
+                if not self._pin_if_needed(encoded_key):
+                    break
+                pinned_hits += 1
+            prefix_hits = pinned_hits
         return prefix_hits
 
     async def batched_get_non_blocking(

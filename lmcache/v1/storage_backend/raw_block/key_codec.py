@@ -28,7 +28,18 @@ class RawBlockKeySpec:
 
 
 def object_key_to_string(key: ObjectKey) -> str:
-    """Serialize an ObjectKey using the same reversible shape as FS L2."""
+    """Serialize an ObjectKey using raw-block's reversible key shape.
+
+    Args:
+        key: Object key supplied by the MP storage layer.
+
+    Returns:
+        A stable string containing model name, KV rank, chunk hash, and
+        optional cache salt.
+
+    Raises:
+        AttributeError: If ``key`` does not expose the ObjectKey fields.
+    """
     safe_model = key.model_name.replace("/", _PATH_SLASH_REPLACEMENT)
     base = f"{safe_model}{_KEY_SEP}{key.kv_rank:#010x}{_KEY_SEP}{key.chunk_hash.hex()}"
     if key.cache_salt:
