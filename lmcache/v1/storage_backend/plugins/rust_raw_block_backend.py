@@ -36,6 +36,14 @@ PerTPDevicePaths = Mapping[TPRankKey, str]
 
 
 def _validate_per_tp_device_paths(per_tp_devices: PerTPDevicePaths) -> None:
+    """Validate that each TP rank uses a distinct raw-block device path.
+
+    Args:
+        per_tp_devices: Mapping from TP rank to raw-block device path.
+
+    Raises:
+        ValueError: If the same device path is assigned to multiple ranks.
+    """
     values = list(per_tp_devices.values())
     if len(values) != len(set(values)):
         raise ValueError(
@@ -46,10 +54,28 @@ def _validate_per_tp_device_paths(per_tp_devices: PerTPDevicePaths) -> None:
 def _get_per_tp_device_path(
     per_tp_devices: PerTPDevicePaths, tp_rank: int
 ) -> Optional[str]:
+    """Return the device path configured for a TP rank.
+
+    Args:
+        per_tp_devices: Mapping with string or integer rank keys.
+        tp_rank: Tensor-parallel rank to look up.
+
+    Returns:
+        The configured path, or None when the rank is absent.
+    """
     return per_tp_devices.get(str(tp_rank), per_tp_devices.get(tp_rank))
 
 
 def _round_up(x: int, align: int) -> int:
+    """Round a value up to the nearest alignment boundary.
+
+    Args:
+        x: Value to align.
+        align: Positive alignment in bytes.
+
+    Returns:
+        ``x`` rounded up to a multiple of ``align``.
+    """
     return ((x + align - 1) // align) * align
 
 
@@ -415,14 +441,12 @@ class RustRawBlockBackend(StoragePluginInterface):
 
         if not allocated:
             return []
-        if len(allocated) != len(prefix_specs):
-            for obj in allocated:
-                obj.ref_count_down()
-            return []
+
+        load_specs = prefix_specs[: len(allocated)]
 
         try:
             load_results = self._core.load_many_into(
-                [spec.encoded for spec in prefix_specs],
+                [spec.encoded for spec in load_specs],
                 allocated,
                 raise_on_error=True,
             )

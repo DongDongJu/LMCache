@@ -209,6 +209,7 @@ class RawBlockCore:
             raise
 
     def _rawdev(self):
+        """Return the lazily opened Rust raw-block device binding."""
         if self._raw is None:
             try:
                 # Third Party
@@ -683,6 +684,7 @@ class RawBlockCore:
         self._closed = True
 
     def _cleanup_after_init_failure(self) -> None:
+        """Close resources that may have been opened before init failed."""
         self._meta_stop_evt.set()
         if self._meta_thread is not None:
             self._meta_thread.join(timeout=5)
@@ -707,6 +709,19 @@ class RawBlockCore:
         *,
         zero_tail: bool,
     ) -> Optional[memoryview]:
+        """Build an aligned memoryview for direct O_DIRECT I/O when possible.
+
+        Args:
+            memory_obj: Memory object whose backing allocation may be aligned.
+            payload_len: Logical payload length in bytes.
+            total_len: I/O length after any O_DIRECT padding.
+            buffer_len: Available buffer length in bytes.
+            zero_tail: Whether to zero any padded tail bytes before writing.
+
+        Returns:
+            A direct memoryview over the allocation, or None when the memory
+            object is unsuitable for direct I/O.
+        """
         if not self.use_odirect or not self.enable_zero_copy:
             return None
 
@@ -741,6 +756,18 @@ class RawBlockCore:
             return None
 
     def _prepare_write_payload(self, memory_obj: MemoryObj) -> tuple[Any, int, int]:
+        """Prepare the payload buffer and lengths for a raw-block write.
+
+        Args:
+            memory_obj: Source object to persist.
+
+        Returns:
+            A tuple of ``(buffer, payload_len, total_len)`` where ``total_len``
+            includes any O_DIRECT padding.
+
+        Raises:
+            RuntimeError: If the aligned payload would exceed slot capacity.
+        """
         buf = memory_obj.byte_array
         if hasattr(buf, "cast"):
             buf = buf.cast("B")
@@ -766,6 +793,16 @@ class RawBlockCore:
     def _write_one(
         self, key: RawBlockKeySpec, memory_obj: MemoryObj, offset: int
     ) -> bool:
+        """Write one object header and payload into a raw-block slot.
+
+        Args:
+            key: Raw-block key spec with the slot-header identity.
+            memory_obj: Source object to write.
+            offset: Slot byte offset on the raw device.
+
+        Returns:
+            True when both header and payload writes complete; false otherwise.
+        """
         try:
             header = self._encode_header(key.slot_identity, len(memory_obj.byte_array))
             buf, payload_len, total_len = self._prepare_write_payload(memory_obj)
@@ -796,6 +833,7 @@ class RawBlockCore:
             return False
 
     def _encode_header(self, slot_identity: int, payload_len: int) -> bytes:
+        """Encode a fixed-size raw-block slot header."""
         hdr = bytearray(self.header_bytes)
         hdr[0:8] = b"LMCBLK01"
         hdr[8:16] = int(slot_identity & ((1 << 64) - 1)).to_bytes(
@@ -807,6 +845,7 @@ class RawBlockCore:
         return bytes(hdr)
 
     def _decode_slot_header(self, hdr: bytes) -> Optional[tuple[int, int]]:
+        """Decode a raw-block slot header into identity and payload length."""
         if len(hdr) < 24 or hdr[0:8] != b"LMCBLK01":
             return None
         slot_identity = int.from_bytes(hdr[8:16], "little", signed=False)
@@ -814,6 +853,7 @@ class RawBlockCore:
         return slot_identity, payload_len
 
     def _read_slot_header(self, offset: int) -> Optional[tuple[int, int]]:
+        """Read and decode the slot header at a raw-device offset."""
         buf = bytearray(self.header_bytes)
         try:
             with self._lock:
@@ -828,6 +868,7 @@ class RawBlockCore:
                 self._last_io_ts = time.monotonic()
 
     def _ensure_capacity_and_layout(self) -> None:
+        """Open the device if needed and compute metadata/data layout."""
         if self._effective_capacity_bytes > 0 and self._max_slots > 0:
             return
 
@@ -848,12 +889,15 @@ class RawBlockCore:
             )
 
     def _slot_to_offset(self, slot: int) -> int:
+        """Convert a data-slot index to its byte offset."""
         return self._data_base_offset + slot * self.slot_bytes
 
     def _offset_to_slot(self, offset: int) -> int:
+        """Convert a data-slot byte offset to its slot index."""
         return (offset - self._data_base_offset) // self.slot_bytes
 
     def _allocate_slot_locked(self) -> int:
+        """Allocate a slot offset while ``self._lock`` is held."""
         self._ensure_capacity_and_layout()
         if self._free_slots:
             return self._slot_to_offset(self._free_slots.pop())
@@ -864,10 +908,12 @@ class RawBlockCore:
         raise RuntimeError("No free slots available; eviction required")
 
     def _touch_locked(self, encoded_key: str) -> None:
+        """Mark a key as most recently used while ``self._lock`` is held."""
         self._lru.pop(encoded_key, None)
         self._lru[encoded_key] = None
 
     def _append_free_slot_locked(self, slot: int) -> None:
+        """Add a slot to the free list while ``self._lock`` is held."""
         if slot < 0 or slot >= self._max_slots:
             return
         if slot in self._free_slots:
@@ -875,6 +921,7 @@ class RawBlockCore:
         self._free_slots.append(slot)
 
     def _evict_one_locked(self) -> Optional[str]:
+        """Evict one unlocked LRU entry while ``self._lock`` is held."""
         for victim in list(self._lru.keys()):
             if self._lock_refcnt.get(victim, 0) > 0:
                 continue
@@ -892,6 +939,7 @@ class RawBlockCore:
         return None
 
     def _checkpoint_loop(self) -> None:
+        """Periodically checkpoint dirty metadata until shutdown."""
         interval = max(1, self.meta_checkpoint_interval_sec)
         while not self._meta_stop_evt.wait(interval):
             try:
@@ -900,14 +948,17 @@ class RawBlockCore:
                 logger.warning("Periodic raw-block metadata checkpoint failed: %s", e)
 
     def _meta_payload_capacity(self) -> int:
+        """Return usable bytes in one metadata checkpoint payload area."""
         return self._meta_container_bytes - self.block_align
 
     def _meta_container_offsets(self) -> list[int]:
+        """Return byte offsets for mirrored metadata checkpoint containers."""
         return [
             idx * self._meta_container_bytes for idx in range(self._meta_copy_count)
         ]
 
     def _read_meta_header(self, container_offset: int) -> Optional[dict[str, int]]:
+        """Read and validate a metadata checkpoint header."""
         buf = bytearray(self.block_align)
         try:
             self._rawdev().pread_into(
@@ -932,6 +983,7 @@ class RawBlockCore:
         }
 
     def _load_meta_payload(self, header: dict[str, int]) -> Optional[bytes]:
+        """Load and CRC-validate a checkpoint payload for a metadata header."""
         payload_len = int(header["payload_len"])
         payload_off = int(header["container_offset"]) + self.block_align
         total_len = _round_up(payload_len, self.block_align)
@@ -950,6 +1002,7 @@ class RawBlockCore:
     def _select_latest_checkpoint(
         self,
     ) -> tuple[Optional[dict[str, int]], Optional[bytes]]:
+        """Return the newest valid checkpoint header and payload."""
         best_header: Optional[dict[str, int]] = None
         best_payload: Optional[bytes] = None
         for offset in self._meta_container_offsets():
@@ -965,6 +1018,7 @@ class RawBlockCore:
         return best_header, best_payload
 
     def _snapshot_state(self) -> tuple[dict[str, Any], int]:
+        """Build a JSON-serializable checkpoint state snapshot."""
         with self._lock:
             dirty_total = self._meta_dirty_total
             snapshot = {
@@ -1014,6 +1068,7 @@ class RawBlockCore:
         return snapshot, dirty_total
 
     def _write_checkpoint(self, payload: bytes, dirty_total_snapshot: int) -> bool:
+        """Write one checkpoint copy and advance persisted metadata counters."""
         payload_cap = self._meta_payload_capacity()
         if len(payload) > payload_cap:
             logger.warning(
@@ -1052,6 +1107,7 @@ class RawBlockCore:
         return True
 
     def _checkpoint_once(self, force: bool) -> bool:
+        """Write a metadata checkpoint when dirty and sufficiently idle."""
         with self._lock:
             dirty = self._meta_dirty_total > self._meta_persisted
             idle_ok = self._inflight_io_count == 0 and (
@@ -1070,6 +1126,7 @@ class RawBlockCore:
         return self._write_checkpoint(payload, dirty_total_snapshot)
 
     def _is_valid_checkpoint_entry(self, offset: int, size: int) -> bool:
+        """Return whether a checkpoint entry references a valid data slot."""
         if offset < self._data_base_offset:
             return False
         rel = offset - self._data_base_offset
@@ -1081,6 +1138,7 @@ class RawBlockCore:
         return 0 < size <= (self.slot_bytes - self.header_bytes)
 
     def _apply_loaded_state(self, data: dict[str, Any]) -> bool:
+        """Apply decoded checkpoint state after validating layout fields."""
         if not isinstance(data, dict):
             return False
         if int(data.get("version", 0)) != 1:
@@ -1223,6 +1281,7 @@ class RawBlockCore:
         return True
 
     def _validate_loaded_entries(self) -> None:
+        """Drop recovered entries whose slot headers do not match metadata."""
         to_drop: list[str] = []
         with self._lock:
             items = list(self._index.items())
@@ -1268,6 +1327,7 @@ class RawBlockCore:
         )
 
     def _load_checkpoint_from_device(self) -> None:
+        """Load the newest valid checkpoint from the raw device if present."""
         header, payload = self._select_latest_checkpoint()
         if header is None:
             logger.info("RawBlockCore: no valid on-device metadata checkpoint found")
