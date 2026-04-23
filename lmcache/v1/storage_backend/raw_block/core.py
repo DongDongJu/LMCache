@@ -20,7 +20,11 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import DiskCacheMetadata, STR_DTYPE_TO_TORCH_DTYPE, TORCH_DTYPE_TO_STR_DTYPE
+from lmcache.utils import (
+    DiskCacheMetadata,
+    STR_DTYPE_TO_TORCH_DTYPE,
+    TORCH_DTYPE_TO_STR_DTYPE,
+)
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.storage_backend.raw_block.key_codec import (
     RawBlockKeyNamespace,
@@ -43,6 +47,8 @@ def _round_up(x: int, align: int) -> int:
 
 @dataclass(frozen=True)
 class RawBlockCoreConfig:
+    """Configuration for RawBlockCore device layout, I/O, and checkpoints."""
+
     device_path: str
     capacity_bytes: int
     block_align: int
@@ -75,7 +81,10 @@ class _Inflight:
 
 @dataclass(frozen=True)
 class RawBlockPutManyResult:
+    """Result of a RawBlockCore batched write."""
+
     results: list[bool]
+    stored_keys: list[str]
     evicted_keys: list[str]
 
 
@@ -93,6 +102,22 @@ class RawBlockCore:
         *,
         key_namespace: RawBlockKeyNamespace,
     ):
+        """Initialize the raw-block storage engine.
+
+        Args:
+            config: Raw-block device, layout, I/O, and checkpoint settings.
+            key_namespace: Encoding namespace used by keys stored in this core.
+
+        Raises:
+            ValueError: If the supplied configuration is invalid.
+            RuntimeError: If the raw device cannot be opened or the computed
+                layout cannot fit metadata and at least one data slot.
+
+        Notes:
+            If initialization opens the device and a later recovery step fails,
+            the partially opened resources are closed before the exception is
+            re-raised.
+        """
         self.device_path = config.device_path
         self.capacity_bytes = int(config.capacity_bytes)
         self.block_align = int(config.block_align)
@@ -168,16 +193,20 @@ class RawBlockCore:
         self._meta_stop_evt = threading.Event()
         self._meta_thread: Optional[threading.Thread] = None
 
-        self._ensure_capacity_and_layout()
-        self._load_checkpoint_from_device()
+        try:
+            self._ensure_capacity_and_layout()
+            self._load_checkpoint_from_device()
 
-        if self.meta_enable_periodic:
-            self._meta_thread = threading.Thread(
-                target=self._checkpoint_loop,
-                daemon=True,
-                name="raw-block-core-checkpoint",
-            )
-            self._meta_thread.start()
+            if self.meta_enable_periodic:
+                self._meta_thread = threading.Thread(
+                    target=self._checkpoint_loop,
+                    daemon=True,
+                    name="raw-block-core-checkpoint",
+                )
+                self._meta_thread.start()
+        except Exception:
+            self._cleanup_after_init_failure()
+            raise
 
     def _rawdev(self):
         if self._raw is None:
@@ -198,13 +227,40 @@ class RawBlockCore:
         return self._raw
 
     def contains_key(self, encoded_key: str, *, lock: bool = False) -> bool:
+        """Return whether one encoded key is present in the raw-block index.
+
+        Args:
+            encoded_key: Encoded raw-block key string.
+            lock: If true, increment the key's L2 lock refcount on hit.
+
+        Returns:
+            True when the key is indexed and available for load.
+        """
         return self.exists_many([encoded_key], lock=lock)[0]
 
     def exists_inflight(self, encoded_key: str) -> bool:
+        """Return whether a key currently has an in-flight write.
+
+        Args:
+            encoded_key: Encoded raw-block key string.
+
+        Returns:
+            True when the key is being written but not committed yet.
+        """
         with self._lock:
             return encoded_key in self._inflight
 
-    def get_metadata_many(self, encoded_keys: Sequence[str]) -> list[DiskCacheMetadata | None]:
+    def get_metadata_many(
+        self, encoded_keys: Sequence[str]
+    ) -> list[DiskCacheMetadata | None]:
+        """Return metadata for encoded keys without loading payload bytes.
+
+        Args:
+            encoded_keys: Ordered encoded raw-block keys to inspect.
+
+        Returns:
+            A metadata-or-None list aligned with ``encoded_keys``.
+        """
         with self._lock:
             metas: list[DiskCacheMetadata | None] = []
             for encoded_key in encoded_keys:
@@ -212,15 +268,85 @@ class RawBlockCore:
                 metas.append(entry.meta if entry is not None else None)
             return metas
 
+    def first_encoded_key(self) -> str | None:
+        """Return one indexed encoded key for diagnostics.
+
+        Returns:
+            The first indexed key according to dictionary iteration order, or
+            None if the recovered/indexed metadata is empty.
+        """
+        with self._lock:
+            return next(iter(self._index), None)
+
+    def lock_refcount(self, encoded_key: str) -> int:
+        """Return the L2 lock refcount for an encoded key.
+
+        Args:
+            encoded_key: Encoded raw-block key string.
+
+        Returns:
+            Current lock refcount, or zero when the key is unlocked or absent.
+        """
+        with self._lock:
+            return int(self._lock_refcnt.get(encoded_key, 0))
+
+    def inflight_io_count(self) -> int:
+        """Return the number of currently active raw-device I/O operations."""
+        with self._lock:
+            return int(self._inflight_io_count)
+
+    def indexed_key_count(self) -> int:
+        """Return the number of entries currently present in the key index."""
+        with self._lock:
+            return len(self._index)
+
+    def entry_offset(self, encoded_key: str) -> int | None:
+        """Return the raw-device slot offset for an indexed key.
+
+        Args:
+            encoded_key: Encoded raw-block key string.
+
+        Returns:
+            Slot offset in bytes, or None when the key is not indexed.
+        """
+        with self._lock:
+            entry = self._index.get(encoded_key)
+            return None if entry is None else int(entry.offset)
+
+    def metadata_container_offsets(self) -> list[int]:
+        """Return checkpoint metadata container offsets in bytes."""
+        return self._meta_container_offsets()
+
+    def data_base_offset(self) -> int:
+        """Return the byte offset where raw-block data slots begin."""
+        return int(self._data_base_offset)
+
     def put_many(
         self,
         keys: Sequence[RawBlockKeySpec],
         objs: Sequence[MemoryObj],
     ) -> RawBlockPutManyResult:
+        """Persist a batch of memory objects into raw-block slots.
+
+        Args:
+            keys: Ordered raw-block key specs corresponding to ``objs``.
+            objs: Memory objects whose byte buffers should be written.
+
+        Returns:
+            Per-key success results, newly stored encoded keys, and encoded keys
+            evicted while making room.
+
+        Raises:
+            ValueError: If either sequence is empty or the sequence lengths do
+                not match.
+        """
+        if not keys or not objs:
+            raise ValueError("keys and objs must be non-empty")
         if len(keys) != len(objs):
             raise ValueError("keys and objs must have the same length")
 
         results = [False] * len(keys)
+        stored_keys: list[str] = []
         evicted_keys: list[str] = []
 
         for i, (key, obj) in enumerate(zip(keys, objs, strict=False)):
@@ -269,7 +395,9 @@ class RawBlockCore:
                     results[i] = False
                     continue
                 if inflight.canceled or not success:
-                    self._append_free_slot_locked(self._offset_to_slot(int(inflight.offset)))
+                    self._append_free_slot_locked(
+                        self._offset_to_slot(int(inflight.offset))
+                    )
                     self._meta_dirty_total += 1
                     results[i] = False
                     continue
@@ -282,8 +410,13 @@ class RawBlockCore:
                 self._touch_locked(key.encoded)
                 self._meta_dirty_total += 1
                 results[i] = True
+                stored_keys.append(key.encoded)
 
-        return RawBlockPutManyResult(results=results, evicted_keys=evicted_keys)
+        return RawBlockPutManyResult(
+            results=results,
+            stored_keys=stored_keys,
+            evicted_keys=evicted_keys,
+        )
 
     def exists_many(
         self,
@@ -291,13 +424,24 @@ class RawBlockCore:
         *,
         lock: bool = False,
     ) -> list[bool]:
+        """Return a full hit bitmap as booleans for encoded keys.
+
+        Args:
+            encoded_keys: Ordered encoded raw-block keys to check.
+            lock: If true, increment L2 lock refcounts for every hit.
+
+        Returns:
+            A list of booleans aligned with ``encoded_keys``.
+        """
         results: list[bool] = []
         with self._lock:
             for encoded_key in encoded_keys:
                 found = encoded_key in self._index
                 results.append(found)
                 if found and lock:
-                    self._lock_refcnt[encoded_key] = self._lock_refcnt.get(encoded_key, 0) + 1
+                    self._lock_refcnt[encoded_key] = (
+                        self._lock_refcnt.get(encoded_key, 0) + 1
+                    )
         return results
 
     def load_many_into(
@@ -307,10 +451,28 @@ class RawBlockCore:
         *,
         raise_on_error: bool = False,
     ) -> list[bool]:
+        """Load raw-block payloads into caller-provided memory objects.
+
+        Args:
+            encoded_keys: Ordered encoded raw-block keys to load.
+            objs: Destination memory objects. Buffers must remain valid until
+                this method returns.
+            raise_on_error: If true, re-raise the first load exception instead
+                of logging it and returning ``False`` for that key.
+
+        Returns:
+            A list of per-key load success booleans aligned with
+            ``encoded_keys``.
+
+        Raises:
+            ValueError: If either sequence is empty or the sequence lengths do
+                not match.
+            Exception: Re-raises load errors when ``raise_on_error`` is true.
+        """
+        if not encoded_keys or not objs:
+            raise ValueError("encoded_keys and objs must be non-empty")
         if len(encoded_keys) != len(objs):
             raise ValueError("encoded_keys and objs must have the same length")
-        if not encoded_keys:
-            return []
 
         with self._lock:
             items = [
@@ -376,6 +538,12 @@ class RawBlockCore:
         return results
 
     def unlock_many(self, encoded_keys: Sequence[str]) -> None:
+        """Release L2 lock references for encoded keys.
+
+        Args:
+            encoded_keys: Encoded raw-block keys whose lock refcounts should be
+                decremented. Missing keys and underflow are treated as no-ops.
+        """
         with self._lock:
             for encoded_key in encoded_keys:
                 refcnt = self._lock_refcnt.get(encoded_key, 0)
@@ -390,6 +558,16 @@ class RawBlockCore:
         *,
         force: bool = False,
     ) -> list[bool]:
+        """Delete indexed keys and recycle their slots when allowed.
+
+        Args:
+            encoded_keys: Ordered encoded raw-block keys to delete.
+            force: If true, delete locked keys as well. Normal MP eviction uses
+                false so locked entries are preserved.
+
+        Returns:
+            A list of per-key deletion booleans aligned with ``encoded_keys``.
+        """
         deleted: list[bool] = []
         with self._lock:
             for encoded_key in encoded_keys:
@@ -411,10 +589,19 @@ class RawBlockCore:
                         self._offset_to_slot(int(removed_entry.offset))
                     )
                     self._meta_dirty_total += 1
-                deleted.append(existed and (removed_entry is not None or inflight is not None))
+                deleted.append(
+                    existed and (removed_entry is not None or inflight is not None)
+                )
         return deleted
 
     def usage(self) -> tuple[float, float]:
+        """Return current and post-eviction usage fractions.
+
+        Returns:
+            ``(current_usage, projected_usage)``. Raw-block has no separate
+            projected value, so both values are identical. ``(-1.0, -1.0)``
+            indicates that usable capacity is unknown.
+        """
         with self._lock:
             usable_capacity = self._max_slots * self.slot_bytes
             if usable_capacity <= 0:
@@ -424,9 +611,23 @@ class RawBlockCore:
             return (usage, usage)
 
     def checkpoint_now(self) -> None:
+        """Synchronously write a metadata checkpoint."""
         self._checkpoint_once(force=True)
 
+    def apply_loaded_state(self, data: dict[str, Any]) -> bool:
+        """Validate and apply a recovered metadata checkpoint payload.
+
+        Args:
+            data: Decoded checkpoint dictionary.
+
+        Returns:
+            True when the payload shape and layout match this core and all
+            valid entries were applied. Invalid per-entry records are skipped.
+        """
+        return self._apply_loaded_state(data)
+
     def report_status(self) -> dict:
+        """Return raw-block health, layout, metadata, and in-flight counters."""
         with self._lock:
             return {
                 "is_healthy": not self._closed,
@@ -440,7 +641,9 @@ class RawBlockCore:
                 "usable_capacity_bytes": self._max_slots * self.slot_bytes,
                 "indexed_key_count": len(self._index),
                 "inflight_key_count": len(self._inflight),
-                "locked_key_count": sum(1 for refcnt in self._lock_refcnt.values() if refcnt > 0),
+                "locked_key_count": sum(
+                    1 for refcnt in self._lock_refcnt.values() if refcnt > 0
+                ),
                 "free_slot_count": len(self._free_slots),
                 "next_slot": self._next_slot,
                 "max_slots": self._max_slots,
@@ -453,6 +656,7 @@ class RawBlockCore:
             }
 
     def close(self) -> None:
+        """Stop checkpointing, write a final checkpoint, and close the device."""
         if self._closed:
             return
 
@@ -470,10 +674,28 @@ class RawBlockCore:
             try:
                 self._raw.close()
             except Exception as e:
-                logger.warning("Failed to close raw block device %s: %s", self.device_path, e)
+                logger.warning(
+                    "Failed to close raw block device %s: %s", self.device_path, e
+                )
             finally:
                 self._raw = None
 
+        self._closed = True
+
+    def _cleanup_after_init_failure(self) -> None:
+        self._meta_stop_evt.set()
+        if self._meta_thread is not None:
+            self._meta_thread.join(timeout=5)
+            self._meta_thread = None
+        if self._raw is not None:
+            try:
+                self._raw.close()
+            except Exception as e:
+                logger.warning(
+                    "Failed to close raw block device %s: %s", self.device_path, e
+                )
+            finally:
+                self._raw = None
         self._closed = True
 
     def _build_direct_odirect_view(
@@ -527,7 +749,9 @@ class RawBlockCore:
         if self.use_odirect:
             total_len = _round_up(payload_len, self.block_align)
             if total_len > (self.slot_bytes - self.header_bytes):
-                raise RuntimeError(f"O_DIRECT payload {total_len} exceeds slot capacity")
+                raise RuntimeError(
+                    f"O_DIRECT payload {total_len} exceeds slot capacity"
+                )
             direct_view = self._build_direct_odirect_view(
                 memory_obj=memory_obj,
                 payload_len=payload_len,
@@ -539,7 +763,9 @@ class RawBlockCore:
                 buf = direct_view
         return buf, payload_len, total_len
 
-    def _write_one(self, key: RawBlockKeySpec, memory_obj: MemoryObj, offset: int) -> bool:
+    def _write_one(
+        self, key: RawBlockKeySpec, memory_obj: MemoryObj, offset: int
+    ) -> bool:
         try:
             header = self._encode_header(key.slot_identity, len(memory_obj.byte_array))
             buf, payload_len, total_len = self._prepare_write_payload(memory_obj)
@@ -617,7 +843,9 @@ class RawBlockCore:
         data_bytes = self._effective_capacity_bytes - self._data_base_offset
         self._max_slots = data_bytes // self.slot_bytes
         if self._max_slots <= 0:
-            raise RuntimeError("raw block capacity too small for slot size after metadata")
+            raise RuntimeError(
+                "raw block capacity too small for slot size after metadata"
+            )
 
     def _slot_to_offset(self, slot: int) -> int:
         return self._data_base_offset + slot * self.slot_bytes
@@ -719,7 +947,9 @@ class RawBlockCore:
             return None
         return payload
 
-    def _select_latest_checkpoint(self) -> tuple[Optional[dict[str, int]], Optional[bytes]]:
+    def _select_latest_checkpoint(
+        self,
+    ) -> tuple[Optional[dict[str, int]], Optional[bytes]]:
         best_header: Optional[dict[str, int]] = None
         best_payload: Optional[bytes] = None
         for offset in self._meta_container_offsets():
@@ -755,7 +985,9 @@ class RawBlockCore:
                     encoded_key: {
                         "offset": entry.offset,
                         "size": entry.meta.size,
-                        "shape": list(entry.meta.shape) if entry.meta.shape is not None else None,
+                        "shape": list(entry.meta.shape)
+                        if entry.meta.shape is not None
+                        else None,
                         "dtype": (
                             TORCH_DTYPE_TO_STR_DTYPE.get(entry.meta.dtype)
                             if entry.meta.dtype is not None
@@ -763,7 +995,8 @@ class RawBlockCore:
                         ),
                         "fmt": (
                             entry.meta.fmt.name
-                            if entry.meta.fmt is not None and hasattr(entry.meta.fmt, "name")
+                            if entry.meta.fmt is not None
+                            and hasattr(entry.meta.fmt, "name")
                             else str(entry.meta.fmt)
                             if entry.meta.fmt is not None
                             else None
@@ -784,7 +1017,8 @@ class RawBlockCore:
         payload_cap = self._meta_payload_capacity()
         if len(payload) > payload_cap:
             logger.warning(
-                "RawBlockCore metadata payload too large (%d > %d), skipping checkpoint",
+                "RawBlockCore metadata payload too large (%d > %d), "
+                "skipping checkpoint",
                 len(payload),
                 payload_cap,
             )
@@ -861,7 +1095,9 @@ class RawBlockCore:
             int(data.get("meta_total_bytes", self.meta_total_bytes))
             != self.meta_total_bytes
         ):
-            logger.warning("Device metadata meta_total_bytes mismatch; ignoring metadata")
+            logger.warning(
+                "Device metadata meta_total_bytes mismatch; ignoring metadata"
+            )
             return False
         if str(data.get("meta_magic", self.meta_magic_text)) != self.meta_magic_text:
             logger.warning("Device metadata meta_magic mismatch; ignoring metadata")
@@ -931,10 +1167,13 @@ class RawBlockCore:
                     if not self._is_valid_checkpoint_entry(offset, size):
                         continue
 
-                    shape = torch.Size(list(shape_list)) if shape_list is not None else None
+                    shape = (
+                        torch.Size(list(shape_list)) if shape_list is not None else None
+                    )
                     fmt = (
                         MemoryFormat[fmt_name]
-                        if isinstance(fmt_name, str) and fmt_name in MemoryFormat.__members__
+                        if isinstance(fmt_name, str)
+                        and fmt_name in MemoryFormat.__members__
                         else MemoryFormat.UNDEFINED
                     )
                     cached_positions = (
@@ -955,10 +1194,13 @@ class RawBlockCore:
                         fmt=fmt,
                         pin_count=0,
                     )
-                    self._index[encoded_key] = _Entry(offset=offset, size=size, meta=meta)
+                    self._index[encoded_key] = _Entry(
+                        offset=offset, size=size, meta=meta
+                    )
 
             used_slots = {
-                self._offset_to_slot(int(entry.offset)) for entry in self._index.values()
+                self._offset_to_slot(int(entry.offset))
+                for entry in self._index.values()
             }
             self._free_slots = [
                 slot for slot in self._free_slots if slot not in used_slots
@@ -1020,7 +1262,8 @@ class RawBlockCore:
             self._meta_dirty_total += 1
 
         logger.warning(
-            "RawBlockCore dropped %d stale metadata entries after slot-header validation",
+            "RawBlockCore dropped %d stale metadata entries after "
+            "slot-header validation",
             len(to_drop),
         )
 
@@ -1029,13 +1272,15 @@ class RawBlockCore:
         if header is None:
             logger.info("RawBlockCore: no valid on-device metadata checkpoint found")
             return
-        assert payload is not None
+        if payload is None:
+            logger.warning("RawBlockCore: checkpoint header had no payload")
+            return
         try:
             data = json.loads(payload.decode("utf-8"))
         except Exception:
             logger.warning("RawBlockCore: failed to decode metadata payload")
             return
-        if not self._apply_loaded_state(data):
+        if not self.apply_loaded_state(data):
             logger.warning("RawBlockCore: metadata payload rejected by checks")
             return
         self._meta_seq = int(header["seq"])

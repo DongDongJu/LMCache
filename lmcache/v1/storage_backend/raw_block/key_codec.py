@@ -21,6 +21,8 @@ _UINT64_MASK = (1 << 64) - 1
 
 @dataclass(frozen=True)
 class RawBlockKeySpec:
+    """Encoded raw-block key plus stable slot-header identity."""
+
     encoded: str
     slot_identity: int
 
@@ -35,6 +37,18 @@ def object_key_to_string(key: ObjectKey) -> str:
 
 
 def decode_object_key(encoded: str) -> ObjectKey:
+    """Deserialize an ObjectKey from raw-block's reversible encoding.
+
+    Args:
+        encoded: Encoded key string produced by ``object_key_to_string``.
+
+    Returns:
+        The reconstructed ``ObjectKey``.
+
+    Raises:
+        ValueError: If the encoded string has an unexpected shape or invalid
+            hexadecimal chunk hash.
+    """
     parts = encoded.split(_KEY_SEP)
     if len(parts) == 3:
         safe_model, kv_rank_str, chunk_hash_hex = parts
@@ -53,6 +67,14 @@ def decode_object_key(encoded: str) -> ObjectKey:
 
 
 def encode_object_key(key: ObjectKey) -> RawBlockKeySpec:
+    """Encode an MP ObjectKey for raw-block storage.
+
+    Args:
+        key: Object key supplied by the MP storage layer.
+
+    Returns:
+        Encoded key and deterministic slot-header identity.
+    """
     encoded = object_key_to_string(key)
     return RawBlockKeySpec(
         encoded=encoded,
@@ -61,6 +83,18 @@ def encode_object_key(key: ObjectKey) -> RawBlockKeySpec:
 
 
 def decode_legacy_key(encoded: str) -> CacheEngineKey | LayerCacheEngineKey:
+    """Deserialize a legacy non-MP cache key string.
+
+    Args:
+        encoded: String produced by ``CacheEngineKey.to_string`` or
+            ``LayerCacheEngineKey.to_string``.
+
+    Returns:
+        Parsed legacy cache key.
+
+    Raises:
+        TypeError: If parsing returns an unsupported key type.
+    """
     parsed = parse_cache_key(encoded)
     if not isinstance(parsed, (CacheEngineKey, LayerCacheEngineKey)):
         raise TypeError(
@@ -71,6 +105,14 @@ def decode_legacy_key(encoded: str) -> CacheEngineKey | LayerCacheEngineKey:
 
 
 def encode_legacy_key(key: CacheEngineKey | LayerCacheEngineKey) -> RawBlockKeySpec:
+    """Encode a legacy non-MP cache key for raw-block storage.
+
+    Args:
+        key: Legacy cache key from the non-MP storage plugin path.
+
+    Returns:
+        Encoded key and slot-header identity derived from the chunk hash.
+    """
     return RawBlockKeySpec(
         encoded=key.to_string(),
         slot_identity=int(key.chunk_hash) & _UINT64_MASK,
@@ -81,6 +123,19 @@ def slot_identity_from_encoded_key(
     encoded: str,
     namespace: RawBlockKeyNamespace,
 ) -> int:
+    """Return the stable slot-header identity for an encoded key.
+
+    Args:
+        encoded: Encoded raw-block key string.
+        namespace: Key namespace used when the key was encoded.
+
+    Returns:
+        Unsigned 64-bit identity stored in the per-slot header.
+
+    Raises:
+        ValueError: If ``namespace`` is unsupported.
+        TypeError: If legacy key parsing returns an unsupported key type.
+    """
     if namespace == "legacy":
         key = decode_legacy_key(encoded)
         return int(key.chunk_hash) & _UINT64_MASK
