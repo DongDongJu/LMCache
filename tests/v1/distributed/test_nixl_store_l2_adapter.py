@@ -38,13 +38,23 @@ class _RecordingListener(L2AdapterListener):
         self.accessed: list[list[ObjectKey]] = []
         self.deleted: list[list[ObjectKey]] = []
 
-    def on_l2_keys_stored(self, keys: list[ObjectKey]):
+    def on_l2_keys_stored(
+        self,
+        keys: list[ObjectKey],
+        object_sizes: list[int] | None = None,
+    ):
+        del object_sizes
         self.stored.append(list(keys))
 
     def on_l2_keys_accessed(self, keys: list[ObjectKey]):
         self.accessed.append(list(keys))
 
-    def on_l2_keys_deleted(self, keys: list[ObjectKey]):
+    def on_l2_keys_deleted(
+        self,
+        keys: list[ObjectKey],
+        object_sizes: list[int] | None = None,
+    ):
+        del object_sizes
         self.deleted.append(list(keys))
 
 
