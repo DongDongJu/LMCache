@@ -29,6 +29,7 @@ from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.storage_backend.raw_block.key_codec import (
     RawBlockKeyNamespace,
     RawBlockKeySpec,
+    decode_legacy_key,
     slot_identity_from_encoded_key,
 )
 
@@ -1239,9 +1240,10 @@ class RawBlockCore:
                         if cached_positions_list is not None
                         else None
                     )
-                    dtype = None
-                    if isinstance(dtype_name, str):
-                        dtype = STR_DTYPE_TO_TORCH_DTYPE.get(dtype_name)
+                    dtype = self._recover_checkpoint_dtype(
+                        str(encoded_key),
+                        dtype_name,
+                    )
 
                     meta = DiskCacheMetadata(
                         path=f"{self.device_path}@{offset}",
@@ -1279,6 +1281,46 @@ class RawBlockCore:
         if self.meta_verify_on_load:
             self._validate_loaded_entries()
         return True
+
+    def _recover_checkpoint_dtype(
+        self,
+        encoded_key: str,
+        dtype_name: Any,
+    ) -> torch.dtype | None:
+        """Recover checkpoint dtype from entry metadata or legacy key strings.
+
+        Args:
+            encoded_key: Encoded raw-block key from the checkpoint entry.
+            dtype_name: Raw dtype value stored in the checkpoint entry.
+
+        Returns:
+            A torch dtype when recovery succeeds, otherwise None.
+        """
+        if isinstance(dtype_name, str):
+            dtype = STR_DTYPE_TO_TORCH_DTYPE.get(dtype_name)
+            if dtype is not None:
+                return dtype
+
+            torch_prefix = "torch."
+            if dtype_name.startswith(torch_prefix):
+                dtype = STR_DTYPE_TO_TORCH_DTYPE.get(
+                    dtype_name.removeprefix(torch_prefix)
+                )
+                if dtype is not None:
+                    return dtype
+
+        if self.key_namespace != "legacy":
+            return None
+
+        try:
+            return decode_legacy_key(encoded_key).dtype
+        except Exception:
+            logger.debug(
+                "Unable to recover dtype from legacy raw-block key %s",
+                encoded_key,
+                exc_info=True,
+            )
+            return None
 
     def _validate_loaded_entries(self) -> None:
         """Drop recovered entries whose slot headers do not match metadata."""

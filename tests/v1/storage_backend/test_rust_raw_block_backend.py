@@ -1077,6 +1077,95 @@ def test_rust_raw_block_backend_skips_invalid_checkpoint_entries(
 @pytest.mark.skipif(
     not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
 )
+def test_rust_raw_block_backend_recovers_legacy_key_dtype(
+    memory_allocator, loop_in_thread
+):
+    """Checkpoint recovery should fall back to dtype encoded in legacy keys."""
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        base_cfg = LMCacheEngineConfig.from_defaults(
+            chunk_size=256,
+            local_cpu=True,
+            max_local_cpu_size=0.1,
+            lmcache_instance_id="test_rust_raw_block_backend_legacy_dtype",
+        )
+        base_cfg.storage_plugins = []
+        base_cfg.extra_config = {
+            "rust_raw_block.device_path": dev_path,
+            "rust_raw_block.block_align": 4096,
+            "rust_raw_block.header_bytes": 4096,
+            "rust_raw_block.slot_bytes": 1 * 1024 * 1024,
+            "rust_raw_block.meta_total_bytes": 4 * 1024 * 1024,
+            "rust_raw_block.meta_enable_periodic": False,
+            "rust_raw_block.meta_verify_on_load": False,
+        }
+        metadata = LMCacheMetadata(
+            model_name="test_model",
+            world_size=1,
+            local_world_size=1,
+            worker_id=0,
+            local_worker_id=0,
+            kv_dtype=torch.bfloat16,
+            kv_shape=(4, 2, 256, 8, 128),
+        )
+
+        local_cpu = LocalCPUBackend(
+            config=base_cfg,
+            metadata=metadata,
+            dst_device="cpu",
+            memory_allocator=memory_allocator,
+        )
+        backend = RustRawBlockBackend(
+            config=base_cfg,
+            metadata=metadata,
+            local_cpu_backend=local_cpu,
+            loop=loop_in_thread,
+            dst_device="cpu",
+        )
+        try:
+            key = CacheEngineKey("test_model", 1, 0, 99, torch.bfloat16)
+            applied = backend.apply_loaded_state(
+                {
+                    "version": 1,
+                    "device_path": dev_path,
+                    "capacity_bytes": backend.capacity_bytes,
+                    "block_align": backend.block_align,
+                    "header_bytes": backend.header_bytes,
+                    "slot_bytes": backend.slot_bytes,
+                    "meta_total_bytes": backend.meta_total_bytes,
+                    "meta_magic": backend.meta_magic_text,
+                    "meta_version": backend.meta_version,
+                    "data_base_offset": backend.data_base_offset,
+                    "next_slot": 1,
+                    "free_slots": [],
+                    "lru_keys": [key.to_string()],
+                    "entries": {
+                        key.to_string(): {
+                            "offset": backend.data_base_offset,
+                            "size": 1024,
+                            "shape": [512],
+                            "dtype": "torch.bfloat16",
+                            "fmt": MemoryFormat.KV_2LTD.name,
+                            "cached_positions": None,
+                        }
+                    },
+                }
+            )
+
+            assert applied is True
+            loaded = backend.batched_get_blocking([key])
+            assert loaded[0] is not None
+            assert loaded[0].metadata.dtype is torch.bfloat16
+        finally:
+            backend.close()
+
+
+@pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
 def test_rust_raw_block_backend_tp4_initialization(memory_allocator, loop_in_thread):
     """Test TP=4 initialization with per-TP device paths."""
     TP = 4

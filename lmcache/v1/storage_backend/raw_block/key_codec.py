@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 import hashlib
+import urllib.parse
 
 # First Party
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, parse_cache_key
@@ -15,7 +16,6 @@ from lmcache.v1.distributed.api import ObjectKey
 RawBlockKeyNamespace = Literal["legacy", "object"]
 
 _KEY_SEP = "@"
-_PATH_SLASH_REPLACEMENT = "-SEP-"
 _UINT64_MASK = (1 << 64) - 1
 
 
@@ -40,7 +40,7 @@ def object_key_to_string(key: ObjectKey) -> str:
     Raises:
         AttributeError: If ``key`` does not expose the ObjectKey fields.
     """
-    safe_model = key.model_name.replace("/", _PATH_SLASH_REPLACEMENT)
+    safe_model = urllib.parse.quote(key.model_name, safe="")
     base = f"{safe_model}{_KEY_SEP}{key.kv_rank:#010x}{_KEY_SEP}{key.chunk_hash.hex()}"
     if key.cache_salt:
         return f"{base}{_KEY_SEP}{key.cache_salt}"
@@ -71,7 +71,7 @@ def decode_object_key(encoded: str) -> ObjectKey:
 
     return ObjectKey(
         chunk_hash=bytes.fromhex(chunk_hash_hex),
-        model_name=safe_model.replace(_PATH_SLASH_REPLACEMENT, "/"),
+        model_name=urllib.parse.unquote(safe_model),
         kv_rank=int(kv_rank_str, 16),
         cache_salt=cache_salt,
     )
