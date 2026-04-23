@@ -101,6 +101,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             internal_eviction_policy: Internal slot-reuse policy. PR1 supports
                 only ``"lru"``.
         """
+        super().__init__()
         self.device_path = device_path
         self.slot_bytes = int(slot_bytes)
         self.capacity_bytes = int(capacity_bytes)
@@ -164,10 +165,12 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "num_lookup_workers": 1,
             "num_load_workers": 4,
         }
+        worker_counts: dict[str, int] = {}
         for field_name, default in worker_defaults.items():
             value = int(d.get(field_name, default))
             if value <= 0:
                 raise ValueError(f"{field_name} must be > 0")
+            worker_counts[field_name] = value
 
         return cls(
             device_path=device_path,
@@ -184,9 +187,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             meta_enable_periodic=bool(d.get("meta_enable_periodic", True)),
             meta_verify_on_load=bool(d.get("meta_verify_on_load", True)),
             enable_zero_copy=bool(d.get("enable_zero_copy", True)),
-            num_store_workers=int(d.get("num_store_workers", 2)),
-            num_lookup_workers=int(d.get("num_lookup_workers", 1)),
-            num_load_workers=int(d.get("num_load_workers", 4)),
+            num_store_workers=worker_counts["num_store_workers"],
+            num_lookup_workers=worker_counts["num_lookup_workers"],
+            num_load_workers=worker_counts["num_load_workers"],
             internal_eviction_policy=internal_eviction_policy,
         )
 

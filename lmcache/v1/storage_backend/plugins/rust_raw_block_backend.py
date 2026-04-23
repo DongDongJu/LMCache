@@ -405,72 +405,66 @@ class RustRawBlockBackend(StoragePluginInterface):
         allocated: list[MemoryObj] = []
         locked_specs: list[RawBlockKeySpec] = []
         with self._pin_lock:
-            try:
-                prefix_metas = self._core.get_metadata_prefix(
-                    encoded_keys,
-                    lock=True,
-                    skip_locked=self._pinned_keys,
-                )
-                prefix_specs = specs[: len(prefix_metas)]
-                locked_specs = [
-                    spec
-                    for spec in prefix_specs
-                    if spec.encoded not in self._pinned_keys
-                ]
+            prefix_metas = self._core.get_metadata_prefix(
+                encoded_keys,
+                lock=True,
+                skip_locked=self._pinned_keys,
+            )
+            prefix_specs = specs[: len(prefix_metas)]
+            locked_specs = [
+                spec for spec in prefix_specs if spec.encoded not in self._pinned_keys
+            ]
 
-                if not prefix_specs:
-                    return []
+        if not prefix_specs:
+            return []
 
-                for spec, meta in zip(prefix_specs, prefix_metas, strict=False):
-                    if meta.shape is None or meta.dtype is None:
-                        logger.warning(
-                            "Raw-block metadata missing shape/dtype for key %s; "
-                            "aborting prefix load",
-                            spec.encoded,
-                        )
-                        break
-                    if self.local_cpu_backend is None:
-                        raise RuntimeError(
-                            "RustRawBlockBackend requires local_cpu_backend"
-                        )
-                    memory_obj = self.local_cpu_backend.allocate(
-                        meta.shape,
-                        meta.dtype,
-                        meta.fmt,
+        try:
+            for spec, meta in zip(prefix_specs, prefix_metas, strict=False):
+                if meta.shape is None or meta.dtype is None:
+                    logger.warning(
+                        "Raw-block metadata missing shape/dtype for key %s; "
+                        "aborting prefix load",
+                        spec.encoded,
                     )
-                    if memory_obj is None:
-                        logger.error(
-                            "Failed to allocate memory for key %s", spec.encoded
-                        )
-                        break
-                    allocated.append(memory_obj)
-
-                if not allocated:
-                    return []
-
-                load_specs = prefix_specs[: len(allocated)]
-                load_results = self._core.load_many_into(
-                    [spec.encoded for spec in load_specs],
-                    allocated,
-                    raise_on_error=True,
+                    break
+                if self.local_cpu_backend is None:
+                    raise RuntimeError("RustRawBlockBackend requires local_cpu_backend")
+                memory_obj = self.local_cpu_backend.allocate(
+                    meta.shape,
+                    meta.dtype,
+                    meta.fmt,
                 )
-                loaded_count = 0
-                for ok in load_results:
-                    if not ok:
-                        break
-                    loaded_count += 1
-                if loaded_count == len(allocated):
-                    return allocated
+                if memory_obj is None:
+                    logger.error("Failed to allocate memory for key %s", spec.encoded)
+                    break
+                allocated.append(memory_obj)
 
-                for obj in allocated[loaded_count:]:
-                    obj.ref_count_down()
-                return allocated[:loaded_count]
-            except Exception:
-                for obj in allocated:
-                    obj.ref_count_down()
-                raise
-            finally:
-                self._core.unlock_many([spec.encoded for spec in locked_specs])
+            if not allocated:
+                return []
+
+            load_specs = prefix_specs[: len(allocated)]
+            load_results = self._core.load_many_into(
+                [spec.encoded for spec in load_specs],
+                allocated,
+                raise_on_error=True,
+            )
+            loaded_count = 0
+            for ok in load_results:
+                if not ok:
+                    break
+                loaded_count += 1
+            if loaded_count == len(allocated):
+                return allocated
+
+            for obj in allocated[loaded_count:]:
+                obj.ref_count_down()
+            return allocated[:loaded_count]
+        except Exception:
+            for obj in allocated:
+                obj.ref_count_down()
+            raise
+        finally:
+            self._core.unlock_many([spec.encoded for spec in locked_specs])
 
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         loaded = self._batched_get_prefix([key])
