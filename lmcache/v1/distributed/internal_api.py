@@ -114,12 +114,17 @@ class L2AdapterListener(EventListener):
     """Listener for L2 adapter events, analogous to L1ManagerListener."""
 
     @abstractmethod
-    def on_l2_keys_stored(self, keys: list[ObjectKey]):
+    def on_l2_keys_stored(
+        self,
+        keys: list[ObjectKey],
+        object_sizes: list[int] | None = None,
+    ):
         """
         Notify the listener that keys have been successfully stored in L2.
 
         Args:
             keys (list[ObjectKey]): The keys that have been stored.
+            object_sizes: Optional byte sizes aligned with ``keys``.
         """
         pass
 
@@ -134,12 +139,17 @@ class L2AdapterListener(EventListener):
         pass
 
     @abstractmethod
-    def on_l2_keys_deleted(self, keys: list[ObjectKey]):
+    def on_l2_keys_deleted(
+        self,
+        keys: list[ObjectKey],
+        object_sizes: list[int] | None = None,
+    ):
         """
         Notify the listener that keys have been deleted from L2.
 
         Args:
             keys (list[ObjectKey]): The keys that have been deleted.
+            object_sizes: Optional byte sizes aligned with ``keys``.
         """
         pass
 

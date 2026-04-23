@@ -461,12 +461,17 @@ class RawBlockL2Adapter(L2AdapterInterface):
     def delete(self, keys: list[ObjectKey]) -> None:
         """Delete keys from raw-block L2 and notify listeners for removals."""
         encoded_keys = [encode_object_key(key).encoded for key in keys]
+        metas = self._core.get_metadata_many(encoded_keys)
         deleted_bitmap = self._core.delete_many(encoded_keys, force=False)
-        deleted_keys = [
-            key for key, deleted in zip(keys, deleted_bitmap, strict=False) if deleted
-        ]
+        deleted_keys: list[ObjectKey] = []
+        deleted_sizes: list[int] = []
+        for key, meta, deleted in zip(keys, metas, deleted_bitmap, strict=False):
+            if not deleted:
+                continue
+            deleted_keys.append(key)
+            deleted_sizes.append(0 if meta is None else int(meta.size))
         if deleted_keys:
-            self._notify_keys_deleted(deleted_keys)
+            self._notify_keys_deleted(deleted_keys, deleted_sizes)
 
     def get_usage(self) -> tuple[float, float]:
         """Return current and projected raw-block usage fractions."""
@@ -527,32 +532,50 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self,
         keys: list[ObjectKey],
         objects: list[MemoryObj],
-    ) -> tuple[bool, list[ObjectKey], list[ObjectKey]]:
+    ) -> tuple[bool, list[ObjectKey], list[int], list[ObjectKey], list[int]]:
         specs = [encode_object_key(key) for key in keys]
         put_result = self._core.put_many(specs, objects)
         stored_encoded = set(put_result.stored_keys)
-        stored_keys = [
-            key
-            for key, spec in zip(keys, specs, strict=False)
-            if spec.encoded in stored_encoded
-        ]
+        stored_keys: list[ObjectKey] = []
+        stored_sizes: list[int] = []
+        for key, spec, obj in zip(keys, specs, objects, strict=False):
+            if spec.encoded not in stored_encoded:
+                continue
+            stored_keys.append(key)
+            stored_sizes.append(obj.get_size())
         evicted_keys: list[ObjectKey] = []
-        for encoded_key in put_result.evicted_keys:
+        evicted_sizes: list[int] = []
+        for encoded_key, size in zip(
+            put_result.evicted_keys,
+            put_result.evicted_key_sizes,
+            strict=False,
+        ):
             try:
                 evicted_keys.append(decode_object_key(encoded_key))
+                evicted_sizes.append(size)
             except ValueError:
                 logger.warning(
                     "RawBlockL2Adapter skipped evicted non-object key %s",
                     encoded_key,
                 )
-        return (all(put_result.results), stored_keys, evicted_keys)
+        return (
+            all(put_result.results),
+            stored_keys,
+            stored_sizes,
+            evicted_keys,
+            evicted_sizes,
+        )
 
     def _finish_store_task(self, task_id: L2TaskId, future: Future[Any]) -> None:
         success = False
         stored_keys: list[ObjectKey] = []
+        stored_sizes: list[int] = []
         evicted_keys: list[ObjectKey] = []
+        evicted_sizes: list[int] = []
         try:
-            success, stored_keys, evicted_keys = future.result()
+            success, stored_keys, stored_sizes, evicted_keys, evicted_sizes = (
+                future.result()
+            )
         except Exception as e:
             logger.error("RawBlockL2Adapter store task %d failed: %s", task_id, e)
         with self._lock:
@@ -560,12 +583,12 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._completed_store_tasks[task_id] = success
         if stored_keys:
             try:
-                self._notify_keys_stored(stored_keys)
+                self._notify_keys_stored(stored_keys, stored_sizes)
             except Exception as e:
                 logger.warning("RawBlockL2Adapter store notification failed: %s", e)
         if evicted_keys:
             try:
-                self._notify_keys_deleted(evicted_keys)
+                self._notify_keys_deleted(evicted_keys, evicted_sizes)
             except Exception as e:
                 logger.warning("RawBlockL2Adapter delete notification failed: %s", e)
         self._signal_event_fd(self._store_efd)

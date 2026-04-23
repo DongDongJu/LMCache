@@ -350,31 +350,40 @@ class L2AdapterInterface(ABC):
         """Register a listener to receive L2 adapter events."""
         self._listeners.append(listener)
 
-    def _notify_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
+    def _notify_keys_stored(
+        self,
+        keys: list[ObjectKey],
+        object_sizes: list[int] | None = None,
+    ) -> None:
         """Update byte accounting and notify listeners that ``keys`` were
-        stored. ``sizes[i]`` is the byte size of ``keys[i]``.
+        stored. ``object_sizes[i]`` is the byte size of ``keys[i]`` when
+        provided.
 
         Accounting is held under ``_usage_lock``; listener callbacks fire
         outside the lock so a slow listener cannot stall further notifies.
         """
-        # Aggregate per-salt deltas before touching
-        # ``_bytes_by_cache_salt`` — one dict read/write per unique
-        # salt instead of one per key. This matters when the registry is
-        # large (10k+ salts) and keys/sizes are bulky.
-        delta: dict[str, int] = {}
-        total_delta = 0
-        for key, size in zip(keys, sizes, strict=True):
-            delta[key.cache_salt] = delta.get(key.cache_salt, 0) + size
-            total_delta += size
+        if object_sizes is not None:
+            # Aggregate per-salt deltas before touching
+            # ``_bytes_by_cache_salt`` — one dict read/write per unique
+            # salt instead of one per key. This matters when the registry is
+            # large (10k+ salts) and keys/sizes are bulky.
+            delta: dict[str, int] = {}
+            total_delta = 0
+            for key, size in zip(keys, object_sizes, strict=True):
+                delta[key.cache_salt] = delta.get(key.cache_salt, 0) + size
+                total_delta += size
 
-        with self._usage_lock:
-            self._total_bytes_used += total_delta
-            for salt, d in delta.items():
-                self._bytes_by_cache_salt[salt] = (
-                    self._bytes_by_cache_salt.get(salt, 0) + d
-                )
+            with self._usage_lock:
+                self._total_bytes_used += total_delta
+                for salt, d in delta.items():
+                    self._bytes_by_cache_salt[salt] = (
+                        self._bytes_by_cache_salt.get(salt, 0) + d
+                    )
         for listener in self._listeners:
-            listener.on_l2_keys_stored(keys)
+            if object_sizes is None:
+                listener.on_l2_keys_stored(keys)
+            else:
+                listener.on_l2_keys_stored(keys, object_sizes)
 
     def _notify_keys_accessed(self, keys: list[ObjectKey]) -> None:
         # ``_notify_keys_accessed`` carries no byte impact — only LRU
@@ -382,10 +391,14 @@ class L2AdapterInterface(ABC):
         for listener in self._listeners:
             listener.on_l2_keys_accessed(keys)
 
-    def _notify_keys_deleted(self, keys: list[ObjectKey], sizes: list[int]) -> None:
+    def _notify_keys_deleted(
+        self,
+        keys: list[ObjectKey],
+        object_sizes: list[int] | None = None,
+    ) -> None:
         """Update byte accounting and notify listeners that ``keys`` were
-        deleted. ``sizes[i]`` is the byte size of ``keys[i]`` (typically
-        the same value the adapter passed to ``_notify_keys_stored``).
+        deleted. ``object_sizes[i]`` is the byte size of ``keys[i]`` when
+        provided.
 
         Per-cache_salt buckets that drop to zero are removed so the
         ``bytes_by_cache_salt`` snapshot in ``AdapterUsage`` stays compact.
@@ -396,37 +409,41 @@ class L2AdapterInterface(ABC):
         sentinel ``usage_fraction == -1`` would silently disable eviction
         forever; with it we log a warning and recover.
         """
-        # Same batching rationale as ``_notify_keys_stored`` — aggregate
-        # per-salt deltas first so the hot path does one dict read/write
-        # per unique salt, not per key.
-        delta: dict[str, int] = {}
-        total_delta = 0
-        for key, size in zip(keys, sizes, strict=True):
-            delta[key.cache_salt] = delta.get(key.cache_salt, 0) + size
-            total_delta += size
+        if object_sizes is not None:
+            # Same batching rationale as ``_notify_keys_stored`` — aggregate
+            # per-salt deltas first so the hot path does one dict read/write
+            # per unique salt, not per key.
+            delta: dict[str, int] = {}
+            total_delta = 0
+            for key, size in zip(keys, object_sizes, strict=True):
+                delta[key.cache_salt] = delta.get(key.cache_salt, 0) + size
+                total_delta += size
 
-        with self._usage_lock:
-            self._total_bytes_used -= total_delta
-            if self._total_bytes_used < 0:
-                logger.warning(
-                    "L2 adapter byte accounting underflow: "
-                    "_total_bytes_used dropped to %d after deleting %d "
-                    "keys (total size %d). Clamping to 0; this indicates "
-                    "an accounting bug (double-delete or size mismatch) "
-                    "in the adapter.",
-                    self._total_bytes_used,
-                    len(keys),
-                    total_delta,
-                )
-                self._total_bytes_used = 0
-            for salt, d in delta.items():
-                new_total = self._bytes_by_cache_salt.get(salt, 0) - d
-                if new_total <= 0:
-                    self._bytes_by_cache_salt.pop(salt, None)
-                else:
-                    self._bytes_by_cache_salt[salt] = new_total
+            with self._usage_lock:
+                self._total_bytes_used -= total_delta
+                if self._total_bytes_used < 0:
+                    logger.warning(
+                        "L2 adapter byte accounting underflow: "
+                        "_total_bytes_used dropped to %d after deleting %d "
+                        "keys (total size %d). Clamping to 0; this indicates "
+                        "an accounting bug (double-delete or size mismatch) "
+                        "in the adapter.",
+                        self._total_bytes_used,
+                        len(keys),
+                        total_delta,
+                    )
+                    self._total_bytes_used = 0
+                for salt, d in delta.items():
+                    new_total = self._bytes_by_cache_salt.get(salt, 0) - d
+                    if new_total <= 0:
+                        self._bytes_by_cache_salt.pop(salt, None)
+                    else:
+                        self._bytes_by_cache_salt[salt] = new_total
         for listener in self._listeners:
-            listener.on_l2_keys_deleted(keys)
+            if object_sizes is None:
+                listener.on_l2_keys_deleted(keys)
+            else:
+                listener.on_l2_keys_deleted(keys, object_sizes)
 
     #####################
     # Eviction Interface

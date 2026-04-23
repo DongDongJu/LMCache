@@ -95,6 +95,7 @@ class RawBlockPutManyResult:
     results: list[bool]
     stored_keys: list[str]
     evicted_keys: list[str]
+    evicted_key_sizes: list[int]
 
 
 class RawBlockCore:
@@ -391,6 +392,7 @@ class RawBlockCore:
         results = [False] * len(keys)
         stored_keys: list[str] = []
         evicted_keys: list[str] = []
+        evicted_key_sizes: list[int] = []
 
         for i, (key, obj) in enumerate(zip(keys, objs, strict=False)):
             if self._closed:
@@ -416,7 +418,9 @@ class RawBlockCore:
                             )
                             offset = -1
                             break
-                        evicted_keys.append(victim)
+                        victim_key, victim_size = victim
+                        evicted_keys.append(victim_key)
+                        evicted_key_sizes.append(victim_size)
 
                 if offset < 0:
                     continue
@@ -461,6 +465,7 @@ class RawBlockCore:
             results=results,
             stored_keys=stored_keys,
             evicted_keys=evicted_keys,
+            evicted_key_sizes=evicted_key_sizes,
         )
 
     def exists_many(
@@ -964,7 +969,7 @@ class RawBlockCore:
             return
         self._free_slots.append(slot)
 
-    def _evict_one_locked(self) -> Optional[str]:
+    def _evict_one_locked(self) -> Optional[tuple[str, int]]:
         """Evict one unlocked LRU entry while ``self._lock`` is held."""
         for victim in list(self._lru.keys()):
             if self._lock_refcnt.get(victim, 0) > 0:
@@ -979,7 +984,7 @@ class RawBlockCore:
             self._lock_refcnt.pop(victim, None)
             self._append_free_slot_locked(self._offset_to_slot(int(entry.offset)))
             self._meta_dirty_total += 1
-            return victim
+            return victim, int(entry.size)
         return None
 
     def _checkpoint_loop(self) -> None:

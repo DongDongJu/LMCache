@@ -42,27 +42,49 @@ pytestmark = pytest.mark.skipif(
 class _RecordingListener(L2AdapterListener):
     def __init__(self):
         self.stored: list[list[ObjectKey]] = []
+        self.stored_sizes: list[list[int] | None] = []
         self.accessed: list[list[ObjectKey]] = []
         self.deleted: list[list[ObjectKey]] = []
+        self.deleted_sizes: list[list[int] | None] = []
 
-    def on_l2_keys_stored(self, keys: list[ObjectKey]):
+    def on_l2_keys_stored(
+        self,
+        keys: list[ObjectKey],
+        object_sizes: list[int] | None = None,
+    ):
         self.stored.append(list(keys))
+        self.stored_sizes.append(None if object_sizes is None else list(object_sizes))
 
     def on_l2_keys_accessed(self, keys: list[ObjectKey]):
         self.accessed.append(list(keys))
 
-    def on_l2_keys_deleted(self, keys: list[ObjectKey]):
+    def on_l2_keys_deleted(
+        self,
+        keys: list[ObjectKey],
+        object_sizes: list[int] | None = None,
+    ):
         self.deleted.append(list(keys))
+        self.deleted_sizes.append(None if object_sizes is None else list(object_sizes))
 
 
 class _FailingListener(L2AdapterListener):
-    def on_l2_keys_stored(self, keys: list[ObjectKey]):
+    def on_l2_keys_stored(
+        self,
+        keys: list[ObjectKey],
+        object_sizes: list[int] | None = None,
+    ):
+        del object_sizes
         raise RuntimeError("store listener failed")
 
     def on_l2_keys_accessed(self, keys: list[ObjectKey]):
         raise RuntimeError("access listener failed")
 
-    def on_l2_keys_deleted(self, keys: list[ObjectKey]):
+    def on_l2_keys_deleted(
+        self,
+        keys: list[ObjectKey],
+        object_sizes: list[int] | None = None,
+    ):
+        del object_sizes
         raise RuntimeError("delete listener failed")
 
 
@@ -264,8 +286,11 @@ def test_raw_block_l2_adapter_listeners_usage_and_internal_eviction():
             assert _run_store(adapter, [key2], [obj2]) is True
 
             assert listener.stored[0] == [key1]
+            assert listener.stored_sizes[0] == [obj1.get_size()]
             assert listener.deleted[-1] == [key1]
+            assert listener.deleted_sizes[-1] == [obj1.get_size()]
             assert listener.stored[-1] == [key2]
+            assert listener.stored_sizes[-1] == [obj2.get_size()]
 
             current_usage, usage_after = adapter.get_usage()
             assert current_usage > 0.0
