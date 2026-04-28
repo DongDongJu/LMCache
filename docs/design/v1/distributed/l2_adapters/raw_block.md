@@ -23,7 +23,7 @@ StoreController / PrefetchController
                 |
                 v
          lmcache_rust_raw_block_io
-      (pwrite_from_buffer / pread_into)
+      (pread/pwrite or io_uring)
                 |
                 v
          raw block device / file
@@ -34,14 +34,15 @@ StoreController / PrefetchController
 - Support LMCache MP mode using raw block storage as an L2 cache.
 - Reuse the same durable metadata and checkpoint model as the existing
   non-MP raw-block backend.
-- Reuse the existing Rust raw-device I/O layer.
+- Reuse the existing Rust raw-device I/O layer, including the optional
+  `io_uring` backend.
 - Preserve restart recovery semantics.
 - Keep the MP controller flow unchanged: store, lookup-and-lock, load, unlock.
 
 ## TODO
 
 - FDP / placement-hint support.
-- A raw NVMe command path.
+- Production hardening for the experimental raw NVMe command path.
 
 ## Key Design Choice
 
@@ -112,6 +113,8 @@ The MP adapter is configured through `--l2-adapter` JSON:
   "slot_bytes": 1048576,
   "capacity_bytes": 0,
   "use_odirect": true,
+  "use_uring": false,
+  "use_uring_cmd": false,
   "block_align": 4096,
   "header_bytes": 4096,
   "meta_total_bytes": 268435456,
@@ -133,8 +136,11 @@ Important validation rules:
   `block_align`
 - `slot_bytes >= header_bytes + 1`
 - `per_tp_device_paths` is rejected in MP mode
-- with `use_odirect=true`, MP L1 alignment must satisfy
+- with `use_odirect=true` or `use_uring=true`, MP L1 alignment must satisfy
   `l1_align_bytes >= block_align`
+- `use_uring_cmd=true` requires `use_uring=true` and an NVMe namespace
+  character device path such as `/dev/ng0n1`; regular files and normal block
+  device paths are rejected early
 
 ## Relationship to Non-MP Mode
 

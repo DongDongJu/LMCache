@@ -7,12 +7,15 @@ Overview
 --------
 
 Native connectors are high-performance C++ storage backends that integrate with LMCache
-through pybind11. They work in **both** LMCache operating modes:
+through pybind11. Most key-value connectors work in **both** LMCache operating modes:
 
 - **Non-MP mode** (single process): via ``ConnectorClientBase`` (asyncio integration)
 - **MP mode** (multiprocess): via ``NativeConnectorL2Adapter`` (L2 adapter interface)
 
-Write the connector once, get both modes for free.
+Write the connector once, get both modes for free when the native connector can
+implement real key existence checks. Offset-oriented connectors such as blkio
+may need a dedicated MP adapter with Python-side key/index tracking instead of
+the generic ``NativeConnectorL2Adapter`` bridge.
 
 The framework lives in ``csrc/storage_backends/`` with the Redis RESP connector as the
 reference implementation.

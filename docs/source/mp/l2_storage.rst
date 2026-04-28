@@ -206,6 +206,10 @@ caller-provided load buffers during prefetch.
 - ``capacity_bytes``: Optional cap on the usable device bytes. Default ``0``
   means use the full device/file size.
 - ``use_odirect``: ``true`` or ``false`` (default ``true``).
+- ``use_uring``: Enable the Rust io_uring path (default ``false``).
+- ``use_uring_cmd``: Enable NVMe io_uring_cmd passthrough. Requires
+  ``use_uring=true`` and a compatible NVMe namespace character device such as
+  ``/dev/ng0n1``.
 - ``block_align``: Device alignment in bytes (default ``4096``).
 - ``header_bytes``: Per-slot header reservation (default ``4096``).
 - ``meta_total_bytes``: Reserved metadata checkpoint region (default ``256MiB``).
@@ -225,15 +229,38 @@ caller-provided load buffers during prefetch.
 - ``raw_block`` manages capacity with its own internal slot-recycling policy.
   The shared/global L2 eviction controller is not attached to this adapter, so
   adapter-level ``"eviction"`` config does not apply here.
-- If ``use_odirect`` is enabled, the server's ``--l1-align-bytes`` should be
-  at least ``block_align``.
+- If ``use_odirect`` or ``use_uring`` is enabled, the server's
+  ``--l1-align-bytes`` should be at least ``block_align``.
 - ``persist_enabled`` must remain ``true`` for this adapter.
+- The ``use_uring_cmd`` path is hardware-gated and intended for explicit NVMe
+  raw-command testing. It is not enabled automatically and does not add FDP or
+  placement-hint behavior.
 
 **Configuration example:**
 
 .. code-block:: bash
 
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/nvme0n1", "slot_bytes": 1048576, "block_align": 4096, "header_bytes": 4096, "meta_total_bytes": 268435456, "use_odirect": true, "num_store_workers": 2, "num_lookup_workers": 1, "num_load_workers": 4}'
+
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/nvme0n1", "slot_bytes": 1048576, "use_uring": true}'
+
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "use_uring": true, "use_uring_cmd": true}'
+
+``blkio`` -- libblkio backed block-device storage
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``blkio`` adapter uses the optional native ``lmcache_blkio`` extension and
+libblkio's io_uring driver. In MP mode, ``BlkioL2Adapter`` maintains a volatile
+Python key-to-offset map so store, lookup-and-lock, load, unlock, and delete all
+work through the normal L2 adapter flow.
+
+The map is not checkpointed. After an LMCache server restart, blkio MP L2 starts
+with an empty index even if bytes remain on the device. Use ``raw_block`` when
+restart recovery is required.
+
+.. code-block:: bash
+
+    --l2-adapter '{"type": "blkio", "device_path": "/dev/nvme0n1", "num_workers": 4, "direct_io": true}'
 
 ``mooncake_store`` -- Mooncake Store native connector
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

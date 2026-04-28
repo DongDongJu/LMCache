@@ -7,7 +7,8 @@ PyO3. It is used by both:
 - the MP `raw_block` L2 adapter (`RawBlockL2Adapter`) via `RawBlockCore`
 
 The Rust crate intentionally stays narrow: it owns the raw device handle and
-exposes blocking `pwrite_from_buffer` / `pread_into` primitives. Slotting,
+exposes blocking `pwrite_from_buffer` / `pread_into` primitives plus optional
+`io_uring` and experimental NVMe `io_uring_cmd` paths. Slotting,
 checkpointing, recovery, and MP task orchestration all live in Python.
 
 ## MP Mode Integration
@@ -51,6 +52,9 @@ both non-MP and MP mode without duplicating the raw-block implementation.
    - Dedicated worker thread drives the io_uring submission/completion loop
    - Batch write, read support to reduce syscall overhead and improve throughput
    - Fixed buffer registration for true zero-copy I/O operations
+6. **Experimental io_uring_cmd support**: The raw NVMe command path is available
+   only when explicitly enabled and pointed at an NVMe namespace character
+   device such as `/dev/ng0n1`.
 
 ## Zero-Copy Data Path
 
@@ -137,6 +141,9 @@ No fixed numbers are included here because results are host/device/workload depe
 - Linux only (`pread` / `pwrite`, O_DIRECT semantics, io_uring).
 - O_DIRECT requires aligned offset, size, and user buffer address.
 - io_uring backend requires Linux kernel 5.1+.
+- `io_uring_cmd` requires compatible NVMe hardware, kernel support, and a
+  namespace character device path. It is hardware-gated and not enabled by
+  default.
 
 ## io_uring Dependencies
 
@@ -210,7 +217,8 @@ dev = RawBlockDevice(
     writable=True,
     use_odirect=True,
     alignment=4096,
-    use_iouring=True
+    use_iouring=True,
+    use_uring_cmd=False,
 )
 
 buf1 = bytearray(4096)
@@ -240,6 +248,24 @@ dev.wait_iouring(batch_id)
 
 dev.close()
 ```
+
+### Experimental NVMe raw command I/O (io_uring_cmd)
+
+```python
+from lmcache_rust_raw_block_io import RawBlockDevice
+
+dev = RawBlockDevice(
+    "/dev/ng0n1",
+    writable=True,
+    use_odirect=True,
+    use_iouring=True,
+    use_uring_cmd=True,
+    alignment=4096,
+)
+```
+
+Use this path only with a dedicated NVMe namespace character device. It is not
+valid for regular files or normal block device paths such as `/dev/nvme0n1`.
 
 ## MP Adapter Example
 
@@ -271,4 +297,7 @@ Notes:
   file used only by LMCache.
 - With `use_odirect=true`, LMCache MP L1 alignment must be at least
   `block_align`.
+- Add `"use_uring": true` to use the Rust io_uring path.
+- Add `"use_uring": true, "use_uring_cmd": true` only for NVMe namespace
+  character devices such as `/dev/ng0n1`.
 - Restart recovery uses the metadata checkpoint region on the same device.

@@ -10,6 +10,7 @@ Supported Backends
    :maxdepth: 1
 
    cpu_ram
+   blkio
    custom_backend
    dax
    eic
