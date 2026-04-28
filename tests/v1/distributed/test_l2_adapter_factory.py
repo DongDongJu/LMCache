@@ -26,7 +26,6 @@ from lmcache.v1.distributed.l2_adapters.plugin_l2_adapter import PluginL2Adapter
 from lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter import (
     RawBlockL2AdapterConfig,
 )
-from lmcache.v1.platform import create_event_notifier
 
 
 def _has_raw_block_ext() -> bool:

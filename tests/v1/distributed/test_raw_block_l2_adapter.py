@@ -145,12 +145,16 @@ def _make_config(
     *,
     slot_bytes: int = 64 * 1024,
     capacity_bytes: int = 0,
+    use_uring: bool = False,
+    use_uring_cmd: bool = False,
 ) -> RawBlockL2AdapterConfig:
     return RawBlockL2AdapterConfig(
         device_path=device_path,
         slot_bytes=slot_bytes,
         capacity_bytes=capacity_bytes,
         use_odirect=False,
+        use_uring=use_uring,
+        use_uring_cmd=use_uring_cmd,
         block_align=4096,
         header_bytes=4096,
         meta_total_bytes=1 * 1024 * 1024,
@@ -167,6 +171,48 @@ def _run_store(adapter: RawBlockL2Adapter, keys, objects) -> bool:
     completed = adapter.pop_completed_store_tasks()
     assert task_id in completed
     return completed[task_id]
+
+
+def test_raw_block_l2_adapter_config_parses_uring_flags():
+    cfg = RawBlockL2AdapterConfig.from_dict(
+        {
+            "type": "raw_block",
+            "device_path": "/tmp/raw-block-dev",
+            "slot_bytes": 64 * 1024,
+            "use_odirect": False,
+            "use_uring": True,
+        }
+    )
+
+    assert cfg.use_uring is True
+    assert cfg.use_uring_cmd is False
+    assert cfg.to_core_config().use_uring is True
+
+    with pytest.raises(ValueError, match="use_uring_cmd requires use_uring"):
+        RawBlockL2AdapterConfig.from_dict(
+            {
+                "type": "raw_block",
+                "device_path": "/tmp/raw-block-dev",
+                "slot_bytes": 64 * 1024,
+                "use_uring_cmd": True,
+            }
+        )
+
+
+def test_raw_block_l2_adapter_uring_cmd_rejects_regular_file():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        with pytest.raises(ValueError, match="NVMe namespace character device"):
+            RawBlockL2Adapter(
+                _make_config(
+                    dev_path,
+                    use_uring=True,
+                    use_uring_cmd=True,
+                )
+            )
 
 
 def _run_lookup(adapter: RawBlockL2Adapter, keys):
@@ -223,6 +269,32 @@ def test_raw_block_l2_adapter_store_lookup_load_roundtrip():
             assert torch.count_nonzero(load_buffers[1].tensor) == 0
 
             adapter.submit_unlock([key1, key_miss, key3])
+        finally:
+            adapter.close()
+
+
+def test_raw_block_l2_adapter_uring_store_lookup_load_roundtrip():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        adapter = RawBlockL2Adapter(_make_config(dev_path, use_uring=True))
+        try:
+            key = _create_object_key(5)
+            obj = _create_memory_obj(fill_value=5.0)
+            assert _run_store(adapter, [key], [obj]) is True
+
+            _, lookup = _run_lookup(adapter, [key])
+            assert lookup is not None
+            assert lookup.get_indices_list() == [0]
+
+            load_buffer = _create_memory_obj(fill_value=0.0)
+            _, loaded = _run_load(adapter, [key], [load_buffer])
+            assert loaded is not None
+            assert loaded.get_indices_list() == [0]
+            assert torch.equal(load_buffer.tensor, obj.tensor)
+            adapter.submit_unlock([key])
         finally:
             adapter.close()
 
@@ -286,11 +358,11 @@ def test_raw_block_l2_adapter_listeners_usage_and_internal_eviction():
             assert _run_store(adapter, [key2], [obj2]) is True
 
             assert listener.stored[0] == [key1]
-            assert listener.stored_sizes[0] is None
+            assert listener.stored_sizes[0] == [obj1.get_size()]
             assert listener.deleted[-1] == [key1]
-            assert listener.deleted_sizes[-1] is None
+            assert listener.deleted_sizes[-1] == [obj1.get_size()]
             assert listener.stored[-1] == [key2]
-            assert listener.stored_sizes[-1] is None
+            assert listener.stored_sizes[-1] == [obj2.get_size()]
 
             usage = adapter.get_usage()
             assert usage.total_bytes_used == obj2.get_size()

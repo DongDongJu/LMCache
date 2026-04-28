@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from typing import Any, Optional
 import ctypes
 import json
+import os
+import stat
 import struct
 import threading
 import time
@@ -39,6 +41,7 @@ logger = init_logger(__name__)
 _DEFAULT_META_MAGIC = b"LMCIDX01"
 _DEFAULT_META_VERSION = 1
 _META_HEADER_STRUCT = struct.Struct("<8sIQQI")
+_URING_CMD_MAX_IO_BYTES = 256 * 1024
 
 
 def round_up(x: int, align: int) -> int:
@@ -72,6 +75,8 @@ class RawBlockCoreConfig:
     meta_idle_quiet_ms: int
     meta_enable_periodic: bool
     meta_verify_on_load: bool
+    use_uring: bool = False
+    use_uring_cmd: bool = False
 
 
 @dataclass
@@ -134,6 +139,8 @@ class RawBlockCore:
         self.header_bytes = int(config.header_bytes)
         self.slot_bytes = int(config.slot_bytes)
         self.use_odirect = bool(config.use_odirect)
+        self.use_uring = bool(config.use_uring)
+        self.use_uring_cmd = bool(config.use_uring_cmd)
         self.enable_zero_copy = bool(config.enable_zero_copy)
 
         self.meta_total_bytes = int(config.meta_total_bytes)
@@ -165,6 +172,21 @@ class RawBlockCore:
             raise ValueError("meta_magic must be exactly 8 bytes")
         if self.meta_version <= 0:
             raise ValueError("meta_version must be > 0")
+        if self.use_uring_cmd and not self.use_uring:
+            raise ValueError("use_uring_cmd requires use_uring=true")
+        if self.use_uring_cmd:
+            try:
+                mode = os.stat(self.device_path).st_mode
+            except OSError as e:
+                raise ValueError(
+                    "use_uring_cmd requires an existing NVMe namespace "
+                    f"character device path, got {self.device_path!r}"
+                ) from e
+            if not stat.S_ISCHR(mode):
+                raise ValueError(
+                    "use_uring_cmd requires an NVMe namespace character device "
+                    f"(for example /dev/ng0n1), got {self.device_path!r}"
+                )
 
         try:
             self.meta_magic_text = self.meta_magic.decode("ascii")
@@ -233,9 +255,64 @@ class RawBlockCore:
                 self.device_path,
                 writable=True,
                 use_odirect=self.use_odirect,
+                use_iouring=self.use_uring,
+                use_uring_cmd=self.use_uring_cmd,
                 alignment=self.block_align,
             )
         return self._raw
+
+    def raw_device(self) -> Any:
+        """Return the lazily opened Rust raw-block device.
+
+        Returns:
+            The underlying Rust ``RawBlockDevice`` object.
+
+        Raises:
+            Exception: Propagates raw-device open errors from the Rust binding.
+        """
+        return self._rawdev()
+
+    def set_raw_device_for_testing(self, raw_device: Any) -> None:
+        """Replace the raw device handle used by this core.
+
+        Args:
+            raw_device: Object implementing the Rust raw-device methods.
+        """
+        self._raw = raw_device
+
+    def register_fixed_buffers_from_allocator(self, memory_allocator: Any) -> None:
+        """Register allocator pages with io_uring when the allocator exposes them.
+
+        Args:
+            memory_allocator: Local CPU allocator that may expose
+                ``get_paged_buffers()``.
+
+        Raises:
+            Exception: Propagates Rust registration errors after logging.
+        """
+        if not self.use_uring:
+            return
+        paged_buffers = getattr(memory_allocator, "get_paged_buffers", None)
+        if not callable(paged_buffers):
+            logger.warning(
+                "RawBlockCore: allocator does not expose paged buffers; "
+                "io_uring fixed-buffer zero-copy is disabled"
+            )
+            return
+        buffers = paged_buffers()
+        if not buffers:
+            logger.warning(
+                "RawBlockCore: allocator returned no paged buffers; "
+                "io_uring fixed-buffer zero-copy is disabled"
+            )
+            return
+        buffer_ptrs = [buf.data_ptr() for buf in buffers]
+        buffer_sizes = [buf.numel() * buf.element_size() for buf in buffers]
+        self._rawdev().register_fixed_buffers(buffer_ptrs, buffer_sizes)
+        logger.info(
+            "RawBlockCore: registered %d paged buffers for io_uring fixed I/O",
+            len(buffers),
+        )
 
     def contains_key(self, encoded_key: str, *, lock: bool = False) -> bool:
         """Return whether one encoded key is present in the raw-block index.
@@ -534,7 +611,6 @@ class RawBlockCore:
         results = [False] * len(encoded_keys)
         touched: list[str] = []
         try:
-            raw_dev = self._rawdev()
             for i, (encoded_key, entry) in enumerate(items):
                 if entry is None:
                     continue
@@ -559,18 +635,22 @@ class RawBlockCore:
                         zero_tail=False,
                     )
                     if direct_view is not None:
-                        raw_dev.pread_into(
-                            entry.offset + self.header_bytes,
-                            direct_view,
-                            total_len if len(direct_view) >= total_len else payload_len,
-                            total_len,
+                        self._read_buffers(
+                            [entry.offset + self.header_bytes],
+                            [direct_view],
+                            [
+                                total_len
+                                if len(direct_view) >= total_len
+                                else payload_len
+                            ],
+                            [total_len],
                         )
                     else:
-                        raw_dev.pread_into(
-                            entry.offset + self.header_bytes,
-                            buf,
-                            payload_len,
-                            total_len,
+                        self._read_buffers(
+                            [entry.offset + self.header_bytes],
+                            [buf],
+                            [payload_len],
+                            [total_len],
                         )
                     objs[i].metadata.cached_positions = entry.meta.cached_positions
                     touched.append(encoded_key)
@@ -702,6 +782,8 @@ class RawBlockCore:
                 "metadata_persisted": self._meta_persisted,
                 "inflight_io_count": self._inflight_io_count,
                 "use_odirect": self.use_odirect,
+                "use_uring": self.use_uring,
+                "use_uring_cmd": self.use_uring_cmd,
                 "enable_zero_copy": self.enable_zero_copy,
             }
 
@@ -839,6 +921,264 @@ class RawBlockCore:
                 buf = direct_view
         return buf, payload_len, total_len
 
+    def _byte_view(self, buf: Any) -> memoryview:
+        """Return a byte-addressable memoryview over a Python buffer.
+
+        Args:
+            buf: Object implementing the Python buffer protocol.
+
+        Returns:
+            A memoryview with one-byte elements.
+
+        Raises:
+            TypeError: If ``buf`` does not expose a compatible contiguous buffer.
+        """
+        view = buf if isinstance(buf, memoryview) else memoryview(buf)
+        if view.itemsize == 1 and view.format in ("B", "b", "c"):
+            return view
+        return view.cast("B")
+
+    def _validate_uring_cmd_chunk(self, offset: int, total_len: int) -> None:
+        """Validate one NVMe raw-command transfer range.
+
+        Args:
+            offset: Device byte offset for the transfer.
+            total_len: Transfer size in bytes.
+
+        Raises:
+            ValueError: If either value is not block aligned.
+        """
+        if offset % self.block_align != 0:
+            raise ValueError("io_uring_cmd requires aligned offsets")
+        if total_len % self.block_align != 0:
+            raise ValueError("io_uring_cmd requires aligned transfer lengths")
+
+    def _write_uring_cmd_buffers(
+        self,
+        offsets: Sequence[int],
+        buffers: Sequence[Any],
+        payload_lens: Sequence[int],
+        total_lens: Sequence[int],
+    ) -> None:
+        """Write buffers as bounded NVMe raw-command chunks.
+
+        Args:
+            offsets: Device offsets for each logical write.
+            buffers: Source buffers.
+            payload_lens: Logical source byte counts.
+            total_lens: Physical transfer sizes, including padding.
+
+        Raises:
+            ValueError: If lengths are inconsistent or unaligned.
+            Exception: Propagates Rust raw-device write errors.
+        """
+        raw_dev = self._rawdev()
+        chunk_offsets: list[int] = []
+        chunk_buffers: list[memoryview] = []
+        chunk_lens: list[int] = []
+        keepalive: list[memoryview] = []
+
+        for offset, buf, payload_len, total_len in zip(
+            offsets, buffers, payload_lens, total_lens, strict=True
+        ):
+            offset = int(offset)
+            payload_len = int(payload_len)
+            total_len = int(total_len)
+            self._validate_uring_cmd_chunk(offset, total_len)
+
+            view = self._byte_view(buf)
+            if len(view) < total_len:
+                if len(view) < payload_len:
+                    raise ValueError("input buffer shorter than payload_len")
+                padded = bytearray(total_len)
+                padded[:payload_len] = view[:payload_len]
+                view = memoryview(padded)
+            else:
+                view = view[:total_len]
+            keepalive.append(view)
+
+            cursor = 0
+            while cursor < total_len:
+                chunk_len = min(_URING_CMD_MAX_IO_BYTES, total_len - cursor)
+                self._validate_uring_cmd_chunk(offset + cursor, chunk_len)
+                chunk_offsets.append(offset + cursor)
+                chunk_buffers.append(view[cursor : cursor + chunk_len])
+                chunk_lens.append(chunk_len)
+                cursor += chunk_len
+
+        if not chunk_offsets:
+            return
+        batch_id = raw_dev.batched_write(chunk_offsets, chunk_buffers, chunk_lens)
+        raw_dev.wait_iouring(batch_id)
+        keepalive.clear()
+
+    def _read_uring_cmd_buffers(
+        self,
+        offsets: Sequence[int],
+        buffers: Sequence[Any],
+        payload_lens: Sequence[int],
+        total_lens: Sequence[int],
+    ) -> None:
+        """Read buffers as bounded NVMe raw-command chunks.
+
+        Args:
+            offsets: Device offsets for each logical read.
+            buffers: Destination buffers.
+            payload_lens: Logical bytes to expose to callers.
+            total_lens: Physical transfer sizes, including padding.
+
+        Raises:
+            ValueError: If lengths are inconsistent or unaligned.
+            Exception: Propagates Rust raw-device read errors.
+        """
+        raw_dev = self._rawdev()
+        read_uring = raw_dev.read_uring
+
+        for offset, buf, payload_len, total_len in zip(
+            offsets, buffers, payload_lens, total_lens, strict=True
+        ):
+            offset = int(offset)
+            payload_len = int(payload_len)
+            total_len = int(total_len)
+            self._validate_uring_cmd_chunk(offset, total_len)
+
+            dst = self._byte_view(buf)
+            if len(dst) < total_len:
+                if len(dst) < payload_len:
+                    raise ValueError("output buffer shorter than payload_len")
+                target = memoryview(bytearray(total_len))
+                copy_back = True
+            else:
+                target = dst[:total_len]
+                copy_back = False
+
+            cursor = 0
+            while cursor < total_len:
+                chunk_len = min(_URING_CMD_MAX_IO_BYTES, total_len - cursor)
+                self._validate_uring_cmd_chunk(offset + cursor, chunk_len)
+                read_uring(
+                    offset + cursor,
+                    target[cursor : cursor + chunk_len],
+                    chunk_len,
+                    chunk_len,
+                )
+                cursor += chunk_len
+
+            if copy_back:
+                dst[:payload_len] = target[:payload_len]
+
+    def _write_buffers(
+        self,
+        offsets: Sequence[int],
+        buffers: Sequence[Any],
+        payload_lens: Sequence[int],
+        total_lens: Sequence[int],
+    ) -> None:
+        """Write one or more buffers through the configured Rust I/O path.
+
+        Args:
+            offsets: Device offsets for each write.
+            buffers: Python buffers to write.
+            payload_lens: Logical payload lengths for each buffer.
+            total_lens: Physical I/O lengths for each buffer.
+
+        Raises:
+            RuntimeError: If the requested io_uring mode is unavailable.
+            Exception: Propagates Rust raw-device write errors.
+        """
+        raw_dev = self._rawdev()
+        if not self.use_uring:
+            for offset, buf, payload_len, total_len in zip(
+                offsets, buffers, payload_lens, total_lens, strict=True
+            ):
+                raw_dev.pwrite_from_buffer(offset, buf, payload_len, total_len)
+            return
+
+        if self.use_uring_cmd:
+            self._write_uring_cmd_buffers(offsets, buffers, payload_lens, total_lens)
+            return
+
+        can_batch = all(
+            int(payload_len) == int(total_len)
+            for payload_len, total_len in zip(payload_lens, total_lens, strict=True)
+        )
+        if can_batch:
+            batch_id = raw_dev.batched_write(
+                [int(offset) for offset in offsets],
+                list(buffers),
+                [int(total_len) for total_len in total_lens],
+            )
+            raw_dev.wait_iouring(batch_id)
+            return
+
+        write_uring = getattr(raw_dev, "write_uring", None)
+        if not callable(write_uring):
+            if self.use_uring_cmd:
+                raise RuntimeError("io_uring_cmd write path requires write_uring")
+            logger.warning(
+                "RawBlockCore falling back to pwrite for padded io_uring writes "
+                "because write_uring is unavailable"
+            )
+            for offset, buf, payload_len, total_len in zip(
+                offsets, buffers, payload_lens, total_lens, strict=True
+            ):
+                raw_dev.pwrite_from_buffer(offset, buf, payload_len, total_len)
+            return
+
+        for offset, buf, payload_len, total_len in zip(
+            offsets, buffers, payload_lens, total_lens, strict=True
+        ):
+            write_uring(int(offset), buf, int(payload_len), int(total_len))
+
+    def _read_buffers(
+        self,
+        offsets: Sequence[int],
+        buffers: Sequence[Any],
+        payload_lens: Sequence[int],
+        total_lens: Sequence[int],
+    ) -> None:
+        """Read one or more buffers through the configured Rust I/O path.
+
+        Args:
+            offsets: Device offsets for each read.
+            buffers: Destination Python buffers.
+            payload_lens: Logical payload lengths to expose to callers.
+            total_lens: Physical I/O lengths for each read.
+
+        Raises:
+            RuntimeError: If the requested io_uring mode is unavailable.
+            Exception: Propagates Rust raw-device read errors.
+        """
+        raw_dev = self._rawdev()
+        if not self.use_uring:
+            for offset, buf, payload_len, total_len in zip(
+                offsets, buffers, payload_lens, total_lens, strict=True
+            ):
+                raw_dev.pread_into(offset, buf, payload_len, total_len)
+            return
+
+        if self.use_uring_cmd:
+            self._read_uring_cmd_buffers(offsets, buffers, payload_lens, total_lens)
+            return
+
+        can_batch = all(
+            int(payload_len) == int(total_len)
+            for payload_len, total_len in zip(payload_lens, total_lens, strict=True)
+        )
+        if can_batch:
+            batch_id = raw_dev.batched_read(
+                [int(offset) for offset in offsets],
+                list(buffers),
+                [int(total_len) for total_len in total_lens],
+            )
+            raw_dev.wait_iouring(batch_id)
+            return
+
+        for offset, buf, payload_len, total_len in zip(
+            offsets, buffers, payload_lens, total_lens, strict=True
+        ):
+            raw_dev.read_uring(int(offset), buf, int(payload_len), int(total_len))
+
     def _write_one(
         self, key: RawBlockKeySpec, memory_obj: MemoryObj, offset: int
     ) -> bool:
@@ -859,18 +1199,24 @@ class RawBlockCore:
             with self._lock:
                 self._inflight_io_count += 1
             try:
-                raw_dev = self._rawdev()
                 hdr_total = (
                     round_up(len(header), self.block_align)
                     if self.use_odirect
                     else len(header)
                 )
-                raw_dev.pwrite_from_buffer(offset, header, len(header), hdr_total)
-                raw_dev.pwrite_from_buffer(
-                    offset + self.header_bytes,
-                    buf,
-                    payload_len,
-                    total_len,
+                header_buf: Any = header
+                if self.use_uring and len(header) < hdr_total:
+                    padded_header = bytearray(header)
+                    padded_header.extend(b"\x00" * (hdr_total - len(header)))
+                    header_buf = padded_header
+                self._write_buffers(
+                    [offset, offset + self.header_bytes],
+                    [header_buf, buf],
+                    [
+                        hdr_total if self.use_uring else len(header),
+                        payload_len,
+                    ],
+                    [hdr_total, total_len],
                 )
             finally:
                 with self._lock:
@@ -907,7 +1253,12 @@ class RawBlockCore:
         try:
             with self._lock:
                 self._inflight_io_count += 1
-            self._rawdev().pread_into(offset, buf, self.header_bytes, self.header_bytes)
+            self._read_buffers(
+                [offset],
+                [buf],
+                [self.header_bytes],
+                [self.header_bytes],
+            )
             return self._decode_slot_header(buf)
         except Exception:
             return None
@@ -1010,8 +1361,11 @@ class RawBlockCore:
         """Read and validate a metadata checkpoint header."""
         buf = bytearray(self.block_align)
         try:
-            self._rawdev().pread_into(
-                container_offset, buf, self.block_align, self.block_align
+            self._read_buffers(
+                [container_offset],
+                [buf],
+                [self.block_align],
+                [self.block_align],
             )
         except Exception:
             return None
@@ -1038,7 +1392,7 @@ class RawBlockCore:
         total_len = round_up(payload_len, self.block_align)
         buf = bytearray(total_len)
         try:
-            self._rawdev().pread_into(payload_off, buf, payload_len, total_len)
+            self._read_buffers([payload_off], [buf], [payload_len], [total_len])
         except Exception:
             return None
 
@@ -1156,9 +1510,12 @@ class RawBlockCore:
             int(crc),
         )
 
-        raw = self._rawdev()
-        raw.pwrite_from_buffer(payload_off, payload, payload_len, payload_total_len)
-        raw.pwrite_from_buffer(target, header_block, self.block_align, self.block_align)
+        self._write_buffers(
+            [payload_off, target],
+            [payload, header_block],
+            [payload_len, self.block_align],
+            [payload_total_len, self.block_align],
+        )
 
         with self._lock:
             self._meta_seq = int(next_seq)

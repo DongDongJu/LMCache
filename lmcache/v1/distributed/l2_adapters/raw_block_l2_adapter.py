@@ -71,6 +71,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         slot_bytes: int,
         capacity_bytes: int = 0,
         use_odirect: bool = True,
+        use_uring: bool = False,
+        use_uring_cmd: bool = False,
         block_align: int = 4096,
         header_bytes: int = 4096,
         meta_total_bytes: int = 256 * 1024 * 1024,
@@ -93,6 +95,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             slot_bytes: Fixed data-slot size in bytes.
             capacity_bytes: Optional cap on usable bytes; zero uses device size.
             use_odirect: Whether to open the raw path with O_DIRECT.
+            use_uring: Whether to use the Rust io_uring I/O path.
+            use_uring_cmd: Whether to use NVMe io_uring_cmd passthrough.
             block_align: Required block alignment in bytes.
             header_bytes: Per-slot header reservation in bytes.
             meta_total_bytes: Reserved metadata checkpoint region size.
@@ -114,6 +118,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         self.slot_bytes = int(slot_bytes)
         self.capacity_bytes = int(capacity_bytes)
         self.use_odirect = bool(use_odirect)
+        self.use_uring = bool(use_uring)
+        self.use_uring_cmd = bool(use_uring_cmd)
         self.block_align = int(block_align)
         self.header_bytes = int(header_bytes)
         self.meta_total_bytes = int(meta_total_bytes)
@@ -150,6 +156,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         header_bytes = int(d.get("header_bytes", 4096))
         meta_total_bytes = int(d.get("meta_total_bytes", 256 * 1024 * 1024))
         capacity_bytes = int(d.get("capacity_bytes", 0))
+        use_uring = bool(d.get("use_uring", False))
+        use_uring_cmd = bool(d.get("use_uring_cmd", False))
 
         if block_align <= 0:
             raise ValueError("block_align must be > 0")
@@ -163,6 +171,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError("slot_bytes must be >= header_bytes + 1")
         if capacity_bytes > 0 and capacity_bytes <= meta_total_bytes:
             raise ValueError("capacity_bytes must leave space for at least one slot")
+        if use_uring_cmd and not use_uring:
+            raise ValueError("use_uring_cmd requires use_uring=true")
 
         internal_eviction_policy = str(d.get("internal_eviction_policy", "lru")).lower()
         if internal_eviction_policy != "lru":
@@ -185,6 +195,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             slot_bytes=slot_bytes,
             capacity_bytes=capacity_bytes,
             use_odirect=bool(d.get("use_odirect", True)),
+            use_uring=use_uring,
+            use_uring_cmd=use_uring_cmd,
             block_align=block_align,
             header_bytes=header_bytes,
             meta_total_bytes=meta_total_bytes,
@@ -212,6 +224,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "- capacity_bytes (int): optional usable capacity cap "
             "(default 0 = device size)\n"
             "- use_odirect (bool): enable O_DIRECT raw I/O (default true)\n"
+            "- use_uring (bool): enable Rust io_uring I/O (default false)\n"
+            "- use_uring_cmd (bool): enable NVMe io_uring_cmd path "
+            "(default false, requires use_uring)\n"
             "- block_align (int): required block alignment in bytes (default 4096)\n"
             "- header_bytes (int): per-slot header reservation (default 4096)\n"
             "- meta_total_bytes (int): reserved metadata checkpoint region "
@@ -242,6 +257,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             header_bytes=self.header_bytes,
             slot_bytes=self.slot_bytes,
             use_odirect=self.use_odirect,
+            use_uring=self.use_uring,
+            use_uring_cmd=self.use_uring_cmd,
             enable_zero_copy=self.enable_zero_copy,
             meta_total_bytes=self.meta_total_bytes,
             meta_magic=self.meta_magic.encode("ascii"),
@@ -279,12 +296,13 @@ class RawBlockL2Adapter(L2AdapterInterface):
         """
         super().__init__()
         if (
-            config.use_odirect
+            (config.use_odirect or config.use_uring)
             and l1_memory_desc is not None
             and l1_memory_desc.align_bytes < config.block_align
         ):
             raise ValueError(
-                "raw_block requires l1_align_bytes >= block_align when use_odirect=true"
+                "raw_block requires l1_align_bytes >= block_align when "
+                "use_odirect=true or use_uring=true"
             )
 
         self._closed = False
@@ -298,6 +316,12 @@ class RawBlockL2Adapter(L2AdapterInterface):
 
         try:
             self._core = RawBlockCore(config.to_core_config(), key_namespace="object")
+            if config.use_uring:
+                logger.warning(
+                    "RawBlockL2Adapter: MP raw_block uses io_uring without "
+                    "fixed-buffer registration; zero-copy fixed buffers are "
+                    "disabled unless registered by a future MP allocator path"
+                )
             self._max_capacity_bytes = int(
                 self._core.report_status().get("usable_capacity_bytes", 0)
             )
