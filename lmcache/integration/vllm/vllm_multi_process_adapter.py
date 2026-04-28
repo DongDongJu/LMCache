@@ -129,6 +129,47 @@ class ParallelStrategy:
     """The pipeline parallel size."""
 
 
+def _normalize_parallel_strategy(
+    block_size_or_world_size: int,
+    strategy_or_kv_rank: ParallelStrategy | int,
+    maybe_block_size: int | None,
+    tp_size: int,
+) -> tuple[int, ParallelStrategy]:
+    """Normalize old and vLLM 0.19 LMCache MP adapter constructor shapes.
+
+    Args:
+        block_size_or_world_size: vLLM block size for the legacy constructor,
+            or KV world size for the vLLM 0.19 constructor.
+        strategy_or_kv_rank: ``ParallelStrategy`` for the legacy constructor,
+            or KV rank for the vLLM 0.19 constructor.
+        maybe_block_size: vLLM block size for the vLLM 0.19 constructor.
+        tp_size: Tensor parallel size when supplied by vLLM.
+
+    Returns:
+        A tuple of ``(vllm_block_size, parallel_strategy)``.
+
+    Raises:
+        TypeError: If the arguments do not match a supported constructor shape.
+    """
+    if isinstance(strategy_or_kv_rank, ParallelStrategy):
+        return block_size_or_world_size, strategy_or_kv_rank
+
+    if maybe_block_size is None:
+        raise TypeError("vLLM block size is required when kv_rank is provided")
+
+    kv_world_size = block_size_or_world_size
+    kv_worker_id = strategy_or_kv_rank
+    return maybe_block_size, ParallelStrategy(
+        use_mla=False,
+        kv_world_size=kv_world_size,
+        kv_worker_id=kv_worker_id,
+        actual_world_size=kv_world_size,
+        actual_worker_id=kv_worker_id,
+        tp_size=tp_size,
+        pp_size=1,
+    )
+
+
 class HeartbeatThread(PeriodicThread):
     """Periodically checks server health via PING.
 
@@ -216,22 +257,32 @@ class LMCacheMPSchedulerAdapter:
         context: zmq.Context,
         model_name: str,
         vllm_block_size: int,
-        parallel_strategy: ParallelStrategy,
+        parallel_strategy: ParallelStrategy | int,
+        maybe_vllm_block_size: int | None = None,
         mq_timeout: float = DEFAULT_MQ_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+        tp_size: int = 1,
     ):
         """
         Args:
             server_url: The server URL for the LMCache message queue
             context: The ZMQ context
             model_name: The model name used for LMCache keys
-            vllm_block_size: The block size used in vLLM
+            vllm_block_size: The block size used in vLLM, or KV world size
+                when called by vLLM 0.19.
             parallel_strategy:
-                The parallel strategy, which includes `use_mla`,
-                `kv_world_size`, `kv_worker_id` and so on
+                The parallel strategy, or KV rank when called by vLLM 0.19.
+            maybe_vllm_block_size: The block size used in vLLM 0.19 calls.
             mq_timeout: Timeout in seconds for message queue requests.
             heartbeat_interval: Interval in seconds between heartbeat pings.
+            tp_size: Tensor parallel size supplied by vLLM 0.19.
         """
+        vllm_block_size, parallel_strategy = _normalize_parallel_strategy(
+            vllm_block_size,
+            parallel_strategy,
+            maybe_vllm_block_size,
+            tp_size,
+        )
         self.mq_client = MessageQueueClient(server_url, context)
         self._mq_timeout = mq_timeout
 
@@ -558,10 +609,33 @@ class LMCacheMPWorkerAdapter:
         context: zmq.Context,
         model_name: str,
         vllm_block_size: int,
-        parallel_strategy: ParallelStrategy,
+        parallel_strategy: ParallelStrategy | int,
+        maybe_vllm_block_size: int | None = None,
         mq_timeout: float = DEFAULT_MQ_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+        tp_size: int = 1,
     ):
+        """Initialize the worker-side LMCache MP adapter.
+
+        Args:
+            server_url: The server URL for the LMCache message queue.
+            context: The ZMQ context.
+            model_name: The model name used for LMCache keys.
+            vllm_block_size: The block size used in vLLM, or KV world size
+                when called by vLLM 0.19.
+            parallel_strategy: The parallel strategy, or KV rank when called
+                by vLLM 0.19.
+            maybe_vllm_block_size: The block size used in vLLM 0.19 calls.
+            mq_timeout: Timeout in seconds for message queue requests.
+            heartbeat_interval: Interval in seconds between heartbeat pings.
+            tp_size: Tensor parallel size when supplied by vLLM.
+        """
+        vllm_block_size, parallel_strategy = _normalize_parallel_strategy(
+            vllm_block_size,
+            parallel_strategy,
+            maybe_vllm_block_size,
+            tp_size,
+        )
         self.mq_client = MessageQueueClient(server_url, context)
         self._mq_timeout = mq_timeout
 
