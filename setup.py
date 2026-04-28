@@ -2,6 +2,8 @@
 # Standard
 from pathlib import Path
 import os
+import shlex
+import subprocess
 import sys
 
 # Third Party
@@ -112,6 +114,104 @@ def _mooncake_extension(
     ]
 
 
+def _pkg_config_flags(package: str, flag: str) -> list[str]:
+    """Return pkg-config flags for a package, or an empty list if unavailable."""
+    try:
+        result = subprocess.run(
+            ["pkg-config", flag, package],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return shlex.split(result.stdout.strip())
+
+
+def _blkio_extension(
+    cpp_extension,
+    blkio_sources: list[str],
+    extra_cxx_flags: list[str],
+) -> list:
+    """Build optional libblkio extension when libblkio is available/requested."""
+    build_env = os.environ.get("BUILD_BLKIO")
+    requested = build_env == "1"
+    if build_env is not None and not requested:
+        return []
+
+    try:
+        has_pkg = (
+            subprocess.run(
+                ["pkg-config", "--exists", "blkio"],
+                capture_output=True,
+            ).returncode
+            == 0
+        )
+    except OSError:
+        has_pkg = False
+    if not has_pkg and not requested:
+        return []
+    if not has_pkg and requested:
+        raise RuntimeError(
+            "BUILD_BLKIO=1 was requested but pkg-config could not find libblkio"
+        )
+
+    env_cflags = " ".join(
+        value
+        for value in (
+            os.environ.get("CFLAGS", ""),
+            os.environ.get("BLKIO_CFLAGS", ""),
+        )
+        if value
+    )
+    env_ldflags = " ".join(
+        value
+        for value in (
+            os.environ.get("LDFLAGS", ""),
+            os.environ.get("BLKIO_LDFLAGS", ""),
+        )
+        if value
+    )
+    cflags = shlex.split(env_cflags) or _pkg_config_flags("blkio", "--cflags")
+    ldflags = shlex.split(env_ldflags) or _pkg_config_flags("blkio", "--libs")
+    include_dirs = [
+        "csrc/storage_backends",
+        "csrc/storage_backends/blkio",
+    ]
+    library_dirs: list[str] = []
+    libraries: list[str] = []
+    extra_link_args: list[str] = []
+    extra_compile_flags: list[str] = []
+    for flag in cflags:
+        if flag.startswith("-I"):
+            include_dirs.append(flag[2:])
+        else:
+            extra_compile_flags.append(flag)
+    for flag in ldflags:
+        if flag.startswith("-L"):
+            library_dirs.append(flag[2:])
+        elif flag.startswith("-l"):
+            libraries.append(flag[2:])
+        else:
+            extra_link_args.append(flag)
+    if "blkio" not in libraries:
+        libraries.append("blkio")
+
+    return [
+        cpp_extension.CppExtension(
+            "lmcache.lmcache_blkio",
+            sources=blkio_sources,
+            include_dirs=include_dirs,
+            libraries=libraries,
+            library_dirs=library_dirs,
+            extra_link_args=extra_link_args,
+            extra_compile_args={
+                "cxx": extra_cxx_flags + ["-O3", "-std=c++17"] + extra_compile_flags,
+            },
+        )
+    ]
+
+
 def cuda_extension() -> tuple[list, dict]:
     # Third Party
     from torch.utils import cpp_extension  # Import here
@@ -148,6 +248,10 @@ def cuda_extension() -> tuple[list, dict]:
     fs_sources = [
         "csrc/storage_backends/fs/pybind.cpp",
         "csrc/storage_backends/fs/connector.cpp",
+    ]
+    blkio_sources = [
+        "csrc/storage_backends/blkio/pybind.cpp",
+        "csrc/storage_backends/blkio/connector.cpp",
     ]
     mooncake_sources = [
         "csrc/storage_backends/mooncake/pybind.cpp",
@@ -191,6 +295,7 @@ def cuda_extension() -> tuple[list, dict]:
     ext_modules.extend(
         _mooncake_extension(cpp_extension, mooncake_sources, [flag_cxx_abi])
     )
+    ext_modules.extend(_blkio_extension(cpp_extension, blkio_sources, [flag_cxx_abi]))
     cmdclass = {"build_ext": cpp_extension.BuildExtension}
     return ext_modules, cmdclass
 
@@ -226,6 +331,10 @@ def rocm_extension() -> tuple[list, dict]:
     fs_sources = [
         "csrc/storage_backends/fs/pybind.cpp",
         "csrc/storage_backends/fs/connector.cpp",
+    ]
+    blkio_sources = [
+        "csrc/storage_backends/blkio/pybind.cpp",
+        "csrc/storage_backends/blkio/connector.cpp",
     ]
     mooncake_sources = [
         "csrc/storage_backends/mooncake/pybind.cpp",
@@ -289,6 +398,7 @@ def rocm_extension() -> tuple[list, dict]:
     ]
     # Mooncake extension is optional.
     ext_modules.extend(_mooncake_extension(cpp_extension, mooncake_sources, []))
+    ext_modules.extend(_blkio_extension(cpp_extension, blkio_sources, []))
     cmdclass = {"build_ext": cpp_extension.BuildExtension}
     return ext_modules, cmdclass
 
