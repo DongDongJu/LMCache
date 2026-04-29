@@ -130,6 +130,9 @@ class MemoryObjMetadata:
     shapes: Optional[list[torch.Size]] = None
     dtypes: Optional[list[torch.dtype]] = None
 
+    # Transient placement hint for storage backends that can steer writes.
+    fdp_placement_rank: Optional[int] = None
+
     def to_dict(self):
         # Note(Kuntai): this is used for serializing MemoryObjMetadata via
         # msgpack.
@@ -143,6 +146,7 @@ class MemoryObjMetadata:
             "fmt": self.fmt.value,
             "shapes": [list(shape) for shape in self.shapes] if self.shapes else None,
             "dtypes": [str(dtype) for dtype in self.dtypes] if self.dtypes else None,
+            "fdp_placement_rank": self.fdp_placement_rank,
         }
 
     @staticmethod
@@ -166,6 +170,7 @@ class MemoryObjMetadata:
             fmt=MemoryFormat(d["fmt"]),
             shapes=shapes,
             dtypes=dtypes,
+            fdp_placement_rank=d.get("fdp_placement_rank"),
         )
 
     def get_size(self) -> int:

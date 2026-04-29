@@ -335,11 +335,16 @@ class RawBlockCore:
         """
         self._raw = raw_device
 
-    def _select_fdp_ruh(self, key: RawBlockKeySpec) -> int | None:
+    def _select_fdp_ruh(
+        self,
+        key: RawBlockKeySpec,
+        obj: MemoryObj | None = None,
+    ) -> int | None:
         """Select an FDP RUH for a raw-block key.
 
         Args:
             key: Encoded raw-block key being written.
+            obj: Optional memory object carrying a transient placement hint.
 
         Returns:
             A configured reclaim unit handle ID when FDP is enabled, otherwise
@@ -348,19 +353,24 @@ class RawBlockCore:
         if not self.use_fdp:
             return None
 
-        if self.key_namespace == "object":
-            kv_rank = decode_object_key(key.encoded).kv_rank
+        placement_rank = (
+            getattr(obj.metadata, "fdp_placement_rank", None)
+            if obj is not None
+            else None
+        )
+        if placement_rank is not None:
+            worker_index = int(placement_rank)
+        elif self.key_namespace == "object":
+            kv_rank = int(decode_object_key(key.encoded).kv_rank)
+            # ObjectKey.ComputeKVRank packs global_rank into bits [16, 23].
+            # Use that worker index directly so FDP placement is stable per
+            # unique KV worker instead of hash-randomized per rank.
+            worker_index = (kv_rank >> 16) & 0xFF
         else:
             parsed_key = decode_legacy_key(key.encoded)
-            kv_rank = int(getattr(parsed_key, "worker_id", 0))
+            worker_index = int(getattr(parsed_key, "worker_id", 0))
 
-        digest = hashlib.blake2b(
-            str(int(kv_rank)).encode("ascii"),
-            digest_size=8,
-        ).digest()
-        idx = int.from_bytes(digest, "little", signed=False) % len(
-            self.fdp_data_ruh_ids
-        )
+        idx = worker_index % len(self.fdp_data_ruh_ids)
         return self.fdp_data_ruh_ids[idx]
 
     def _select_fdp_metadata_ruh(self, encoded_key: str) -> int | None:
@@ -590,7 +600,7 @@ class RawBlockCore:
         for i, (key, obj) in enumerate(zip(keys, objs, strict=False)):
             if self._closed:
                 break
-            fdp_ruh_id = self._select_fdp_ruh(key)
+            fdp_ruh_id = self._select_fdp_ruh(key, obj)
 
             with self._lock:
                 if key.encoded in self._index:

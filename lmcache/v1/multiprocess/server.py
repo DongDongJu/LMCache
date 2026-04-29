@@ -185,6 +185,8 @@ class MPCacheEngine:
 
         # Lock for clear() to avoid concurrent storage manager mutations
         self.lock = threading.Lock()
+        self._fdp_placement_lock = threading.Lock()
+        self._fdp_placement_ranks: dict[tuple[int, int], int] = {}
 
         # storage manager
         self.storage_manager = StorageManager(storage_manager_config)
@@ -205,6 +207,31 @@ class MPCacheEngine:
         self._prefetch_job_lock = threading.Lock()
 
         self._setup_metrics()
+
+    def _get_fdp_placement_rank(self, instance_id: int, worker_id: int) -> int:
+        """Return a stable placement rank for an actual vLLM GPU worker.
+
+        Args:
+            instance_id: MP adapter instance ID, currently the vLLM worker PID.
+            worker_id: Worker rank from the IPC cache key.
+
+        Returns:
+            Dense rank assigned to the unique ``(instance_id, worker_id)``
+            pair for backend placement decisions.
+        """
+        key = (int(instance_id), int(worker_id))
+        with self._fdp_placement_lock:
+            rank = self._fdp_placement_ranks.get(key)
+            if rank is None:
+                rank = len(self._fdp_placement_ranks)
+                self._fdp_placement_ranks[key] = rank
+                logger.info(
+                    "Assigned FDP placement rank %d to instance_id=%d worker_id=%d",
+                    rank,
+                    instance_id,
+                    worker_id,
+                )
+            return rank
 
     def register_kv_cache(
         self,
@@ -286,6 +313,10 @@ class MPCacheEngine:
 
         assert key.worker_id is not None, "Must store with worker_id != None"
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
+        fdp_placement_rank = self._get_fdp_placement_rank(
+            instance_id,
+            key.worker_id,
+        )
 
         assert instance_id in self.gpu_contexts, (
             f"KV cache not registered for GPU ID {instance_id}"
@@ -340,6 +371,8 @@ class MPCacheEngine:
                 reserved_dict = self.storage_manager.reserve_write(
                     obj_keys, layout_desc, "new"
                 )
+                for memory_obj in reserved_dict.values():
+                    memory_obj.metadata.fdp_placement_rank = fdp_placement_rank
 
                 # NOTE: Store is not batched because some obj_keys may be
                 # skipped (not in reserved_dict), making block_ids
@@ -401,6 +434,7 @@ class MPCacheEngine:
                             "device": str(gpu_context.device),
                             "engine_id": instance_id,
                             "model_name": model_name,
+                            "fdp_placement_rank": fdp_placement_rank,
                             "total_bytes": total_bytes,
                         },
                     ),
