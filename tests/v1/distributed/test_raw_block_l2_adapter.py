@@ -147,6 +147,12 @@ def _make_config(
     capacity_bytes: int = 0,
     use_uring: bool = False,
     use_uring_cmd: bool = False,
+    use_fdp: bool = False,
+    fdp_ruh_ids: tuple[int, ...] = (),
+    fdp_data_ruh_ids: tuple[int, ...] = (),
+    fdp_metadata_ruh_ids: tuple[int, ...] = (),
+    meta_total_bytes: int = 1 * 1024 * 1024,
+    meta_magic: str = "LMCIDX01",
 ) -> RawBlockL2AdapterConfig:
     return RawBlockL2AdapterConfig(
         device_path=device_path,
@@ -155,9 +161,14 @@ def _make_config(
         use_odirect=False,
         use_uring=use_uring,
         use_uring_cmd=use_uring_cmd,
+        use_fdp=use_fdp,
+        fdp_ruh_ids=fdp_ruh_ids,
+        fdp_data_ruh_ids=fdp_data_ruh_ids,
+        fdp_metadata_ruh_ids=fdp_metadata_ruh_ids,
         block_align=4096,
         header_bytes=4096,
-        meta_total_bytes=1 * 1024 * 1024,
+        meta_total_bytes=meta_total_bytes,
+        meta_magic=meta_magic,
         meta_enable_periodic=False,
         num_store_workers=2,
         num_lookup_workers=1,
@@ -213,9 +224,34 @@ def test_raw_block_l2_adapter_config_parses_uring_flags():
     )
     assert fdp_cfg.use_fdp is True
     assert fdp_cfg.fdp_ruh_ids == (3, 4)
+    assert fdp_cfg.fdp_data_ruh_ids == (3, 4)
+    assert fdp_cfg.fdp_metadata_ruh_ids == (3, 4)
     core_cfg = fdp_cfg.to_core_config()
     assert core_cfg.use_fdp is True
     assert core_cfg.fdp_ruh_ids == (3, 4)
+    assert core_cfg.fdp_data_ruh_ids == (3, 4)
+    assert core_cfg.fdp_metadata_ruh_ids == (3, 4)
+
+    split_cfg = RawBlockL2AdapterConfig.from_dict(
+        {
+            "type": "raw_block",
+            "device_path": "/dev/ng0n1",
+            "slot_bytes": 64 * 1024,
+            "capacity_bytes": 8 * 1024 * 1024,
+            "meta_total_bytes": 1 * 1024 * 1024,
+            "use_uring": True,
+            "use_uring_cmd": True,
+            "use_fdp": True,
+            "fdp_data_ruh_ids": [0, 1, 5, 6],
+            "fdp_metadata_ruh_ids": [2],
+        }
+    )
+    assert split_cfg.fdp_ruh_ids == ()
+    assert split_cfg.fdp_data_ruh_ids == (0, 1, 5, 6)
+    assert split_cfg.fdp_metadata_ruh_ids == (2,)
+    split_core_cfg = split_cfg.to_core_config()
+    assert split_core_cfg.fdp_data_ruh_ids == (0, 1, 5, 6)
+    assert split_core_cfg.fdp_metadata_ruh_ids == (2,)
 
     with pytest.raises(ValueError, match="use_fdp requires use_uring_cmd"):
         RawBlockL2AdapterConfig.from_dict(
@@ -228,7 +264,7 @@ def test_raw_block_l2_adapter_config_parses_uring_flags():
                 "fdp_ruh_ids": [1],
             }
         )
-    with pytest.raises(ValueError, match="non-empty fdp_ruh_ids"):
+    with pytest.raises(ValueError, match="non-empty fdp_data_ruh_ids"):
         RawBlockL2AdapterConfig.from_dict(
             {
                 "type": "raw_block",
@@ -237,6 +273,18 @@ def test_raw_block_l2_adapter_config_parses_uring_flags():
                 "use_uring": True,
                 "use_uring_cmd": True,
                 "use_fdp": True,
+            }
+        )
+    with pytest.raises(ValueError, match="non-empty fdp_metadata_ruh_ids"):
+        RawBlockL2AdapterConfig.from_dict(
+            {
+                "type": "raw_block",
+                "device_path": "/dev/ng0n1",
+                "slot_bytes": 64 * 1024,
+                "use_uring": True,
+                "use_uring_cmd": True,
+                "use_fdp": True,
+                "fdp_data_ruh_ids": [1],
             }
         )
     with pytest.raises(ValueError, match="leave space"):
@@ -442,6 +490,158 @@ def test_raw_block_l2_adapter_listeners_usage_and_internal_eviction():
             adapter.close()
 
 
+def test_raw_block_l2_adapter_full_locked_store_fails_then_evicts_after_unlock():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        slot_bytes = 64 * 1024
+        capacity_bytes = (1 * 1024 * 1024) + slot_bytes
+        adapter = RawBlockL2Adapter(
+            _make_config(
+                dev_path,
+                slot_bytes=slot_bytes,
+                capacity_bytes=capacity_bytes,
+            )
+        )
+        listener = _RecordingListener()
+        adapter.register_listener(listener)
+
+        try:
+            key1 = _create_object_key(23)
+            key2 = _create_object_key(24)
+            obj1 = _create_memory_obj(fill_value=23.0)
+            obj2 = _create_memory_obj(fill_value=24.0)
+
+            assert _run_store(adapter, [key1], [obj1]) is True
+            _, locked = _run_lookup(adapter, [key1])
+            assert locked is not None
+            assert locked.get_indices_list() == [0]
+
+            assert _run_store(adapter, [key2], [obj2]) is False
+            _, still_locked = _run_lookup(adapter, [key1, key2])
+            assert still_locked is not None
+            assert still_locked.get_indices_list() == [0]
+            adapter.submit_unlock([key1, key1])
+
+            assert listener.stored == [[key1]]
+            assert listener.deleted == []
+
+            assert _run_store(adapter, [key2], [obj2]) is True
+            assert listener.deleted == [[key1]]
+            assert listener.deleted_sizes == [[obj1.get_size()]]
+            assert listener.stored[-1] == [key2]
+            assert listener.stored_sizes[-1] == [obj2.get_size()]
+
+            _, after_eviction = _run_lookup(adapter, [key1, key2])
+            assert after_eviction is not None
+            assert after_eviction.get_indices_list() == [1]
+            adapter.submit_unlock([key1, key2])
+        finally:
+            adapter.close()
+
+
+def test_raw_block_l2_adapter_fdp_full_locked_store_fails_then_evicts_after_unlock():
+    dev_path = os.environ.get("LMCACHE_RAW_BLOCK_FDP_TEST_DEVICE")
+    if not dev_path:
+        pytest.skip("LMCACHE_RAW_BLOCK_FDP_TEST_DEVICE is not set")
+    ruh_ids = tuple(
+        int(item)
+        for item in os.environ.get("LMCACHE_RAW_BLOCK_FDP_RUH_IDS", "0,1,5,6").split(
+            ","
+        )
+        if item.strip()
+    )
+    if not ruh_ids:
+        pytest.skip("LMCACHE_RAW_BLOCK_FDP_RUH_IDS is empty")
+
+    slot_bytes = 64 * 1024
+    meta_total_bytes = 1 * 1024 * 1024
+    capacity_bytes = meta_total_bytes * len(ruh_ids) + slot_bytes
+    adapter = RawBlockL2Adapter(
+        _make_config(
+            dev_path,
+            slot_bytes=slot_bytes,
+            capacity_bytes=capacity_bytes,
+            use_uring=True,
+            use_uring_cmd=True,
+            use_fdp=True,
+            fdp_ruh_ids=ruh_ids,
+            meta_total_bytes=meta_total_bytes,
+            meta_magic="TSTFDP01",
+        )
+    )
+
+    try:
+        key1 = _create_object_key(2300, model_name="fdp-evict")
+        key2 = _create_object_key(2400, model_name="fdp-evict")
+        obj1 = _create_memory_obj(fill_value=23.0)
+        obj2 = _create_memory_obj(fill_value=24.0)
+
+        assert _run_store(adapter, [key1], [obj1]) is True
+        _, locked = _run_lookup(adapter, [key1])
+        assert locked is not None
+        assert locked.get_indices_list() == [0]
+
+        assert _run_store(adapter, [key2], [obj2]) is False
+        adapter.submit_unlock([key1])
+
+        assert _run_store(adapter, [key2], [obj2]) is True
+        _, after_eviction = _run_lookup(adapter, [key1, key2])
+        assert after_eviction is not None
+        assert after_eviction.get_indices_list() == [1]
+        adapter.submit_unlock([key1, key2])
+    finally:
+        adapter.close()
+
+
+def test_raw_block_l2_adapter_evicts_lru_not_recently_loaded_key():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        slot_bytes = 64 * 1024
+        capacity_bytes = (1 * 1024 * 1024) + 2 * slot_bytes
+        adapter = RawBlockL2Adapter(
+            _make_config(
+                dev_path,
+                slot_bytes=slot_bytes,
+                capacity_bytes=capacity_bytes,
+            )
+        )
+
+        try:
+            key1 = _create_object_key(26)
+            key2 = _create_object_key(27)
+            key3 = _create_object_key(28)
+            obj1 = _create_memory_obj(fill_value=26.0)
+            obj2 = _create_memory_obj(fill_value=27.0)
+            obj3 = _create_memory_obj(fill_value=28.0)
+
+            assert _run_store(adapter, [key1, key2], [obj1, obj2]) is True
+
+            _, lookup = _run_lookup(adapter, [key1])
+            assert lookup is not None
+            assert lookup.get_indices_list() == [0]
+            load_buffer = _create_memory_obj(fill_value=0.0)
+            _, loaded = _run_load(adapter, [key1], [load_buffer])
+            assert loaded is not None
+            assert loaded.get_indices_list() == [0]
+            assert torch.equal(load_buffer.tensor, obj1.tensor)
+            adapter.submit_unlock([key1])
+
+            assert _run_store(adapter, [key3], [obj3]) is True
+
+            _, bitmap = _run_lookup(adapter, [key1, key2, key3])
+            assert bitmap is not None
+            assert bitmap.get_indices_list() == [0, 2]
+            adapter.submit_unlock([key1, key2, key3])
+        finally:
+            adapter.close()
+
+
 def test_raw_block_l2_adapter_does_not_notify_duplicate_store():
     with tempfile.TemporaryDirectory() as td:
         dev_path = os.path.join(td, "dev.bin")
@@ -462,6 +662,83 @@ def test_raw_block_l2_adapter_does_not_notify_duplicate_store():
             assert listener.stored == [[key]]
         finally:
             adapter.close()
+
+
+def test_raw_block_l2_adapter_metadata_full_skips_checkpoint_but_live_data_works():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        slot_bytes = 64 * 1024
+        meta_total_bytes = 16 * 1024
+        capacity_bytes = meta_total_bytes + 32 * slot_bytes
+        config = _make_config(
+            dev_path,
+            slot_bytes=slot_bytes,
+            capacity_bytes=capacity_bytes,
+            meta_total_bytes=meta_total_bytes,
+            meta_magic="TSTFUL01",
+        )
+        stable_key = _create_object_key(43)
+        stable_obj = _create_memory_obj(fill_value=43.0)
+
+        adapter1 = RawBlockL2Adapter(config)
+        try:
+            assert _run_store(adapter1, [stable_key], [stable_obj]) is True
+        finally:
+            adapter1.close()
+
+        adapter2 = RawBlockL2Adapter(config)
+        adapter2_closed = False
+        try:
+            _, recovered = _run_lookup(adapter2, [stable_key])
+            assert recovered is not None
+            assert recovered.get_indices_list() == [0]
+            adapter2.submit_unlock([stable_key])
+
+            overflow_keys = [
+                _create_object_key(i, model_name=f"overflow-{i}-" + "x" * 512)
+                for i in range(5000, 5016)
+            ]
+            overflow_objs = [
+                _create_memory_obj(fill_value=float(i)) for i in range(16)
+            ]
+            overflow_key = overflow_keys[0]
+            overflow_obj = overflow_objs[0]
+            assert _run_store(adapter2, overflow_keys, overflow_objs) is True
+
+            _, live_lookup = _run_lookup(adapter2, [overflow_key])
+            assert live_lookup is not None
+            assert live_lookup.get_indices_list() == [0]
+            load_buffer = _create_memory_obj(fill_value=0.0)
+            _, live_load = _run_load(adapter2, [overflow_key], [load_buffer])
+            assert live_load is not None
+            assert live_load.get_indices_list() == [0]
+            assert torch.equal(load_buffer.tensor, overflow_obj.tensor)
+            adapter2.submit_unlock([overflow_key])
+
+            with patch(
+                "lmcache.v1.storage_backend.raw_block.core.logger.warning"
+            ) as warning_mock:
+                adapter2.close()
+                adapter2_closed = True
+            assert any(
+                "metadata payload too large" in str(call.args[0])
+                for call in warning_mock.call_args_list
+            )
+        finally:
+            if not adapter2_closed:
+                adapter2.close()
+
+        adapter3 = RawBlockL2Adapter(config)
+        try:
+            _, restarted = _run_lookup(adapter3, [stable_key, overflow_key])
+            assert restarted is not None
+            assert restarted.get_indices_list() == [0]
+            adapter3.submit_unlock([stable_key, overflow_key])
+        finally:
+            adapter3.close()
 
 
 def test_raw_block_l2_adapter_listener_errors_do_not_block_eventfds():

@@ -99,6 +99,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         use_uring_cmd: bool = False,
         use_fdp: bool = False,
         fdp_ruh_ids: Sequence[int] | None = None,
+        fdp_data_ruh_ids: Sequence[int] | None = None,
+        fdp_metadata_ruh_ids: Sequence[int] | None = None,
         fdp_directive_type: int = 2,
         fdp_metadata_mode: str = "per_ruh",
         block_align: int = 4096,
@@ -126,7 +128,10 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             use_uring: Whether to use the Rust io_uring I/O path.
             use_uring_cmd: Whether to use NVMe io_uring_cmd passthrough.
             use_fdp: Whether to set FDP directive fields on raw-command writes.
-            fdp_ruh_ids: Reclaim unit handles used for FDP placement.
+            fdp_ruh_ids: Legacy shorthand for both FDP data and metadata RUHs.
+            fdp_data_ruh_ids: Reclaim unit handles used for data placement.
+            fdp_metadata_ruh_ids: Reclaim unit handles used for checkpoint
+                metadata placement.
             fdp_directive_type: NVMe directive type used for FDP placement.
             fdp_metadata_mode: Metadata layout for FDP. Only ``"per_ruh"`` is
                 currently supported.
@@ -155,6 +160,12 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         self.use_uring_cmd = bool(use_uring_cmd)
         self.use_fdp = bool(use_fdp)
         self.fdp_ruh_ids = tuple(int(value) for value in (fdp_ruh_ids or ()))
+        self.fdp_data_ruh_ids = tuple(
+            int(value) for value in (fdp_data_ruh_ids or self.fdp_ruh_ids)
+        )
+        self.fdp_metadata_ruh_ids = tuple(
+            int(value) for value in (fdp_metadata_ruh_ids or self.fdp_ruh_ids)
+        )
         self.fdp_directive_type = int(fdp_directive_type)
         self.fdp_metadata_mode = str(fdp_metadata_mode)
         self.block_align = int(block_align)
@@ -197,9 +208,17 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         use_uring_cmd = bool(d.get("use_uring_cmd", False))
         use_fdp = bool(d.get("use_fdp", False))
         fdp_ruh_ids = _parse_fdp_ruh_ids(d.get("fdp_ruh_ids", ()))
+        fdp_data_ruh_ids = _parse_fdp_ruh_ids(
+            d.get("fdp_data_ruh_ids", fdp_ruh_ids)
+        )
+        fdp_metadata_ruh_ids = _parse_fdp_ruh_ids(
+            d.get("fdp_metadata_ruh_ids", fdp_ruh_ids)
+        )
         fdp_directive_type = int(d.get("fdp_directive_type", 2))
         fdp_metadata_mode = str(d.get("fdp_metadata_mode", "per_ruh"))
-        reserved_meta_bytes = meta_total_bytes * (len(fdp_ruh_ids) if use_fdp else 1)
+        reserved_meta_bytes = meta_total_bytes * (
+            len(fdp_metadata_ruh_ids) if use_fdp else 1
+        )
 
         if block_align <= 0:
             raise ValueError("block_align must be > 0")
@@ -218,13 +237,17 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         if use_fdp:
             if not use_uring_cmd:
                 raise ValueError("use_fdp requires use_uring_cmd=true")
-            if not fdp_ruh_ids:
-                raise ValueError("use_fdp requires non-empty fdp_ruh_ids")
-            if len(set(fdp_ruh_ids)) != len(fdp_ruh_ids):
-                raise ValueError("fdp_ruh_ids must not contain duplicates")
-            for ruh_id in fdp_ruh_ids:
+            if not fdp_data_ruh_ids:
+                raise ValueError("use_fdp requires non-empty fdp_data_ruh_ids")
+            if not fdp_metadata_ruh_ids:
+                raise ValueError("use_fdp requires non-empty fdp_metadata_ruh_ids")
+            if len(set(fdp_data_ruh_ids)) != len(fdp_data_ruh_ids):
+                raise ValueError("fdp_data_ruh_ids must not contain duplicates")
+            if len(set(fdp_metadata_ruh_ids)) != len(fdp_metadata_ruh_ids):
+                raise ValueError("fdp_metadata_ruh_ids must not contain duplicates")
+            for ruh_id in fdp_data_ruh_ids + fdp_metadata_ruh_ids:
                 if ruh_id < 0 or ruh_id > 0xFFFF:
-                    raise ValueError("fdp_ruh_ids must fit in uint16")
+                    raise ValueError("FDP RUH IDs must fit in uint16")
             if fdp_directive_type < 0 or fdp_directive_type > 0x0F:
                 raise ValueError("fdp_directive_type must fit in 4 bits")
             if fdp_metadata_mode != "per_ruh":
@@ -250,11 +273,13 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             device_path=device_path,
             slot_bytes=slot_bytes,
             capacity_bytes=capacity_bytes,
-            use_odirect=bool(d.get("use_odirect", True)),
+            use_odirect=bool(d.get("use_odirect", not use_uring_cmd)),
             use_uring=use_uring,
             use_uring_cmd=use_uring_cmd,
             use_fdp=use_fdp,
             fdp_ruh_ids=fdp_ruh_ids,
+            fdp_data_ruh_ids=fdp_data_ruh_ids,
+            fdp_metadata_ruh_ids=fdp_metadata_ruh_ids,
             fdp_directive_type=fdp_directive_type,
             fdp_metadata_mode=fdp_metadata_mode,
             block_align=block_align,
@@ -283,18 +308,23 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "(required)\n"
             "- capacity_bytes (int): optional usable capacity cap "
             "(default 0 = device size)\n"
-            "- use_odirect (bool): enable O_DIRECT raw I/O (default true)\n"
+            "- use_odirect (bool): enable O_DIRECT raw I/O "
+            "(default true, false for use_uring_cmd)\n"
             "- use_uring (bool): enable Rust io_uring I/O (default false)\n"
             "- use_uring_cmd (bool): enable NVMe io_uring_cmd path "
             "(default false, requires use_uring)\n"
             "- use_fdp (bool): enable FDP directive fields on io_uring_cmd "
             "writes (default false, requires use_uring_cmd)\n"
             "- fdp_ruh_ids (list[int] | str): FDP reclaim unit handles used "
-            "for placement; required when use_fdp is true\n"
+            "for data and metadata placement when split fields are omitted\n"
+            "- fdp_data_ruh_ids (list[int] | str): FDP reclaim unit handles "
+            "used for data placement; defaults to fdp_ruh_ids\n"
+            "- fdp_metadata_ruh_ids (list[int] | str): FDP reclaim unit "
+            "handles used for checkpoint metadata; defaults to fdp_ruh_ids\n"
             "- fdp_directive_type (int): NVMe directive type for FDP "
             "(default 2)\n"
             "- fdp_metadata_mode (str): only 'per_ruh' is supported; "
-            "meta_total_bytes is reserved per RUH\n"
+            "meta_total_bytes is reserved per metadata RUH\n"
             "- block_align (int): required block alignment in bytes (default 4096)\n"
             "- header_bytes (int): per-slot header reservation (default 4096)\n"
             "- meta_total_bytes (int): reserved metadata checkpoint region "
@@ -329,6 +359,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             use_uring_cmd=self.use_uring_cmd,
             use_fdp=self.use_fdp,
             fdp_ruh_ids=self.fdp_ruh_ids,
+            fdp_data_ruh_ids=self.fdp_data_ruh_ids,
+            fdp_metadata_ruh_ids=self.fdp_metadata_ruh_ids,
             fdp_directive_type=self.fdp_directive_type,
             fdp_metadata_mode=self.fdp_metadata_mode,
             enable_zero_copy=self.enable_zero_copy,

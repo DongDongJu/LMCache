@@ -117,6 +117,8 @@ The MP adapter is configured through `--l2-adapter` JSON:
   "use_uring_cmd": false,
   "use_fdp": false,
   "fdp_ruh_ids": [],
+  "fdp_data_ruh_ids": [],
+  "fdp_metadata_ruh_ids": [],
   "fdp_directive_type": 2,
   "fdp_metadata_mode": "per_ruh",
   "block_align": 4096,
@@ -145,10 +147,16 @@ Important validation rules:
 - `use_uring_cmd=true` requires `use_uring=true` and an NVMe namespace
   character device path such as `/dev/ng0n1`; regular files and normal block
   device paths are rejected early
-- `use_fdp=true` requires `use_uring_cmd=true` and a non-empty `fdp_ruh_ids`
-  list. FDP placement is experimental and hardware-gated.
+- `use_odirect` is not used with `/dev/ng*` character devices. Raw-command
+  transfers are still aligned to `block_align` because NVMe commands operate on
+  LBAs.
+- `use_fdp=true` requires `use_uring_cmd=true` and non-empty FDP data and
+  metadata RUH lists. `fdp_ruh_ids` remains a legacy shorthand for using the
+  same RUH list for both data and metadata placement.
+- `fdp_data_ruh_ids` selects the RUH pool for data-slot writes, while
+  `fdp_metadata_ruh_ids` selects the RUH pool for checkpoint metadata writes.
 - with `fdp_metadata_mode="per_ruh"`, `meta_total_bytes` is reserved once per
-  configured RUH; data slots start after all RUH metadata partitions
+  metadata RUH; data slots start after all metadata partitions
 
 ## Relationship to Non-MP Mode
 

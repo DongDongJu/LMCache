@@ -264,7 +264,7 @@ from lmcache_rust_raw_block_io import RawBlockDevice
 dev = RawBlockDevice(
     "/dev/ng0n1",
     writable=True,
-    use_odirect=True,
+    use_odirect=False,
     use_iouring=True,
     use_uring_cmd=True,
     alignment=4096,
@@ -273,6 +273,8 @@ dev = RawBlockDevice(
 
 Use this path only with a dedicated NVMe namespace character device. It is not
 valid for regular files or normal block device paths such as `/dev/nvme0n1`.
+`O_DIRECT` is not used with `/dev/ng*` character devices; raw-command transfers
+still must be LBA-aligned.
 When FDP is enabled through `RawBlockCore`, writes pass the configured directive
 type and selected reclaim unit handle to this same raw-command path.
 
@@ -310,6 +312,9 @@ Notes:
 - Add `"use_uring": true, "use_uring_cmd": true` only for NVMe namespace
   character devices such as `/dev/ng0n1`.
 - Add `"use_uring": true, "use_uring_cmd": true, "use_fdp": true,
-  "fdp_ruh_ids": [0, 1]` only on FDP-capable NVMe devices. In this mode,
-  `meta_total_bytes` is reserved per RUH.
+  "fdp_ruh_ids": [0, 1]` only on FDP-capable NVMe devices. This legacy
+  shorthand uses the same RUHs for data and metadata.
+- Use `"fdp_data_ruh_ids": [0, 1, 5, 6], "fdp_metadata_ruh_ids": [2]` to
+  isolate checkpoint metadata writes from data-slot writes. In this mode,
+  `meta_total_bytes` is reserved per metadata RUH.
 - Restart recovery uses the metadata checkpoint region on the same device.

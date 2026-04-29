@@ -81,6 +81,8 @@ class RawBlockCoreConfig:
     use_uring_cmd: bool = False
     use_fdp: bool = False
     fdp_ruh_ids: tuple[int, ...] = ()
+    fdp_data_ruh_ids: tuple[int, ...] = ()
+    fdp_metadata_ruh_ids: tuple[int, ...] = ()
     fdp_directive_type: int = 2
     fdp_metadata_mode: str = "per_ruh"
 
@@ -146,11 +148,23 @@ class RawBlockCore:
         self.block_align = int(config.block_align)
         self.header_bytes = int(config.header_bytes)
         self.slot_bytes = int(config.slot_bytes)
-        self.use_odirect = bool(config.use_odirect)
         self.use_uring = bool(config.use_uring)
         self.use_uring_cmd = bool(config.use_uring_cmd)
+        self.use_odirect = bool(config.use_odirect)
+        if self.use_uring_cmd and self.use_odirect:
+            logger.warning(
+                "RawBlockCore: use_odirect is ignored for NVMe namespace "
+                "character devices when use_uring_cmd=true"
+            )
+            self.use_odirect = False
         self.use_fdp = bool(config.use_fdp)
         self.fdp_ruh_ids = tuple(int(v) for v in config.fdp_ruh_ids)
+        self.fdp_data_ruh_ids = tuple(
+            int(v) for v in (config.fdp_data_ruh_ids or self.fdp_ruh_ids)
+        )
+        self.fdp_metadata_ruh_ids = tuple(
+            int(v) for v in (config.fdp_metadata_ruh_ids or self.fdp_ruh_ids)
+        )
         self.fdp_directive_type = int(config.fdp_directive_type)
         self.fdp_metadata_mode = str(config.fdp_metadata_mode)
         self.enable_zero_copy = bool(config.enable_zero_copy)
@@ -189,13 +203,19 @@ class RawBlockCore:
         if self.use_fdp:
             if not self.use_uring_cmd:
                 raise ValueError("use_fdp requires use_uring_cmd=true")
-            if not self.fdp_ruh_ids:
-                raise ValueError("use_fdp requires non-empty fdp_ruh_ids")
-            if len(set(self.fdp_ruh_ids)) != len(self.fdp_ruh_ids):
-                raise ValueError("fdp_ruh_ids must not contain duplicates")
-            for ruh_id in self.fdp_ruh_ids:
+            if not self.fdp_data_ruh_ids:
+                raise ValueError("use_fdp requires non-empty fdp_data_ruh_ids")
+            if not self.fdp_metadata_ruh_ids:
+                raise ValueError("use_fdp requires non-empty fdp_metadata_ruh_ids")
+            if len(set(self.fdp_data_ruh_ids)) != len(self.fdp_data_ruh_ids):
+                raise ValueError("fdp_data_ruh_ids must not contain duplicates")
+            if len(set(self.fdp_metadata_ruh_ids)) != len(
+                self.fdp_metadata_ruh_ids
+            ):
+                raise ValueError("fdp_metadata_ruh_ids must not contain duplicates")
+            for ruh_id in self.fdp_data_ruh_ids + self.fdp_metadata_ruh_ids:
                 if ruh_id < 0 or ruh_id > 0xFFFF:
-                    raise ValueError("fdp_ruh_ids must fit in uint16")
+                    raise ValueError("FDP RUH IDs must fit in uint16")
             if self.fdp_directive_type < 0 or self.fdp_directive_type > 0x0F:
                 raise ValueError("fdp_directive_type must fit in 4 bits")
             if self.fdp_metadata_mode != "per_ruh":
@@ -220,9 +240,11 @@ class RawBlockCore:
             raise ValueError("meta_magic must be ASCII bytes") from e
 
         self._meta_copy_count: int = 2
-        self._meta_partition_count: int = len(self.fdp_ruh_ids) if self.use_fdp else 1
-        self._fdp_ruh_index: dict[int, int] = {
-            ruh_id: idx for idx, ruh_id in enumerate(self.fdp_ruh_ids)
+        self._meta_partition_count: int = (
+            len(self.fdp_metadata_ruh_ids) if self.use_fdp else 1
+        )
+        self._fdp_metadata_ruh_index: dict[int, int] = {
+            ruh_id: idx for idx, ruh_id in enumerate(self.fdp_metadata_ruh_ids)
         }
         self._reserved_meta_bytes: int = self.meta_total_bytes * (
             self._meta_partition_count
@@ -336,8 +358,28 @@ class RawBlockCore:
             str(int(kv_rank)).encode("ascii"),
             digest_size=8,
         ).digest()
-        idx = int.from_bytes(digest, "little", signed=False) % len(self.fdp_ruh_ids)
-        return self.fdp_ruh_ids[idx]
+        idx = int.from_bytes(digest, "little", signed=False) % len(
+            self.fdp_data_ruh_ids
+        )
+        return self.fdp_data_ruh_ids[idx]
+
+    def _select_fdp_metadata_ruh(self, encoded_key: str) -> int | None:
+        """Select an FDP RUH for checkpoint metadata that owns a key.
+
+        Args:
+            encoded_key: Durable raw-block key string.
+
+        Returns:
+            A configured metadata reclaim unit handle ID when FDP is enabled,
+            otherwise None.
+        """
+        if not self.use_fdp:
+            return None
+        digest = hashlib.blake2b(encoded_key.encode("utf-8"), digest_size=8).digest()
+        idx = int.from_bytes(digest, "little", signed=False) % len(
+            self.fdp_metadata_ruh_ids
+        )
+        return self.fdp_metadata_ruh_ids[idx]
 
     def _write_directive_for_ruh(self, fdp_ruh_id: int | None) -> tuple[int, int]:
         """Return NVMe directive fields for an optional FDP RUH.
@@ -698,7 +740,7 @@ class RawBlockCore:
                     payload_len = int(entry.size)
                     total_len = (
                         round_up(payload_len, self.block_align)
-                        if self.use_odirect
+                        if self._requires_aligned_io()
                         else payload_len
                     )
                     buf = memoryview(objs[i].byte_array)
@@ -868,6 +910,8 @@ class RawBlockCore:
                 "use_uring_cmd": self.use_uring_cmd,
                 "use_fdp": self.use_fdp,
                 "fdp_ruh_ids": list(self.fdp_ruh_ids),
+                "fdp_data_ruh_ids": list(self.fdp_data_ruh_ids),
+                "fdp_metadata_ruh_ids": list(self.fdp_metadata_ruh_ids),
                 "fdp_directive_type": self.fdp_directive_type,
                 "fdp_metadata_mode": self.fdp_metadata_mode,
                 "enable_zero_copy": self.enable_zero_copy,
@@ -972,6 +1016,10 @@ class RawBlockCore:
         except Exception:
             return None
 
+    def _requires_aligned_io(self) -> bool:
+        """Return whether this I/O path requires block-aligned transfers."""
+        return self.use_odirect or self.use_uring_cmd
+
     def _prepare_write_payload(self, memory_obj: MemoryObj) -> tuple[Any, int, int]:
         """Prepare the payload buffer and lengths for a raw-block write.
 
@@ -980,7 +1028,7 @@ class RawBlockCore:
 
         Returns:
             A tuple of ``(buffer, payload_len, total_len)`` where ``total_len``
-            includes any O_DIRECT padding.
+            includes any O_DIRECT or raw-command alignment padding.
 
         Raises:
             RuntimeError: If the aligned payload would exceed slot capacity.
@@ -990,11 +1038,11 @@ class RawBlockCore:
             buf = buf.cast("B")
         payload_len = len(memory_obj.byte_array)
         total_len = payload_len
-        if self.use_odirect:
+        if self._requires_aligned_io():
             total_len = round_up(payload_len, self.block_align)
             if total_len > (self.slot_bytes - self.header_bytes):
                 raise RuntimeError(
-                    f"O_DIRECT payload {total_len} exceeds slot capacity"
+                    f"Aligned payload {total_len} exceeds slot capacity"
                 )
             direct_view = self._build_direct_odirect_view(
                 memory_obj=memory_obj,
@@ -1312,7 +1360,7 @@ class RawBlockCore:
             try:
                 hdr_total = (
                     round_up(len(header), self.block_align)
-                    if self.use_odirect
+                    if self._requires_aligned_io()
                     else len(header)
                 )
                 header_buf: Any = header
@@ -1473,13 +1521,15 @@ class RawBlockCore:
 
         if fdp_ruh_id is None:
             offsets: list[int] = []
-            for ruh_id in self.fdp_ruh_ids:
+            for ruh_id in self.fdp_metadata_ruh_ids:
                 offsets.extend(self._meta_container_offsets(ruh_id))
             return offsets
 
-        if fdp_ruh_id not in self._fdp_ruh_index:
-            raise ValueError(f"Unknown FDP RUH ID {fdp_ruh_id}")
-        partition_base = self._fdp_ruh_index[fdp_ruh_id] * self.meta_total_bytes
+        if fdp_ruh_id not in self._fdp_metadata_ruh_index:
+            raise ValueError(f"Unknown FDP metadata RUH ID {fdp_ruh_id}")
+        partition_base = (
+            self._fdp_metadata_ruh_index[fdp_ruh_id] * self.meta_total_bytes
+        )
         return [
             partition_base + idx * self._meta_container_bytes
             for idx in range(self._meta_copy_count)
@@ -1562,7 +1612,8 @@ class RawBlockCore:
             checkpoint_entries = {
                 encoded_key: entry
                 for encoded_key, entry in self._index.items()
-                if not self.use_fdp or entry.fdp_ruh_id == fdp_ruh_id
+                if not self.use_fdp
+                or self._select_fdp_metadata_ruh(encoded_key) == fdp_ruh_id
             }
             snapshot = {
                 "version": 1,
@@ -1576,7 +1627,10 @@ class RawBlockCore:
                 "meta_version": self.meta_version,
                 "use_fdp": self.use_fdp,
                 "fdp_ruh_ids": list(self.fdp_ruh_ids),
+                "fdp_data_ruh_ids": list(self.fdp_data_ruh_ids),
+                "fdp_metadata_ruh_ids": list(self.fdp_metadata_ruh_ids),
                 "fdp_ruh_id": fdp_ruh_id,
+                "fdp_metadata_ruh_id": fdp_ruh_id,
                 "fdp_directive_type": self.fdp_directive_type,
                 "fdp_metadata_mode": self.fdp_metadata_mode,
                 "reserved_meta_bytes": self._reserved_meta_bytes,
@@ -1708,7 +1762,7 @@ class RawBlockCore:
 
         next_seq = self._meta_seq + 1
         dirty_total_snapshot = 0
-        for ruh_id in self.fdp_ruh_ids:
+        for ruh_id in self.fdp_metadata_ruh_ids:
             snapshot, dirty_total = self._snapshot_state(fdp_ruh_id=ruh_id)
             dirty_total_snapshot = max(dirty_total_snapshot, dirty_total)
             payload = json.dumps(
@@ -1783,26 +1837,51 @@ class RawBlockCore:
                     "Device metadata FDP metadata mode mismatch; ignoring metadata"
                 )
                 return False
-            if tuple(int(v) for v in data.get("fdp_ruh_ids", [])) != self.fdp_ruh_ids:
+            data_fdp_data_ruh_ids = tuple(
+                int(v)
+                for v in data.get(
+                    "fdp_data_ruh_ids",
+                    data.get("fdp_ruh_ids", []),
+                )
+            )
+            data_fdp_metadata_ruh_ids = tuple(
+                int(v)
+                for v in data.get(
+                    "fdp_metadata_ruh_ids",
+                    data.get("fdp_ruh_ids", []),
+                )
+            )
+            if data_fdp_data_ruh_ids != self.fdp_data_ruh_ids:
                 logger.warning(
-                    "Device metadata FDP RUH list mismatch; ignoring metadata"
+                    "Device metadata FDP data RUH list mismatch; ignoring metadata"
+                )
+                return False
+            if data_fdp_metadata_ruh_ids != self.fdp_metadata_ruh_ids:
+                logger.warning(
+                    "Device metadata FDP metadata RUH list mismatch; "
+                    "ignoring metadata"
                 )
                 return False
             try:
-                data_fdp_ruh_id = int(data.get("fdp_ruh_id"))
+                data_fdp_ruh_id = int(
+                    data.get("fdp_metadata_ruh_id", data.get("fdp_ruh_id"))
+                )
             except Exception:
                 logger.warning(
-                    "Device metadata FDP RUH ID is invalid; ignoring metadata"
+                    "Device metadata FDP metadata RUH ID is invalid; "
+                    "ignoring metadata"
                 )
                 return False
             if (
                 expected_fdp_ruh_id is not None
                 and data_fdp_ruh_id != expected_fdp_ruh_id
             ):
-                logger.warning("Device metadata FDP RUH partition mismatch")
+                logger.warning("Device metadata FDP metadata RUH partition mismatch")
                 return False
-            if data_fdp_ruh_id not in self._fdp_ruh_index:
-                logger.warning("Device metadata FDP RUH ID is not configured")
+            if data_fdp_ruh_id not in self._fdp_metadata_ruh_index:
+                logger.warning(
+                    "Device metadata FDP metadata RUH ID is not configured"
+                )
                 return False
         else:
             data_fdp_ruh_id = None
@@ -1870,7 +1949,7 @@ class RawBlockCore:
                         if self.use_fdp
                         else None
                     )
-                    if self.use_fdp and entry_fdp_ruh_id != data_fdp_ruh_id:
+                    if self.use_fdp and entry_fdp_ruh_id not in self.fdp_data_ruh_ids:
                         continue
 
                     if not self._is_valid_checkpoint_entry(offset, size):
@@ -2081,7 +2160,7 @@ class RawBlockCore:
             self._free_slots.clear()
             self._next_slot = 0
 
-        for ruh_id in self.fdp_ruh_ids:
+        for ruh_id in self.fdp_metadata_ruh_ids:
             header, payload = self._select_latest_checkpoint(ruh_id)
             if header is None or payload is None:
                 continue

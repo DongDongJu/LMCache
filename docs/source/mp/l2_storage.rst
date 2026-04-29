@@ -205,19 +205,24 @@ caller-provided load buffers during prefetch.
 
 - ``capacity_bytes``: Optional cap on the usable device bytes. Default ``0``
   means use the full device/file size.
-- ``use_odirect``: ``true`` or ``false`` (default ``true``).
+- ``use_odirect``: ``true`` or ``false`` (default ``true`` for block devices
+  and files; default ``false`` for ``use_uring_cmd`` NVMe character devices).
 - ``use_uring``: Enable the Rust io_uring path (default ``false``).
 - ``use_uring_cmd``: Enable NVMe io_uring_cmd passthrough. Requires
   ``use_uring=true`` and a compatible NVMe namespace character device such as
   ``/dev/ng0n1``.
 - ``use_fdp``: Enable experimental FDP directive fields on NVMe
   ``io_uring_cmd`` writes. Requires ``use_uring_cmd=true``.
-- ``fdp_ruh_ids``: FDP reclaim unit handle IDs used for placement. Required
-  when ``use_fdp=true``.
+- ``fdp_ruh_ids``: Legacy shorthand for using the same FDP reclaim unit handle
+  IDs for data and metadata placement.
+- ``fdp_data_ruh_ids``: FDP reclaim unit handle IDs used for data placement.
+  Defaults to ``fdp_ruh_ids`` when omitted.
+- ``fdp_metadata_ruh_ids``: FDP reclaim unit handle IDs used for checkpoint
+  metadata placement. Defaults to ``fdp_ruh_ids`` when omitted.
 - ``fdp_directive_type``: NVMe directive type used for FDP placement
   (default ``2``).
 - ``fdp_metadata_mode``: Only ``"per_ruh"`` is supported. In this mode,
-  ``meta_total_bytes`` is reserved once per configured RUH.
+  ``meta_total_bytes`` is reserved once per configured metadata RUH.
 - ``block_align``: Device alignment in bytes (default ``4096``).
 - ``header_bytes``: Per-slot header reservation (default ``4096``).
 - ``meta_total_bytes``: Reserved metadata checkpoint region (default ``256MiB``).
@@ -252,9 +257,11 @@ caller-provided load buffers during prefetch.
 
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/nvme0n1", "slot_bytes": 1048576, "use_uring": true}'
 
-    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "use_uring": true, "use_uring_cmd": true}'
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "use_odirect": false, "use_uring": true, "use_uring_cmd": true}'
 
-    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "use_uring": true, "use_uring_cmd": true, "use_fdp": true, "fdp_ruh_ids": [0, 1, 2, 3]}'
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "use_odirect": false, "use_uring": true, "use_uring_cmd": true, "use_fdp": true, "fdp_ruh_ids": [0, 1, 2, 3]}'
+
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "use_odirect": false, "use_uring": true, "use_uring_cmd": true, "use_fdp": true, "fdp_data_ruh_ids": [0, 1, 5, 6], "fdp_metadata_ruh_ids": [2]}'
 
 ``blkio`` -- libblkio backed block-device storage
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
