@@ -210,6 +210,14 @@ caller-provided load buffers during prefetch.
 - ``use_uring_cmd``: Enable NVMe io_uring_cmd passthrough. Requires
   ``use_uring=true`` and a compatible NVMe namespace character device such as
   ``/dev/ng0n1``.
+- ``use_fdp``: Enable experimental FDP directive fields on NVMe
+  ``io_uring_cmd`` writes. Requires ``use_uring_cmd=true``.
+- ``fdp_ruh_ids``: FDP reclaim unit handle IDs used for placement. Required
+  when ``use_fdp=true``.
+- ``fdp_directive_type``: NVMe directive type used for FDP placement
+  (default ``2``).
+- ``fdp_metadata_mode``: Only ``"per_ruh"`` is supported. In this mode,
+  ``meta_total_bytes`` is reserved once per configured RUH.
 - ``block_align``: Device alignment in bytes (default ``4096``).
 - ``header_bytes``: Per-slot header reservation (default ``4096``).
 - ``meta_total_bytes``: Reserved metadata checkpoint region (default ``256MiB``).
@@ -233,8 +241,8 @@ caller-provided load buffers during prefetch.
   ``--l1-align-bytes`` should be at least ``block_align``.
 - ``persist_enabled`` must remain ``true`` for this adapter.
 - The ``use_uring_cmd`` path is hardware-gated and intended for explicit NVMe
-  raw-command testing. It is not enabled automatically and does not add FDP or
-  placement-hint behavior.
+  raw-command testing. FDP support is also hardware-gated, off by default, and
+  only applies when ``use_fdp=true``.
 
 **Configuration example:**
 
@@ -245,6 +253,8 @@ caller-provided load buffers during prefetch.
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/nvme0n1", "slot_bytes": 1048576, "use_uring": true}'
 
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "use_uring": true, "use_uring_cmd": true}'
+
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "use_uring": true, "use_uring_cmd": true, "use_fdp": true, "fdp_ruh_ids": [0, 1, 2, 3]}'
 
 ``blkio`` -- libblkio backed block-device storage
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

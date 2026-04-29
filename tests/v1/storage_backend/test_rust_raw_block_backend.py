@@ -2108,3 +2108,77 @@ def test_rust_raw_block_backend_uring_cmd_opens_explicit_device(
         assert backend.indexed_key_count() == 0
     finally:
         backend.close()
+
+
+@pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
+@pytest.mark.skipif(
+    not os.environ.get("LMCACHE_RAW_BLOCK_FDP_TEST_DEVICE"),
+    reason="set LMCACHE_RAW_BLOCK_FDP_TEST_DEVICE=/dev/ng0n1 to run",
+)
+@pytest.mark.skipif(
+    not os.environ.get("LMCACHE_RAW_BLOCK_FDP_RUHS"),
+    reason="set LMCACHE_RAW_BLOCK_FDP_RUHS=0,1 to run",
+)
+def test_rust_raw_block_backend_fdp_opens_explicit_device(
+    memory_allocator,
+    loop_in_thread,
+):
+    """Open FDP on the experimental NVMe io_uring_cmd path."""
+    dev_path = os.environ["LMCACHE_RAW_BLOCK_FDP_TEST_DEVICE"]
+    fdp_ruh_ids = [
+        int(value.strip())
+        for value in os.environ["LMCACHE_RAW_BLOCK_FDP_RUHS"].split(",")
+        if value.strip()
+    ]
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        local_cpu=True,
+        max_local_cpu_size=0.1,
+        lmcache_instance_id="test_rust_raw_block_fdp",
+    )
+    config.storage_plugins = []
+    config.extra_config = {
+        "rust_raw_block.device_path": dev_path,
+        "rust_raw_block.capacity_bytes": 64 * 1024 * 1024,
+        "rust_raw_block.block_align": 4096,
+        "rust_raw_block.header_bytes": 4096,
+        "rust_raw_block.meta_total_bytes": 4 * 1024 * 1024,
+        "rust_raw_block.meta_enable_periodic": False,
+        "rust_raw_block.use_odirect": True,
+        "rust_raw_block.use_uring": True,
+        "rust_raw_block.use_uring_cmd": True,
+        "rust_raw_block.use_fdp": True,
+        "rust_raw_block.fdp_ruh_ids": fdp_ruh_ids,
+    }
+    metadata = LMCacheMetadata(
+        model_name="test_model",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(4, 2, 256, 8, 128),
+    )
+
+    local_cpu = LocalCPUBackend(
+        config=config,
+        metadata=metadata,
+        dst_device="cpu",
+        memory_allocator=memory_allocator,
+    )
+    backend = RustRawBlockBackend(
+        config=config,
+        metadata=metadata,
+        local_cpu_backend=local_cpu,
+        loop=loop_in_thread,
+        dst_device="cpu",
+    )
+    try:
+        status = backend._core.report_status()
+        assert status["use_fdp"] is True
+        assert status["fdp_ruh_ids"] == fdp_ruh_ids
+        assert status["meta_partition_count"] == len(fdp_ruh_ids)
+    finally:
+        backend.close()

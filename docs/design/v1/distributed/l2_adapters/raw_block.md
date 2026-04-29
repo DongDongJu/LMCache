@@ -115,6 +115,10 @@ The MP adapter is configured through `--l2-adapter` JSON:
   "use_odirect": true,
   "use_uring": false,
   "use_uring_cmd": false,
+  "use_fdp": false,
+  "fdp_ruh_ids": [],
+  "fdp_directive_type": 2,
+  "fdp_metadata_mode": "per_ruh",
   "block_align": 4096,
   "header_bytes": 4096,
   "meta_total_bytes": 268435456,
@@ -141,6 +145,10 @@ Important validation rules:
 - `use_uring_cmd=true` requires `use_uring=true` and an NVMe namespace
   character device path such as `/dev/ng0n1`; regular files and normal block
   device paths are rejected early
+- `use_fdp=true` requires `use_uring_cmd=true` and a non-empty `fdp_ruh_ids`
+  list. FDP placement is experimental and hardware-gated.
+- with `fdp_metadata_mode="per_ruh"`, `meta_total_bytes` is reserved once per
+  configured RUH; data slots start after all RUH metadata partitions
 
 ## Relationship to Non-MP Mode
 

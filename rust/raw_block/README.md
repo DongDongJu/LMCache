@@ -55,6 +55,10 @@ both non-MP and MP mode without duplicating the raw-block implementation.
 6. **Experimental io_uring_cmd support**: The raw NVMe command path is available
    only when explicitly enabled and pointed at an NVMe namespace character
    device such as `/dev/ng0n1`.
+7. **Experimental FDP placement support**: Python callers can pass NVMe
+   directive fields on `io_uring_cmd` writes. `RawBlockCore` uses this to map
+   KV ranks to configured reclaim unit handles and stores metadata in
+   per-RUH checkpoint partitions.
 
 ## Zero-Copy Data Path
 
@@ -144,6 +148,9 @@ No fixed numbers are included here because results are host/device/workload depe
 - `io_uring_cmd` requires compatible NVMe hardware, kernel support, and a
   namespace character device path. It is hardware-gated and not enabled by
   default.
+- FDP support requires `io_uring_cmd`, configured RUH IDs, and compatible NVMe
+  hardware. It is disabled by default. In FDP mode, `meta_total_bytes` is
+  reserved per RUH.
 
 ## io_uring Dependencies
 
@@ -266,6 +273,8 @@ dev = RawBlockDevice(
 
 Use this path only with a dedicated NVMe namespace character device. It is not
 valid for regular files or normal block device paths such as `/dev/nvme0n1`.
+When FDP is enabled through `RawBlockCore`, writes pass the configured directive
+type and selected reclaim unit handle to this same raw-command path.
 
 ## MP Adapter Example
 
@@ -300,4 +309,7 @@ Notes:
 - Add `"use_uring": true` to use the Rust io_uring path.
 - Add `"use_uring": true, "use_uring_cmd": true` only for NVMe namespace
   character devices such as `/dev/ng0n1`.
+- Add `"use_uring": true, "use_uring_cmd": true, "use_fdp": true,
+  "fdp_ruh_ids": [0, 1]` only on FDP-capable NVMe devices. In this mode,
+  `meta_total_bytes` is reserved per RUH.
 - Restart recovery uses the metadata checkpoint region on the same device.

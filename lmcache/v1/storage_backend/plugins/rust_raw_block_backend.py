@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 # Standard
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence as ABCSequence
 from concurrent.futures import Future
 from typing import Any, Callable, List, Optional, Sequence
 import asyncio
@@ -66,6 +66,29 @@ def _get_per_tp_device_path(
         The configured path, or None when the rank is absent.
     """
     return per_tp_devices.get(str(tp_rank), per_tp_devices.get(tp_rank))
+
+
+def _parse_fdp_ruh_ids(raw_ids: Any) -> tuple[int, ...]:
+    """Parse FDP reclaim unit handle IDs from config.
+
+    Args:
+        raw_ids: Sequence of IDs or comma-separated string.
+
+    Returns:
+        Parsed reclaim unit handle IDs as integers.
+
+    Raises:
+        ValueError: If the value is not a supported sequence or string.
+    """
+    if raw_ids is None:
+        return ()
+    if isinstance(raw_ids, str):
+        if not raw_ids.strip():
+            return ()
+        return tuple(int(part.strip()) for part in raw_ids.split(","))
+    if isinstance(raw_ids, ABCSequence):
+        return tuple(int(value) for value in raw_ids)
+    raise ValueError("rust_raw_block.fdp_ruh_ids must be a sequence or CSV string")
 
 
 class RustRawBlockBackend(StoragePluginInterface):
@@ -241,6 +264,12 @@ class RustRawBlockBackend(StoragePluginInterface):
         use_odirect = bool(extra.get("rust_raw_block.use_odirect", False))
         use_uring = bool(extra.get("rust_raw_block.use_uring", False))
         use_uring_cmd = bool(extra.get("rust_raw_block.use_uring_cmd", False))
+        use_fdp = bool(extra.get("rust_raw_block.use_fdp", False))
+        fdp_ruh_ids = _parse_fdp_ruh_ids(extra.get("rust_raw_block.fdp_ruh_ids", ()))
+        fdp_directive_type = int(extra.get("rust_raw_block.fdp_directive_type", 2))
+        fdp_metadata_mode = str(
+            extra.get("rust_raw_block.fdp_metadata_mode", "per_ruh")
+        )
         enable_zero_copy = bool(extra.get("rust_raw_block.enable_zero_copy", True))
         capacity_bytes = int(extra.get("rust_raw_block.capacity_bytes", 0))
         meta_total_bytes = int(
@@ -281,6 +310,10 @@ class RustRawBlockBackend(StoragePluginInterface):
             use_odirect=use_odirect,
             use_uring=use_uring,
             use_uring_cmd=use_uring_cmd,
+            use_fdp=use_fdp,
+            fdp_ruh_ids=fdp_ruh_ids,
+            fdp_directive_type=fdp_directive_type,
+            fdp_metadata_mode=fdp_metadata_mode,
             enable_zero_copy=enable_zero_copy,
             meta_total_bytes=meta_total_bytes,
             meta_magic=meta_magic,

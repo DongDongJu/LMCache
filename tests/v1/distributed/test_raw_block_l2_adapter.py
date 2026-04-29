@@ -198,6 +198,62 @@ def test_raw_block_l2_adapter_config_parses_uring_flags():
             }
         )
 
+    fdp_cfg = RawBlockL2AdapterConfig.from_dict(
+        {
+            "type": "raw_block",
+            "device_path": "/dev/ng0n1",
+            "slot_bytes": 64 * 1024,
+            "capacity_bytes": 8 * 1024 * 1024,
+            "meta_total_bytes": 1 * 1024 * 1024,
+            "use_uring": True,
+            "use_uring_cmd": True,
+            "use_fdp": True,
+            "fdp_ruh_ids": [3, 4],
+        }
+    )
+    assert fdp_cfg.use_fdp is True
+    assert fdp_cfg.fdp_ruh_ids == (3, 4)
+    core_cfg = fdp_cfg.to_core_config()
+    assert core_cfg.use_fdp is True
+    assert core_cfg.fdp_ruh_ids == (3, 4)
+
+    with pytest.raises(ValueError, match="use_fdp requires use_uring_cmd"):
+        RawBlockL2AdapterConfig.from_dict(
+            {
+                "type": "raw_block",
+                "device_path": "/dev/ng0n1",
+                "slot_bytes": 64 * 1024,
+                "use_uring": True,
+                "use_fdp": True,
+                "fdp_ruh_ids": [1],
+            }
+        )
+    with pytest.raises(ValueError, match="non-empty fdp_ruh_ids"):
+        RawBlockL2AdapterConfig.from_dict(
+            {
+                "type": "raw_block",
+                "device_path": "/dev/ng0n1",
+                "slot_bytes": 64 * 1024,
+                "use_uring": True,
+                "use_uring_cmd": True,
+                "use_fdp": True,
+            }
+        )
+    with pytest.raises(ValueError, match="leave space"):
+        RawBlockL2AdapterConfig.from_dict(
+            {
+                "type": "raw_block",
+                "device_path": "/dev/ng0n1",
+                "slot_bytes": 64 * 1024,
+                "capacity_bytes": 2 * 1024 * 1024,
+                "meta_total_bytes": 1 * 1024 * 1024,
+                "use_uring": True,
+                "use_uring_cmd": True,
+                "use_fdp": True,
+                "fdp_ruh_ids": [1, 2],
+            }
+        )
+
 
 def test_raw_block_l2_adapter_uring_cmd_rejects_regular_file():
     with tempfile.TemporaryDirectory() as td:

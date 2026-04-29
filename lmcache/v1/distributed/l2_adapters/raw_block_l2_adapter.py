@@ -11,6 +11,7 @@ lookup, and load.
 from __future__ import annotations
 
 # Standard
+from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
@@ -54,6 +55,29 @@ RawBlockStoreTaskResult = tuple[
 ]
 
 
+def _parse_fdp_ruh_ids(raw_ids: Any) -> tuple[int, ...]:
+    """Parse FDP reclaim unit handle IDs from adapter config.
+
+    Args:
+        raw_ids: Sequence of IDs or comma-separated string.
+
+    Returns:
+        Parsed reclaim unit handle IDs as integers.
+
+    Raises:
+        ValueError: If the value is not a supported sequence or string.
+    """
+    if raw_ids is None:
+        return ()
+    if isinstance(raw_ids, str):
+        if not raw_ids.strip():
+            return ()
+        return tuple(int(part.strip()) for part in raw_ids.split(","))
+    if isinstance(raw_ids, Sequence):
+        return tuple(int(value) for value in raw_ids)
+    raise ValueError("fdp_ruh_ids must be a sequence or CSV string")
+
+
 def _make_bitmap(size: int) -> "Bitmap":
     # First Party
     from lmcache.native_storage_ops import Bitmap
@@ -73,6 +97,10 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         use_odirect: bool = True,
         use_uring: bool = False,
         use_uring_cmd: bool = False,
+        use_fdp: bool = False,
+        fdp_ruh_ids: Sequence[int] | None = None,
+        fdp_directive_type: int = 2,
+        fdp_metadata_mode: str = "per_ruh",
         block_align: int = 4096,
         header_bytes: int = 4096,
         meta_total_bytes: int = 256 * 1024 * 1024,
@@ -97,6 +125,11 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             use_odirect: Whether to open the raw path with O_DIRECT.
             use_uring: Whether to use the Rust io_uring I/O path.
             use_uring_cmd: Whether to use NVMe io_uring_cmd passthrough.
+            use_fdp: Whether to set FDP directive fields on raw-command writes.
+            fdp_ruh_ids: Reclaim unit handles used for FDP placement.
+            fdp_directive_type: NVMe directive type used for FDP placement.
+            fdp_metadata_mode: Metadata layout for FDP. Only ``"per_ruh"`` is
+                currently supported.
             block_align: Required block alignment in bytes.
             header_bytes: Per-slot header reservation in bytes.
             meta_total_bytes: Reserved metadata checkpoint region size.
@@ -120,6 +153,10 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         self.use_odirect = bool(use_odirect)
         self.use_uring = bool(use_uring)
         self.use_uring_cmd = bool(use_uring_cmd)
+        self.use_fdp = bool(use_fdp)
+        self.fdp_ruh_ids = tuple(int(value) for value in (fdp_ruh_ids or ()))
+        self.fdp_directive_type = int(fdp_directive_type)
+        self.fdp_metadata_mode = str(fdp_metadata_mode)
         self.block_align = int(block_align)
         self.header_bytes = int(header_bytes)
         self.meta_total_bytes = int(meta_total_bytes)
@@ -158,6 +195,11 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         capacity_bytes = int(d.get("capacity_bytes", 0))
         use_uring = bool(d.get("use_uring", False))
         use_uring_cmd = bool(d.get("use_uring_cmd", False))
+        use_fdp = bool(d.get("use_fdp", False))
+        fdp_ruh_ids = _parse_fdp_ruh_ids(d.get("fdp_ruh_ids", ()))
+        fdp_directive_type = int(d.get("fdp_directive_type", 2))
+        fdp_metadata_mode = str(d.get("fdp_metadata_mode", "per_ruh"))
+        reserved_meta_bytes = meta_total_bytes * (len(fdp_ruh_ids) if use_fdp else 1)
 
         if block_align <= 0:
             raise ValueError("block_align must be > 0")
@@ -169,10 +211,24 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError("meta_total_bytes must be a multiple of block_align")
         if slot_bytes < header_bytes + 1:
             raise ValueError("slot_bytes must be >= header_bytes + 1")
-        if capacity_bytes > 0 and capacity_bytes <= meta_total_bytes:
+        if capacity_bytes > 0 and capacity_bytes <= reserved_meta_bytes:
             raise ValueError("capacity_bytes must leave space for at least one slot")
         if use_uring_cmd and not use_uring:
             raise ValueError("use_uring_cmd requires use_uring=true")
+        if use_fdp:
+            if not use_uring_cmd:
+                raise ValueError("use_fdp requires use_uring_cmd=true")
+            if not fdp_ruh_ids:
+                raise ValueError("use_fdp requires non-empty fdp_ruh_ids")
+            if len(set(fdp_ruh_ids)) != len(fdp_ruh_ids):
+                raise ValueError("fdp_ruh_ids must not contain duplicates")
+            for ruh_id in fdp_ruh_ids:
+                if ruh_id < 0 or ruh_id > 0xFFFF:
+                    raise ValueError("fdp_ruh_ids must fit in uint16")
+            if fdp_directive_type < 0 or fdp_directive_type > 0x0F:
+                raise ValueError("fdp_directive_type must fit in 4 bits")
+            if fdp_metadata_mode != "per_ruh":
+                raise ValueError("fdp_metadata_mode must be 'per_ruh'")
 
         internal_eviction_policy = str(d.get("internal_eviction_policy", "lru")).lower()
         if internal_eviction_policy != "lru":
@@ -197,6 +253,10 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             use_odirect=bool(d.get("use_odirect", True)),
             use_uring=use_uring,
             use_uring_cmd=use_uring_cmd,
+            use_fdp=use_fdp,
+            fdp_ruh_ids=fdp_ruh_ids,
+            fdp_directive_type=fdp_directive_type,
+            fdp_metadata_mode=fdp_metadata_mode,
             block_align=block_align,
             header_bytes=header_bytes,
             meta_total_bytes=meta_total_bytes,
@@ -227,6 +287,14 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "- use_uring (bool): enable Rust io_uring I/O (default false)\n"
             "- use_uring_cmd (bool): enable NVMe io_uring_cmd path "
             "(default false, requires use_uring)\n"
+            "- use_fdp (bool): enable FDP directive fields on io_uring_cmd "
+            "writes (default false, requires use_uring_cmd)\n"
+            "- fdp_ruh_ids (list[int] | str): FDP reclaim unit handles used "
+            "for placement; required when use_fdp is true\n"
+            "- fdp_directive_type (int): NVMe directive type for FDP "
+            "(default 2)\n"
+            "- fdp_metadata_mode (str): only 'per_ruh' is supported; "
+            "meta_total_bytes is reserved per RUH\n"
             "- block_align (int): required block alignment in bytes (default 4096)\n"
             "- header_bytes (int): per-slot header reservation (default 4096)\n"
             "- meta_total_bytes (int): reserved metadata checkpoint region "
@@ -259,6 +327,10 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             use_odirect=self.use_odirect,
             use_uring=self.use_uring,
             use_uring_cmd=self.use_uring_cmd,
+            use_fdp=self.use_fdp,
+            fdp_ruh_ids=self.fdp_ruh_ids,
+            fdp_directive_type=self.fdp_directive_type,
+            fdp_metadata_mode=self.fdp_metadata_mode,
             enable_zero_copy=self.enable_zero_copy,
             meta_total_bytes=self.meta_total_bytes,
             meta_magic=self.meta_magic.encode("ascii"),

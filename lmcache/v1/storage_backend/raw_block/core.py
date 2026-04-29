@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 import ctypes
+import hashlib
 import json
 import os
 import stat
@@ -31,6 +32,7 @@ from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.storage_backend.raw_block.key_codec import (
     RawBlockKeyNamespace,
     RawBlockKeySpec,
+    decode_object_key,
     decode_legacy_key,
     slot_identity_from_encoded_key,
 )
@@ -77,6 +79,10 @@ class RawBlockCoreConfig:
     meta_verify_on_load: bool
     use_uring: bool = False
     use_uring_cmd: bool = False
+    use_fdp: bool = False
+    fdp_ruh_ids: tuple[int, ...] = ()
+    fdp_directive_type: int = 2
+    fdp_metadata_mode: str = "per_ruh"
 
 
 @dataclass
@@ -84,12 +90,14 @@ class _Entry:
     offset: int
     size: int
     meta: DiskCacheMetadata
+    fdp_ruh_id: int | None = None
 
 
 @dataclass
 class _Inflight:
     offset: int
     meta: DiskCacheMetadata
+    fdp_ruh_id: int | None = None
     canceled: bool = False
 
 
@@ -141,6 +149,10 @@ class RawBlockCore:
         self.use_odirect = bool(config.use_odirect)
         self.use_uring = bool(config.use_uring)
         self.use_uring_cmd = bool(config.use_uring_cmd)
+        self.use_fdp = bool(config.use_fdp)
+        self.fdp_ruh_ids = tuple(int(v) for v in config.fdp_ruh_ids)
+        self.fdp_directive_type = int(config.fdp_directive_type)
+        self.fdp_metadata_mode = str(config.fdp_metadata_mode)
         self.enable_zero_copy = bool(config.enable_zero_copy)
 
         self.meta_total_bytes = int(config.meta_total_bytes)
@@ -174,6 +186,20 @@ class RawBlockCore:
             raise ValueError("meta_version must be > 0")
         if self.use_uring_cmd and not self.use_uring:
             raise ValueError("use_uring_cmd requires use_uring=true")
+        if self.use_fdp:
+            if not self.use_uring_cmd:
+                raise ValueError("use_fdp requires use_uring_cmd=true")
+            if not self.fdp_ruh_ids:
+                raise ValueError("use_fdp requires non-empty fdp_ruh_ids")
+            if len(set(self.fdp_ruh_ids)) != len(self.fdp_ruh_ids):
+                raise ValueError("fdp_ruh_ids must not contain duplicates")
+            for ruh_id in self.fdp_ruh_ids:
+                if ruh_id < 0 or ruh_id > 0xFFFF:
+                    raise ValueError("fdp_ruh_ids must fit in uint16")
+            if self.fdp_directive_type < 0 or self.fdp_directive_type > 0x0F:
+                raise ValueError("fdp_directive_type must fit in 4 bits")
+            if self.fdp_metadata_mode != "per_ruh":
+                raise ValueError("fdp_metadata_mode must be 'per_ruh'")
         if self.use_uring_cmd:
             try:
                 mode = os.stat(self.device_path).st_mode
@@ -194,6 +220,13 @@ class RawBlockCore:
             raise ValueError("meta_magic must be ASCII bytes") from e
 
         self._meta_copy_count: int = 2
+        self._meta_partition_count: int = len(self.fdp_ruh_ids) if self.use_fdp else 1
+        self._fdp_ruh_index: dict[int, int] = {
+            ruh_id: idx for idx, ruh_id in enumerate(self.fdp_ruh_ids)
+        }
+        self._reserved_meta_bytes: int = self.meta_total_bytes * (
+            self._meta_partition_count
+        )
         self._meta_container_bytes: int = (
             (self.meta_total_bytes // self._meta_copy_count) // self.block_align
         ) * self.block_align
@@ -279,6 +312,47 @@ class RawBlockCore:
             raw_device: Object implementing the Rust raw-device methods.
         """
         self._raw = raw_device
+
+    def _select_fdp_ruh(self, key: RawBlockKeySpec) -> int | None:
+        """Select an FDP RUH for a raw-block key.
+
+        Args:
+            key: Encoded raw-block key being written.
+
+        Returns:
+            A configured reclaim unit handle ID when FDP is enabled, otherwise
+            None.
+        """
+        if not self.use_fdp:
+            return None
+
+        if self.key_namespace == "object":
+            kv_rank = decode_object_key(key.encoded).kv_rank
+        else:
+            parsed_key = decode_legacy_key(key.encoded)
+            kv_rank = int(getattr(parsed_key, "worker_id", 0))
+
+        digest = hashlib.blake2b(
+            str(int(kv_rank)).encode("ascii"),
+            digest_size=8,
+        ).digest()
+        idx = int.from_bytes(digest, "little", signed=False) % len(self.fdp_ruh_ids)
+        return self.fdp_ruh_ids[idx]
+
+    def _write_directive_for_ruh(self, fdp_ruh_id: int | None) -> tuple[int, int]:
+        """Return NVMe directive fields for an optional FDP RUH.
+
+        Args:
+            fdp_ruh_id: Reclaim unit handle selected for a write, or None.
+
+        Returns:
+            ``(dtype, dspec)`` values for the Rust io_uring_cmd write path.
+        """
+        if fdp_ruh_id is None:
+            return (0, 0)
+        if not self.use_fdp:
+            return (0, 0)
+        return (self.fdp_directive_type, int(fdp_ruh_id))
 
     def register_fixed_buffers_from_allocator(self, memory_allocator: Any) -> None:
         """Register allocator pages with io_uring when the allocator exposes them.
@@ -474,6 +548,7 @@ class RawBlockCore:
         for i, (key, obj) in enumerate(zip(keys, objs, strict=False)):
             if self._closed:
                 break
+            fdp_ruh_id = self._select_fdp_ruh(key)
 
             with self._lock:
                 if key.encoded in self._index:
@@ -511,9 +586,13 @@ class RawBlockCore:
                     fmt=obj.metadata.fmt,
                     pin_count=0,
                 )
-                self._inflight[key.encoded] = _Inflight(offset=offset, meta=meta)
+                self._inflight[key.encoded] = _Inflight(
+                    offset=offset,
+                    meta=meta,
+                    fdp_ruh_id=fdp_ruh_id,
+                )
 
-            success = self._write_one(key, obj, offset)
+            success = self._write_one(key, obj, offset, fdp_ruh_id=fdp_ruh_id)
 
             with self._lock:
                 inflight = self._inflight.pop(key.encoded, None)
@@ -532,6 +611,7 @@ class RawBlockCore:
                     offset=inflight.offset,
                     size=inflight.meta.size,
                     meta=inflight.meta,
+                    fdp_ruh_id=inflight.fdp_ruh_id,
                 )
                 self._touch_locked(key.encoded)
                 self._meta_dirty_total += 1
@@ -768,6 +848,8 @@ class RawBlockCore:
                 "header_bytes": self.header_bytes,
                 "slot_bytes": self.slot_bytes,
                 "meta_total_bytes": self.meta_total_bytes,
+                "reserved_meta_bytes": self._reserved_meta_bytes,
+                "meta_partition_count": self._meta_partition_count,
                 "usable_capacity_bytes": self._max_slots * self.slot_bytes,
                 "indexed_key_count": len(self._index),
                 "inflight_key_count": len(self._inflight),
@@ -784,6 +866,10 @@ class RawBlockCore:
                 "use_odirect": self.use_odirect,
                 "use_uring": self.use_uring,
                 "use_uring_cmd": self.use_uring_cmd,
+                "use_fdp": self.use_fdp,
+                "fdp_ruh_ids": list(self.fdp_ruh_ids),
+                "fdp_directive_type": self.fdp_directive_type,
+                "fdp_metadata_mode": self.fdp_metadata_mode,
                 "enable_zero_copy": self.enable_zero_copy,
             }
 
@@ -959,6 +1045,8 @@ class RawBlockCore:
         buffers: Sequence[Any],
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
+        *,
+        fdp_ruh_id: int | None = None,
     ) -> None:
         """Write buffers as bounded NVMe raw-command chunks.
 
@@ -967,6 +1055,7 @@ class RawBlockCore:
             buffers: Source buffers.
             payload_lens: Logical source byte counts.
             total_lens: Physical transfer sizes, including padding.
+            fdp_ruh_id: Optional FDP RUH used as the NVMe directive specifier.
 
         Raises:
             ValueError: If lengths are inconsistent or unaligned.
@@ -1008,7 +1097,14 @@ class RawBlockCore:
 
         if not chunk_offsets:
             return
-        batch_id = raw_dev.batched_write(chunk_offsets, chunk_buffers, chunk_lens)
+        dtype, dspec = self._write_directive_for_ruh(fdp_ruh_id)
+        batch_id = raw_dev.batched_write(
+            chunk_offsets,
+            chunk_buffers,
+            chunk_lens,
+            dtype,
+            dspec,
+        )
         raw_dev.wait_iouring(batch_id)
         keepalive.clear()
 
@@ -1073,6 +1169,8 @@ class RawBlockCore:
         buffers: Sequence[Any],
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
+        *,
+        fdp_ruh_id: int | None = None,
     ) -> None:
         """Write one or more buffers through the configured Rust I/O path.
 
@@ -1081,6 +1179,7 @@ class RawBlockCore:
             buffers: Python buffers to write.
             payload_lens: Logical payload lengths for each buffer.
             total_lens: Physical I/O lengths for each buffer.
+            fdp_ruh_id: Optional FDP RUH used for NVMe raw-command writes.
 
         Raises:
             RuntimeError: If the requested io_uring mode is unavailable.
@@ -1095,7 +1194,13 @@ class RawBlockCore:
             return
 
         if self.use_uring_cmd:
-            self._write_uring_cmd_buffers(offsets, buffers, payload_lens, total_lens)
+            self._write_uring_cmd_buffers(
+                offsets,
+                buffers,
+                payload_lens,
+                total_lens,
+                fdp_ruh_id=fdp_ruh_id,
+            )
             return
 
         can_batch = all(
@@ -1180,7 +1285,12 @@ class RawBlockCore:
             raw_dev.read_uring(int(offset), buf, int(payload_len), int(total_len))
 
     def _write_one(
-        self, key: RawBlockKeySpec, memory_obj: MemoryObj, offset: int
+        self,
+        key: RawBlockKeySpec,
+        memory_obj: MemoryObj,
+        offset: int,
+        *,
+        fdp_ruh_id: int | None = None,
     ) -> bool:
         """Write one object header and payload into a raw-block slot.
 
@@ -1188,6 +1298,7 @@ class RawBlockCore:
             key: Raw-block key spec with the slot-header identity.
             memory_obj: Source object to write.
             offset: Slot byte offset on the raw device.
+            fdp_ruh_id: Optional FDP RUH used as the NVMe directive specifier.
 
         Returns:
             True when both header and payload writes complete; false otherwise.
@@ -1217,6 +1328,7 @@ class RawBlockCore:
                         payload_len,
                     ],
                     [hdr_total, total_len],
+                    fdp_ruh_id=fdp_ruh_id,
                 )
             finally:
                 with self._lock:
@@ -1277,10 +1389,10 @@ class RawBlockCore:
         self._effective_capacity_bytes = min(requested, device_size)
         self.capacity_bytes = self._effective_capacity_bytes
 
-        if self.meta_total_bytes >= self._effective_capacity_bytes:
+        if self._reserved_meta_bytes >= self._effective_capacity_bytes:
             raise RuntimeError("metadata region exceeds usable device capacity")
 
-        self._data_base_offset = self.meta_total_bytes
+        self._data_base_offset = self._reserved_meta_bytes
         data_bytes = self._effective_capacity_bytes - self._data_base_offset
         self._max_slots = data_bytes // self.slot_bytes
         if self._max_slots <= 0:
@@ -1351,10 +1463,26 @@ class RawBlockCore:
         """Return usable bytes in one metadata checkpoint payload area."""
         return self._meta_container_bytes - self.block_align
 
-    def _meta_container_offsets(self) -> list[int]:
+    def _meta_container_offsets(self, fdp_ruh_id: int | None = None) -> list[int]:
         """Return byte offsets for mirrored metadata checkpoint containers."""
+        if not self.use_fdp:
+            return [
+                idx * self._meta_container_bytes
+                for idx in range(self._meta_copy_count)
+            ]
+
+        if fdp_ruh_id is None:
+            offsets: list[int] = []
+            for ruh_id in self.fdp_ruh_ids:
+                offsets.extend(self._meta_container_offsets(ruh_id))
+            return offsets
+
+        if fdp_ruh_id not in self._fdp_ruh_index:
+            raise ValueError(f"Unknown FDP RUH ID {fdp_ruh_id}")
+        partition_base = self._fdp_ruh_index[fdp_ruh_id] * self.meta_total_bytes
         return [
-            idx * self._meta_container_bytes for idx in range(self._meta_copy_count)
+            partition_base + idx * self._meta_container_bytes
+            for idx in range(self._meta_copy_count)
         ]
 
     def _read_meta_header(self, container_offset: int) -> Optional[dict[str, int]]:
@@ -1404,11 +1532,12 @@ class RawBlockCore:
 
     def _select_latest_checkpoint(
         self,
+        fdp_ruh_id: int | None = None,
     ) -> tuple[Optional[dict[str, int]], Optional[bytes]]:
         """Return the newest valid checkpoint header and payload."""
         best_header: Optional[dict[str, int]] = None
         best_payload: Optional[bytes] = None
-        for offset in self._meta_container_offsets():
+        for offset in self._meta_container_offsets(fdp_ruh_id):
             header = self._read_meta_header(offset)
             if header is None:
                 continue
@@ -1420,10 +1549,21 @@ class RawBlockCore:
                 best_payload = payload
         return best_header, best_payload
 
-    def _snapshot_state(self) -> tuple[dict[str, Any], int]:
+    def _snapshot_state(
+        self,
+        *,
+        fdp_ruh_id: int | None = None,
+    ) -> tuple[dict[str, Any], int]:
         """Build a JSON-serializable checkpoint state snapshot."""
+        if self.use_fdp and fdp_ruh_id is None:
+            raise ValueError("FDP checkpoints require a specific RUH ID")
         with self._lock:
             dirty_total = self._meta_dirty_total
+            checkpoint_entries = {
+                encoded_key: entry
+                for encoded_key, entry in self._index.items()
+                if not self.use_fdp or entry.fdp_ruh_id == fdp_ruh_id
+            }
             snapshot = {
                 "version": 1,
                 "device_path": self.device_path,
@@ -1434,14 +1574,25 @@ class RawBlockCore:
                 "meta_total_bytes": self.meta_total_bytes,
                 "meta_magic": self.meta_magic_text,
                 "meta_version": self.meta_version,
+                "use_fdp": self.use_fdp,
+                "fdp_ruh_ids": list(self.fdp_ruh_ids),
+                "fdp_ruh_id": fdp_ruh_id,
+                "fdp_directive_type": self.fdp_directive_type,
+                "fdp_metadata_mode": self.fdp_metadata_mode,
+                "reserved_meta_bytes": self._reserved_meta_bytes,
                 "data_base_offset": self._data_base_offset,
                 "next_slot": self._next_slot,
                 "free_slots": list(self._free_slots),
-                "lru_keys": list(self._lru.keys()),
+                "lru_keys": [
+                    encoded_key
+                    for encoded_key in self._lru.keys()
+                    if encoded_key in checkpoint_entries
+                ],
                 "entries": {
                     encoded_key: {
                         "offset": entry.offset,
                         "size": entry.meta.size,
+                        "fdp_ruh_id": entry.fdp_ruh_id,
                         "shape": list(entry.meta.shape)
                         if entry.meta.shape is not None
                         else None,
@@ -1461,7 +1612,7 @@ class RawBlockCore:
                             else None
                         ),
                     }
-                    for encoded_key, entry in self._index.items()
+                    for encoded_key, entry in checkpoint_entries.items()
                 },
             }
         return snapshot, dirty_total
@@ -1480,7 +1631,15 @@ class RawBlockCore:
             return None
         return TORCH_DTYPE_TO_STR_DTYPE.get(dtype, str(dtype))
 
-    def _write_checkpoint(self, payload: bytes, dirty_total_snapshot: int) -> bool:
+    def _write_checkpoint(
+        self,
+        payload: bytes,
+        dirty_total_snapshot: int,
+        *,
+        fdp_ruh_id: int | None = None,
+        next_seq: int | None = None,
+        update_counters: bool = True,
+    ) -> bool:
         """Write one checkpoint copy and advance persisted metadata counters."""
         payload_cap = self._meta_payload_capacity()
         if len(payload) > payload_cap:
@@ -1492,9 +1651,10 @@ class RawBlockCore:
             )
             return False
 
-        next_seq = self._meta_seq + 1
+        if next_seq is None:
+            next_seq = self._meta_seq + 1
         target_idx = int((next_seq - 1) % self._meta_copy_count)
-        target = self._meta_container_offsets()[target_idx]
+        target = self._meta_container_offsets(fdp_ruh_id)[target_idx]
 
         payload_len = len(payload)
         payload_total_len = round_up(payload_len, self.block_align)
@@ -1515,11 +1675,15 @@ class RawBlockCore:
             [payload, header_block],
             [payload_len, self.block_align],
             [payload_total_len, self.block_align],
+            fdp_ruh_id=fdp_ruh_id,
         )
 
-        with self._lock:
-            self._meta_seq = int(next_seq)
-            self._meta_persisted = max(self._meta_persisted, int(dirty_total_snapshot))
+        if update_counters:
+            with self._lock:
+                self._meta_seq = int(next_seq)
+                self._meta_persisted = max(
+                    self._meta_persisted, int(dirty_total_snapshot)
+                )
         return True
 
     def _checkpoint_once(self, force: bool) -> bool:
@@ -1535,11 +1699,34 @@ class RawBlockCore:
         if not force and not idle_ok:
             return False
 
-        snapshot, dirty_total_snapshot = self._snapshot_state()
-        payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=True).encode(
-            "utf-8"
-        )
-        return self._write_checkpoint(payload, dirty_total_snapshot)
+        if not self.use_fdp:
+            snapshot, dirty_total_snapshot = self._snapshot_state()
+            payload = json.dumps(
+                snapshot, separators=(",", ":"), ensure_ascii=True
+            ).encode("utf-8")
+            return self._write_checkpoint(payload, dirty_total_snapshot)
+
+        next_seq = self._meta_seq + 1
+        dirty_total_snapshot = 0
+        for ruh_id in self.fdp_ruh_ids:
+            snapshot, dirty_total = self._snapshot_state(fdp_ruh_id=ruh_id)
+            dirty_total_snapshot = max(dirty_total_snapshot, dirty_total)
+            payload = json.dumps(
+                snapshot, separators=(",", ":"), ensure_ascii=True
+            ).encode("utf-8")
+            if not self._write_checkpoint(
+                payload,
+                dirty_total,
+                fdp_ruh_id=ruh_id,
+                next_seq=next_seq,
+                update_counters=False,
+            ):
+                return False
+
+        with self._lock:
+            self._meta_seq = int(next_seq)
+            self._meta_persisted = max(self._meta_persisted, dirty_total_snapshot)
+        return True
 
     def _is_valid_checkpoint_entry(self, offset: int, size: int) -> bool:
         """Return whether a checkpoint entry references a valid data slot."""
@@ -1553,7 +1740,13 @@ class RawBlockCore:
             return False
         return 0 < size <= (self.slot_bytes - self.header_bytes)
 
-    def _apply_loaded_state(self, data: dict[str, Any]) -> bool:
+    def _apply_loaded_state(
+        self,
+        data: dict[str, Any],
+        *,
+        merge: bool = False,
+        expected_fdp_ruh_id: int | None = None,
+    ) -> bool:
         """Apply decoded checkpoint state after validating layout fields."""
         if not isinstance(data, dict):
             return False
@@ -1579,6 +1772,40 @@ class RawBlockCore:
         if int(data.get("meta_version", self.meta_version)) != self.meta_version:
             logger.warning("Device metadata meta_version mismatch; ignoring metadata")
             return False
+
+        data_use_fdp = bool(data.get("use_fdp", False))
+        if data_use_fdp != self.use_fdp:
+            logger.warning("Device metadata FDP mode mismatch; ignoring metadata")
+            return False
+        if self.use_fdp:
+            if str(data.get("fdp_metadata_mode", "per_ruh")) != self.fdp_metadata_mode:
+                logger.warning(
+                    "Device metadata FDP metadata mode mismatch; ignoring metadata"
+                )
+                return False
+            if tuple(int(v) for v in data.get("fdp_ruh_ids", [])) != self.fdp_ruh_ids:
+                logger.warning(
+                    "Device metadata FDP RUH list mismatch; ignoring metadata"
+                )
+                return False
+            try:
+                data_fdp_ruh_id = int(data.get("fdp_ruh_id"))
+            except Exception:
+                logger.warning(
+                    "Device metadata FDP RUH ID is invalid; ignoring metadata"
+                )
+                return False
+            if (
+                expected_fdp_ruh_id is not None
+                and data_fdp_ruh_id != expected_fdp_ruh_id
+            ):
+                logger.warning("Device metadata FDP RUH partition mismatch")
+                return False
+            if data_fdp_ruh_id not in self._fdp_ruh_index:
+                logger.warning("Device metadata FDP RUH ID is not configured")
+                return False
+        else:
+            data_fdp_ruh_id = None
 
         try:
             next_slot = int(data.get("next_slot", 0))
@@ -1619,11 +1846,12 @@ class RawBlockCore:
             free_slots.append(slot)
 
         with self._lock:
-            self._next_slot = next_slot
-            self._free_slots = free_slots
-            self._index.clear()
-            self._lru.clear()
-            self._lock_refcnt.clear()
+            if not merge:
+                self._next_slot = next_slot
+                self._free_slots = free_slots
+                self._index.clear()
+                self._lru.clear()
+                self._lock_refcnt.clear()
 
             entries = data.get("entries", {})
             if isinstance(entries, dict):
@@ -1637,6 +1865,13 @@ class RawBlockCore:
                     fmt_name = entry.get("fmt")
                     cached_positions_list = entry.get("cached_positions")
                     dtype_name = entry.get("dtype")
+                    entry_fdp_ruh_id = (
+                        int(entry.get("fdp_ruh_id", data_fdp_ruh_id))
+                        if self.use_fdp
+                        else None
+                    )
+                    if self.use_fdp and entry_fdp_ruh_id != data_fdp_ruh_id:
+                        continue
 
                     if not self._is_valid_checkpoint_entry(offset, size):
                         continue
@@ -1670,16 +1905,20 @@ class RawBlockCore:
                         pin_count=0,
                     )
                     self._index[encoded_key] = _Entry(
-                        offset=offset, size=size, meta=meta
+                        offset=offset,
+                        size=size,
+                        meta=meta,
+                        fdp_ruh_id=entry_fdp_ruh_id,
                     )
 
-            used_slots = {
-                self._offset_to_slot(int(entry.offset))
-                for entry in self._index.values()
-            }
-            self._free_slots = [
-                slot for slot in self._free_slots if slot not in used_slots
-            ]
+            if not merge:
+                used_slots = {
+                    self._offset_to_slot(int(entry.offset))
+                    for entry in self._index.values()
+                }
+                self._free_slots = [
+                    slot for slot in self._free_slots if slot not in used_slots
+                ]
 
             lru_keys = data.get("lru_keys", [])
             if isinstance(lru_keys, list) and lru_keys:
@@ -1690,12 +1929,28 @@ class RawBlockCore:
                 for encoded_key in self._index:
                     self._lru[encoded_key] = None
 
-            self._meta_dirty_total = 0
-            self._meta_persisted = 0
+            if not merge:
+                self._meta_dirty_total = 0
+                self._meta_persisted = 0
 
-        if self.meta_verify_on_load:
+        if self.meta_verify_on_load and not merge:
             self._validate_loaded_entries()
         return True
+
+    def _rebuild_slot_allocator_from_index_locked(self) -> None:
+        """Rebuild slot allocator state from the recovered index."""
+        used_slots = {
+            self._offset_to_slot(int(entry.offset)) for entry in self._index.values()
+        }
+        if not used_slots:
+            self._next_slot = 0
+            self._free_slots = []
+            return
+
+        self._next_slot = max(used_slots) + 1
+        self._free_slots = [
+            slot for slot in range(self._next_slot) if slot not in used_slots
+        ]
 
     def _recover_checkpoint_dtype(
         self,
@@ -1787,6 +2042,10 @@ class RawBlockCore:
 
     def _load_checkpoint_from_device(self) -> None:
         """Load the newest valid checkpoint from the raw device if present."""
+        if self.use_fdp:
+            self._load_fdp_checkpoints_from_device()
+            return
+
         header, payload = self._select_latest_checkpoint()
         if header is None:
             logger.info("RawBlockCore: no valid on-device metadata checkpoint found")
@@ -1805,6 +2064,66 @@ class RawBlockCore:
         self._meta_seq = int(header["seq"])
         logger.info(
             "RawBlockCore loaded checkpoint (entries=%d next_slot=%d seq=%d device=%s)",
+            len(self._index),
+            self._next_slot,
+            self._meta_seq,
+            self.device_path,
+        )
+
+    def _load_fdp_checkpoints_from_device(self) -> None:
+        """Load and merge per-RUH FDP metadata checkpoints from the raw device."""
+        loaded_partitions = 0
+        max_seq = 0
+        with self._lock:
+            self._index.clear()
+            self._lru.clear()
+            self._lock_refcnt.clear()
+            self._free_slots.clear()
+            self._next_slot = 0
+
+        for ruh_id in self.fdp_ruh_ids:
+            header, payload = self._select_latest_checkpoint(ruh_id)
+            if header is None or payload is None:
+                continue
+            try:
+                data = json.loads(payload.decode("utf-8"))
+            except Exception:
+                logger.warning(
+                    "RawBlockCore: failed to decode FDP metadata payload "
+                    "for RUH %d",
+                    ruh_id,
+                )
+                continue
+            if not self._apply_loaded_state(
+                data,
+                merge=True,
+                expected_fdp_ruh_id=ruh_id,
+            ):
+                logger.warning(
+                    "RawBlockCore: FDP metadata payload rejected for RUH %d",
+                    ruh_id,
+                )
+                continue
+            loaded_partitions += 1
+            max_seq = max(max_seq, int(header["seq"]))
+
+        if loaded_partitions == 0:
+            logger.info("RawBlockCore: no valid FDP metadata checkpoint found")
+            return
+
+        with self._lock:
+            self._rebuild_slot_allocator_from_index_locked()
+            self._meta_dirty_total = 0
+            self._meta_persisted = 0
+            self._meta_seq = max_seq
+
+        if self.meta_verify_on_load:
+            self._validate_loaded_entries()
+
+        logger.info(
+            "RawBlockCore loaded FDP checkpoints "
+            "(partitions=%d entries=%d next_slot=%d seq=%d device=%s)",
+            loaded_partitions,
             len(self._index),
             self._next_slot,
             self._meta_seq,

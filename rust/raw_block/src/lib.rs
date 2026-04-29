@@ -559,6 +559,26 @@ struct NvmeCmdData {
     dspec: u16,     // NVMe directive specifier; 0 when directives are disabled.
 }
 
+/// Validate optional NVMe directive fields supplied by Python callers.
+fn validate_nvme_directive(use_uring_cmd: bool, dtype: u8, dspec: u16) -> PyResult<()> {
+    if dtype > 0x0f {
+        return Err(PyValueError::new_err(
+            "NVMe directive type must fit in 4 bits",
+        ));
+    }
+    if dspec != 0 && dtype == 0 {
+        return Err(PyValueError::new_err(
+            "NVMe directive specifier requires non-zero directive type",
+        ));
+    }
+    if (dtype != 0 || dspec != 0) && !use_uring_cmd {
+        return Err(PyValueError::new_err(
+            "NVMe directives require use_uring_cmd=true",
+        ));
+    }
+    Ok(())
+}
+
 /// Represents a single I/O submission to io_uring.
 ///
 /// This struct is sent from Python threads to the worker thread via a queue.
@@ -1529,13 +1549,15 @@ impl RawBlockDevice {
     ///
     /// Returns a batch_id that must be passed to wait_iouring() to wait
     /// for completions for that batch.
-    #[pyo3(signature = (offsets, buffers, total_lens))]
+    #[pyo3(signature = (offsets, buffers, total_lens, dtype = 0, dspec = 0))]
     fn batched_write(
         &self,
         py: Python<'_>,
         offsets: Vec<u64>,
         buffers: Vec<Bound<'_, PyAny>>,
         total_lens: Vec<usize>,
+        dtype: u8,
+        dspec: u16,
     ) -> PyResult<u64> {
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
@@ -1543,6 +1565,7 @@ impl RawBlockDevice {
         if self.closed.load(Ordering::Relaxed) {
             return Err(PyRuntimeError::new_err("device is closed"));
         }
+        validate_nvme_directive(self.use_uring_cmd, dtype, dspec)?;
 
         let n = offsets.len();
         if n == 0 {
@@ -1619,8 +1642,8 @@ impl RawBlockDevice {
                 lba_shift: self
                     .nvme_lba_shift
                     .ok_or_else(|| PyRuntimeError::new_err("NVMe LBA shift not available"))?,
-                dtype: 0,
-                dspec: 0,
+                dtype,
+                dspec,
             })
         } else {
             None
@@ -1994,7 +2017,7 @@ impl RawBlockDevice {
     }
 
     /// Synchronous write using io_uring.
-    #[pyo3(signature = (offset, data, payload_len, total_len = None))]
+    #[pyo3(signature = (offset, data, payload_len, total_len = None, dtype = 0, dspec = 0))]
     fn write_uring(
         &self,
         py: Python<'_>,
@@ -2002,6 +2025,8 @@ impl RawBlockDevice {
         data: &Bound<'_, PyAny>,
         payload_len: usize,
         total_len: Option<usize>,
+        dtype: u8,
+        dspec: u16,
     ) -> PyResult<()> {
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
@@ -2009,6 +2034,7 @@ impl RawBlockDevice {
         if self.closed.load(Ordering::Relaxed) {
             return Err(PyRuntimeError::new_err("device is closed"));
         }
+        validate_nvme_directive(self.use_uring_cmd, dtype, dspec)?;
 
         let view = get_pybuffer(py, data, false)?;
         let ptr = view.buf as *const u8;
@@ -2089,8 +2115,8 @@ impl RawBlockDevice {
                         lba_shift: self.nvme_lba_shift.ok_or_else(|| {
                             PyRuntimeError::new_err("NVMe LBA shift not available")
                         })?,
-                        dtype: 0,
-                        dspec: 0,
+                        dtype,
+                        dspec,
                     })
                 } else {
                     None
@@ -2135,8 +2161,8 @@ impl RawBlockDevice {
                         lba_shift: self.nvme_lba_shift.ok_or_else(|| {
                             PyRuntimeError::new_err("NVMe LBA shift not available")
                         })?,
-                        dtype: 0,
-                        dspec: 0,
+                        dtype,
+                        dspec,
                     })
                 } else {
                     None
