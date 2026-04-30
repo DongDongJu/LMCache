@@ -147,6 +147,7 @@ def _enc_object_key(k: ObjectKey) -> dict[str, Any]:
         "chunk_hash": k.chunk_hash,
         "model_name": k.model_name,
         "kv_rank": k.kv_rank,
+        "cache_salt": k.cache_salt,
     }
 
 
@@ -155,6 +156,7 @@ def _dec_object_key(d: dict[str, Any]) -> ObjectKey:
         chunk_hash=d["chunk_hash"],
         model_name=d["model_name"],
         kv_rank=d["kv_rank"],
+        cache_salt=d.get("cache_salt", ""),
     )
 
 

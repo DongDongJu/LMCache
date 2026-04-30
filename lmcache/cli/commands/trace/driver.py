@@ -39,7 +39,7 @@ from __future__ import annotations
 
 # Standard
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 import hashlib
 import json
 import time
@@ -52,6 +52,7 @@ from lmcache.cli.commands.trace.dispatch import (
 )
 from lmcache.cli.commands.trace.stats import ReplayStatsCollector
 from lmcache.logging import init_logger
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.config import StorageManagerConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.config import (
@@ -67,6 +68,56 @@ if TYPE_CHECKING:
     from lmcache.v1.mp_observability.event_bus import EventBus
 
 logger = init_logger(__name__)
+
+
+def _append_cache_salt_suffix(cache_salt: str, suffix: str) -> str:
+    """Return ``cache_salt`` with a replay-specific suffix appended.
+
+    Args:
+        cache_salt: Existing ``ObjectKey.cache_salt`` value from the trace.
+        suffix: Replay suffix supplied by the caller.
+
+    Returns:
+        ``suffix`` when ``cache_salt`` is empty, otherwise
+        ``"<cache_salt>.<suffix>"``.
+    """
+    if not cache_salt:
+        return suffix
+    return f"{cache_salt}.{suffix}"
+
+
+def _rewrite_object_key_cache_salts(value: Any, suffix: str) -> Any:
+    """Recursively append ``suffix`` to every ``ObjectKey`` cache salt.
+
+    Args:
+        value: Decoded trace argument value.
+        suffix: Replay suffix. An empty suffix returns ``value`` unchanged.
+
+    Returns:
+        A value with the same container shape, replacing each
+        :class:`ObjectKey` with an equivalent key in the suffixed
+        cache namespace.
+    """
+    if not suffix:
+        return value
+    if isinstance(value, ObjectKey):
+        return ObjectKey(
+            chunk_hash=value.chunk_hash,
+            model_name=value.model_name,
+            kv_rank=value.kv_rank,
+            cache_salt=_append_cache_salt_suffix(value.cache_salt, suffix),
+        )
+    if isinstance(value, list):
+        return [_rewrite_object_key_cache_salts(item, suffix) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_rewrite_object_key_cache_salts(item, suffix) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _rewrite_object_key_cache_salts(item, suffix)
+            for key, item in value.items()
+        }
+    return value
+
 
 #: Default :class:`ObservabilityConfig` for replay sessions.
 #:
@@ -124,6 +175,7 @@ class StorageReplayDriver:
         trace_path: str,
         dispatcher: CallDispatcher | None = None,
         obs_config: ObservabilityConfig = DEFAULT_REPLAY_OBS_CONFIG,
+        replay_cache_salt_suffix: str = "",
     ) -> None:
         """Construct a driver.
 
@@ -158,10 +210,16 @@ class StorageReplayDriver:
                 installs this config as the global singleton via
                 :func:`init_observability` and stops the resulting
                 bus on :meth:`close`.
+            replay_cache_salt_suffix: Optional suffix appended to every
+                decoded ``ObjectKey.cache_salt`` before dispatch.  Use a
+                unique value per replay iteration to exercise L2 writes
+                with distinct keys while preserving the recorded access
+                pattern.
         """
         self._sm_config = sm_config
         self._trace_path = trace_path
         self._dispatcher = dispatcher or build_default_dispatcher()
+        self._replay_cache_salt_suffix = replay_cache_salt_suffix
         self._closed = False
 
         # Each resource is acquired under its own try/except so that a
@@ -285,6 +343,10 @@ class StorageReplayDriver:
 
             try:
                 decoded_args = codecs.decode_args(record.args)
+                decoded_args = _rewrite_object_key_cache_salts(
+                    decoded_args,
+                    self._replay_cache_salt_suffix,
+                )
             except Exception:
                 skipped += 1
                 logger.warning(

@@ -128,6 +128,20 @@ also works here (``--l2-adapter``, ``--l1-use-lazy``,
 ``--l2-store-policy``, …); run ``lmcache trace replay --help`` for the
 full list.
 
+**Distinct L2 keys across replay iterations.** By default, replay uses
+the exact ``ObjectKey`` values stored in the trace. Persistent L2
+adapters may treat repeated stores of those keys as already present.
+Use ``--replay-cache-salt-suffix`` with a unique value per replay
+iteration when you want the same trace pattern to create new L2 keys:
+
+.. code-block:: bash
+
+    lmcache trace replay /tmp/run.lct \
+        --replay-cache-salt-suffix iter-0001 \
+        --l1-size-gb 50 --eviction-policy LRU \
+        --l2-store-policy skip_l1 \
+        --l2-adapter '{"type":"raw_block","device_path":"/dev/ng0n1","slot_bytes":33554432,"use_uring":true,"use_uring_cmd":true}'
+
 **Pacing.** The driver always honors the recorded inter-call timings
 by sleeping to align each dispatch with its recorded ``t_mono``
 offset. There is **no** as-fast-as-possible mode: ``StorageManager``

@@ -219,6 +219,35 @@ class TestRecordReplayRoundtrip:
         assert len(seen) == result.records_replayed
         assert all(not failed for _, failed in seen)
 
+    def test_replay_cache_salt_suffix_rewrites_object_keys(self, trace_path):
+        sm_config = _make_sm_config()
+        layout = _make_layout()
+        keys = [_make_key(0)]
+
+        def script(sm: StorageManager) -> None:
+            sm.reserve_write(keys, layout, mode="new")
+
+        _record_sequence(trace_path, sm_config, script)
+
+        captured: list[ObjectKey] = []
+        dispatcher = CallDispatcher()
+        dispatcher.register(
+            "lmcache.v1.distributed.storage_manager.StorageManager.reserve_write",
+            lambda _ctx, args: captured.extend(args["keys"]),
+        )
+
+        with StorageReplayDriver(
+            _make_sm_config(),
+            trace_path,
+            dispatcher=dispatcher,
+            replay_cache_salt_suffix="iter-1",
+        ) as driver:
+            result = driver.run()
+
+        assert result.records_failed == 0
+        assert captured
+        assert {key.cache_salt for key in captured} == {"iter-1"}
+
 
 class TestMismatchHandling:
     def test_unknown_qualname_is_skipped(self, trace_path):

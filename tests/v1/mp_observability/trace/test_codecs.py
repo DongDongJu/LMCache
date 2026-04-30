@@ -45,6 +45,16 @@ class TestObjectKey:
         out = _roundtrip(k)
         assert out == k
 
+    def test_cache_salt_roundtrip(self):
+        k = ObjectKey(
+            chunk_hash=b"\x00\x01\x02",
+            model_name="m",
+            kv_rank=42,
+            cache_salt="tenant-a",
+        )
+        out = _roundtrip(k)
+        assert out == k
+
     def test_inside_list(self):
         keys = [
             ObjectKey(chunk_hash=b"a", model_name="m", kv_rank=1),

@@ -259,6 +259,16 @@ class TraceCommand(BaseCommand):
             action="store_true",
             help="Suppress the terminal metrics table (files are still written).",
         )
+        parser.add_argument(
+            "--replay-cache-salt-suffix",
+            default="",
+            metavar="SUFFIX",
+            help=(
+                "Append SUFFIX to every replayed ObjectKey.cache_salt. "
+                "Use a unique suffix per replay iteration to generate "
+                "distinct L2 keys from the same trace."
+            ),
+        )
         # ``add_storage_manager_args`` and ``add_observability_args``
         # live in the full LMCache runtime (``lmcache.v1.*``) and are
         # unavailable in the CLI-only install.  When those imports
@@ -395,7 +405,10 @@ class TraceCommand(BaseCommand):
 
         try:
             with StorageReplayDriver(
-                sm_config, args.trace_path, obs_config=obs_config
+                sm_config,
+                args.trace_path,
+                obs_config=obs_config,
+                replay_cache_salt_suffix=args.replay_cache_salt_suffix,
             ) as driver:
                 result = driver.run(on_record=_on_record)
         finally:
