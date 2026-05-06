@@ -142,6 +142,28 @@ iteration when you want the same trace pattern to create new L2 keys:
         --l2-store-policy skip_l1 \
         --l2-adapter '{"type":"raw_block","device_path":"/dev/ng0n1","slot_bytes":33554432,"use_uring":true,"use_uring_cmd":true}'
 
+**Concurrent raw-block FDP replays on one namespace.** RUH lists only steer FDP
+placement; they do not isolate byte ranges. For device experiments with several
+replays on the same ``/dev/ng*`` namespace, give each replay a unique
+``base_offset_bytes`` / ``capacity_bytes`` window and keep those windows
+non-overlapping. Use a unique ``meta_magic`` and
+``--replay-cache-salt-suffix`` per process so recovery metadata and keys do not
+collide:
+
+.. code-block:: bash
+
+    lmcache trace replay /tmp/run.lct \
+        --replay-cache-salt-suffix ruh-a \
+        --l1-size-gb 10 --eviction-policy LRU \
+        --disable-metrics \
+        --l2-adapter '{"type":"raw_block","device_path":"/dev/ng1n1","slot_bytes":33554432,"base_offset_bytes":2199023255552,"capacity_bytes":1073741824,"meta_total_bytes":67108864,"meta_magic":"FDPRP001","use_odirect":false,"use_uring":true,"use_uring_cmd":true,"use_fdp":true,"fdp_data_ruh_ids":[0,1],"fdp_metadata_ruh_ids":[2]}'
+
+    lmcache trace replay /tmp/run.lct \
+        --replay-cache-salt-suffix ruh-b \
+        --l1-size-gb 10 --eviction-policy LRU \
+        --disable-metrics \
+        --l2-adapter '{"type":"raw_block","device_path":"/dev/ng1n1","slot_bytes":33554432,"base_offset_bytes":2200096997376,"capacity_bytes":1073741824,"meta_total_bytes":67108864,"meta_magic":"FDPRP002","use_odirect":false,"use_uring":true,"use_uring_cmd":true,"use_fdp":true,"fdp_data_ruh_ids":[3,4],"fdp_metadata_ruh_ids":[5]}'
+
 **Pacing.** The driver always honors the recorded inter-call timings
 by sleeping to align each dispatch with its recorded ``t_mono``
 offset. There is **no** as-fast-as-possible mode: ``StorageManager``

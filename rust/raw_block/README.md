@@ -59,6 +59,9 @@ both non-MP and MP mode without duplicating the raw-block implementation.
    directive fields on `io_uring_cmd` writes. `RawBlockCore` uses this to map
    KV ranks to configured reclaim unit handles and stores metadata in
    per-RUH checkpoint partitions.
+8. **Windowed raw-block layout**: `base_offset_bytes` can move a raw-block
+   instance's metadata and data region into a disjoint byte window on the same
+   device. This is useful for concurrent trace replay device tests.
 
 ## Zero-Copy Data Path
 
@@ -151,6 +154,9 @@ No fixed numbers are included here because results are host/device/workload depe
 - FDP support requires `io_uring_cmd`, configured RUH IDs, and compatible NVMe
   hardware. It is disabled by default. In FDP mode, `meta_total_bytes` is
   reserved per RUH.
+- RUH IDs guide placement only; they do not isolate byte ranges. Use
+  `base_offset_bytes` and `capacity_bytes` for non-overlapping raw-block
+  windows on a shared namespace.
 
 ## io_uring Dependencies
 
@@ -317,4 +323,6 @@ Notes:
 - Use `"fdp_data_ruh_ids": [0, 1, 5, 6], "fdp_metadata_ruh_ids": [2]` to
   isolate checkpoint metadata writes from data-slot writes. In this mode,
   `meta_total_bytes` is reserved per metadata RUH.
+- Use `"base_offset_bytes": ...` with `"capacity_bytes": ...` to run multiple
+  raw-block instances on non-overlapping windows of the same namespace.
 - Restart recovery uses the metadata checkpoint region on the same device.

@@ -203,8 +203,11 @@ caller-provided load buffers during prefetch.
 
 **Optional fields:**
 
-- ``capacity_bytes``: Optional cap on the usable device bytes. Default ``0``
-  means use the full device/file size.
+- ``capacity_bytes``: Optional raw-block window size. Default ``0`` means use
+  the device/file bytes remaining after ``base_offset_bytes``.
+- ``base_offset_bytes``: Optional byte offset where this raw-block window
+  starts. Use distinct, non-overlapping windows when running multiple raw-block
+  adapters or trace replays on the same namespace.
 - ``use_odirect``: ``true`` or ``false`` (default ``true`` for block devices
   and files; default ``false`` for ``use_uring_cmd`` NVMe character devices).
 - ``use_uring``: Enable the Rust io_uring path (default ``false``).
@@ -242,6 +245,9 @@ caller-provided load buffers during prefetch.
 - ``raw_block`` manages capacity with its own internal slot-recycling policy.
   The shared/global L2 eviction controller is not attached to this adapter, so
   adapter-level ``"eviction"`` config does not apply here.
+- FDP RUH IDs select placement for writes; they do not reserve disjoint LBA
+  ranges. Use ``base_offset_bytes`` plus ``capacity_bytes`` to isolate multiple
+  concurrent raw-block users of the same device.
 - If ``use_odirect`` or ``use_uring`` is enabled, the server's
   ``--l1-align-bytes`` should be at least ``block_align``.
 - ``persist_enabled`` must remain ``true`` for this adapter.
