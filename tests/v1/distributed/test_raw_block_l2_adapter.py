@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 import os
 import select
@@ -22,6 +23,7 @@ from lmcache.v1.memory_management import (
     MemoryObjMetadata,
     TensorMemoryObj,
 )
+from lmcache.v1.storage_backend.raw_block import encode_object_key
 
 
 def _has_ext() -> bool:
@@ -145,6 +147,7 @@ def _make_config(
     *,
     slot_bytes: int = 64 * 1024,
     capacity_bytes: int = 0,
+    base_offset_bytes: int = 0,
     use_uring: bool = False,
     use_uring_cmd: bool = False,
     use_fdp: bool = False,
@@ -158,6 +161,7 @@ def _make_config(
         device_path=device_path,
         slot_bytes=slot_bytes,
         capacity_bytes=capacity_bytes,
+        base_offset_bytes=base_offset_bytes,
         use_odirect=False,
         use_uring=use_uring,
         use_uring_cmd=use_uring_cmd,
@@ -215,6 +219,7 @@ def test_raw_block_l2_adapter_config_parses_uring_flags():
             "device_path": "/dev/ng0n1",
             "slot_bytes": 64 * 1024,
             "capacity_bytes": 8 * 1024 * 1024,
+            "base_offset_bytes": 4 * 1024 * 1024,
             "meta_total_bytes": 1 * 1024 * 1024,
             "use_uring": True,
             "use_uring_cmd": True,
@@ -226,11 +231,13 @@ def test_raw_block_l2_adapter_config_parses_uring_flags():
     assert fdp_cfg.fdp_ruh_ids == (3, 4)
     assert fdp_cfg.fdp_data_ruh_ids == (3, 4)
     assert fdp_cfg.fdp_metadata_ruh_ids == (3, 4)
+    assert fdp_cfg.base_offset_bytes == 4 * 1024 * 1024
     core_cfg = fdp_cfg.to_core_config()
     assert core_cfg.use_fdp is True
     assert core_cfg.fdp_ruh_ids == (3, 4)
     assert core_cfg.fdp_data_ruh_ids == (3, 4)
     assert core_cfg.fdp_metadata_ruh_ids == (3, 4)
+    assert core_cfg.base_offset_bytes == 4 * 1024 * 1024
 
     split_cfg = RawBlockL2AdapterConfig.from_dict(
         {
@@ -252,6 +259,16 @@ def test_raw_block_l2_adapter_config_parses_uring_flags():
     split_core_cfg = split_cfg.to_core_config()
     assert split_core_cfg.fdp_data_ruh_ids == (0, 1, 5, 6)
     assert split_core_cfg.fdp_metadata_ruh_ids == (2,)
+
+    with pytest.raises(ValueError, match="base_offset_bytes"):
+        RawBlockL2AdapterConfig.from_dict(
+            {
+                "type": "raw_block",
+                "device_path": "/tmp/raw-block-dev",
+                "slot_bytes": 64 * 1024,
+                "base_offset_bytes": 1,
+            }
+        )
 
     with pytest.raises(ValueError, match="use_fdp requires use_uring_cmd"):
         RawBlockL2AdapterConfig.from_dict(
@@ -375,6 +392,71 @@ def test_raw_block_l2_adapter_store_lookup_load_roundtrip():
             adapter.submit_unlock([key1, key_miss, key3])
         finally:
             adapter.close()
+
+
+def test_raw_block_l2_adapter_base_offset_separates_same_device_windows():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        meta_total_bytes = 1 * 1024 * 1024
+        capacity_bytes = 2 * 1024 * 1024
+        second_base = 4 * 1024 * 1024
+        adapter1 = RawBlockL2Adapter(
+            _make_config(
+                dev_path,
+                capacity_bytes=capacity_bytes,
+                meta_total_bytes=meta_total_bytes,
+                meta_magic="WIN00001",
+            )
+        )
+        adapter2 = RawBlockL2Adapter(
+            _make_config(
+                dev_path,
+                capacity_bytes=capacity_bytes,
+                base_offset_bytes=second_base,
+                meta_total_bytes=meta_total_bytes,
+                meta_magic="WIN00002",
+            )
+        )
+
+        try:
+            key1 = _create_object_key(51, model_name="window-1")
+            key2 = _create_object_key(52, model_name="window-2")
+            obj1 = _create_memory_obj(fill_value=51.0)
+            obj2 = _create_memory_obj(fill_value=52.0)
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                fut1 = executor.submit(_run_store, adapter1, [key1], [obj1])
+                fut2 = executor.submit(_run_store, adapter2, [key2], [obj2])
+                assert fut1.result(timeout=10) is True
+                assert fut2.result(timeout=10) is True
+
+            offset1 = adapter1._core.entry_offset(encode_object_key(key1).encoded)
+            offset2 = adapter2._core.entry_offset(encode_object_key(key2).encoded)
+            assert offset1 is not None
+            assert offset2 is not None
+            assert meta_total_bytes <= offset1 < capacity_bytes
+            assert (
+                second_base + meta_total_bytes
+                <= offset2
+                < (second_base + capacity_bytes)
+            )
+
+            load1 = _create_memory_obj(fill_value=0.0)
+            load2 = _create_memory_obj(fill_value=0.0)
+            assert adapter1._core.load_many_into(
+                [encode_object_key(key1).encoded], [load1]
+            ) == [True]
+            assert adapter2._core.load_many_into(
+                [encode_object_key(key2).encoded], [load2]
+            ) == [True]
+            assert torch.equal(load1.tensor, obj1.tensor)
+            assert torch.equal(load2.tensor, obj2.tensor)
+        finally:
+            adapter1.close()
+            adapter2.close()
 
 
 def test_raw_block_l2_adapter_uring_store_lookup_load_roundtrip():
@@ -701,9 +783,7 @@ def test_raw_block_l2_adapter_metadata_full_skips_checkpoint_but_live_data_works
                 _create_object_key(i, model_name=f"overflow-{i}-" + "x" * 512)
                 for i in range(5000, 5016)
             ]
-            overflow_objs = [
-                _create_memory_obj(fill_value=float(i)) for i in range(16)
-            ]
+            overflow_objs = [_create_memory_obj(fill_value=float(i)) for i in range(16)]
             overflow_key = overflow_keys[0]
             overflow_obj = overflow_objs[0]
             assert _run_store(adapter2, overflow_keys, overflow_objs) is True

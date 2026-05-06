@@ -979,6 +979,85 @@ def test_rust_raw_block_backend_data_offsets_start_after_metadata(
 @pytest.mark.skipif(
     not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
 )
+def test_rust_raw_block_backend_base_offset_layout(memory_allocator, loop_in_thread):
+    """A base offset moves metadata and data into a disjoint device window."""
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(64 * 1024 * 1024)
+
+        base_offset = 8 * 1024 * 1024
+        capacity_bytes = 24 * 1024 * 1024
+        meta_total_bytes = 4 * 1024 * 1024
+        config = LMCacheEngineConfig.from_defaults(
+            chunk_size=256,
+            local_cpu=True,
+            max_local_cpu_size=0.1,
+            lmcache_instance_id="test_rust_raw_block_backend_base_offset",
+        )
+        config.extra_config = {
+            "rust_raw_block.device_path": dev_path,
+            "rust_raw_block.capacity_bytes": capacity_bytes,
+            "rust_raw_block.base_offset_bytes": base_offset,
+            "rust_raw_block.block_align": 4096,
+            "rust_raw_block.header_bytes": 4096,
+            "rust_raw_block.meta_total_bytes": meta_total_bytes,
+            "rust_raw_block.meta_enable_periodic": False,
+        }
+        metadata = LMCacheMetadata(
+            model_name="test_model",
+            world_size=1,
+            local_world_size=1,
+            worker_id=0,
+            local_worker_id=0,
+            kv_dtype=torch.bfloat16,
+            kv_shape=(4, 2, 256, 8, 128),
+        )
+        local_cpu = LocalCPUBackend(
+            config=config,
+            metadata=metadata,
+            dst_device="cpu",
+            memory_allocator=memory_allocator,
+        )
+        backend = RustRawBlockBackend(
+            config=config,
+            metadata=metadata,
+            local_cpu_backend=local_cpu,
+            loop=loop_in_thread,
+            dst_device="cpu",
+        )
+
+        try:
+            key = CacheEngineKey("test_model", 1, 0, 778, torch.bfloat16)
+            alloc = AdHocMemoryAllocator(device="cpu")
+            obj = alloc.allocate(
+                [torch.Size([2, 16, 8, 128])], [torch.bfloat16], fmt=MemoryFormat.KV_T2D
+            )
+            assert obj is not None
+            futs = backend.batched_submit_put_task([key], [obj])
+            assert futs is not None
+            futs[0].result(timeout=10)
+
+            assert backend.base_offset_bytes == base_offset
+            assert backend.metadata_container_offsets() == [
+                base_offset,
+                base_offset + meta_total_bytes // 2,
+            ]
+            assert backend.data_base_offset == base_offset + meta_total_bytes
+            entry_offset = backend.entry_offset(key)
+            assert entry_offset is not None
+            assert (
+                base_offset + meta_total_bytes
+                <= entry_offset
+                < (base_offset + capacity_bytes)
+            )
+        finally:
+            backend.close()
+
+
+@pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
 def test_rust_raw_block_backend_ignores_torn_newer_checkpoint(
     memory_allocator, loop_in_thread
 ):
