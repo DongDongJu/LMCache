@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 # Standard
-from collections.abc import Mapping, Sequence as ABCSequence
+from collections.abc import Mapping
+from collections.abc import Sequence as ABCSequence
 from concurrent.futures import Future
 from typing import Any, Callable, List, Optional, Sequence
 import asyncio
@@ -186,6 +187,11 @@ class RustRawBlockBackend(StoragePluginInterface):
         return int(self._core.capacity_bytes)
 
     @property
+    def base_offset_bytes(self) -> int:
+        """Return the byte offset where this raw-block window starts."""
+        return int(self._core.base_offset_bytes)
+
+    @property
     def block_align(self) -> int:
         """Return the configured raw-device block alignment."""
         return int(self._core.block_align)
@@ -272,6 +278,7 @@ class RustRawBlockBackend(StoragePluginInterface):
         )
         enable_zero_copy = bool(extra.get("rust_raw_block.enable_zero_copy", True))
         capacity_bytes = int(extra.get("rust_raw_block.capacity_bytes", 0))
+        base_offset_bytes = int(extra.get("rust_raw_block.base_offset_bytes", 0))
         meta_total_bytes = int(
             extra.get("rust_raw_block.meta_total_bytes", 128 * 1024 * 1024)
         )
@@ -304,6 +311,7 @@ class RustRawBlockBackend(StoragePluginInterface):
         return RawBlockCoreConfig(
             device_path=self.device_path,
             capacity_bytes=capacity_bytes,
+            base_offset_bytes=base_offset_bytes,
             block_align=block_align,
             header_bytes=header_bytes,
             slot_bytes=slot_bytes,

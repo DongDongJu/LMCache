@@ -94,6 +94,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         device_path: str,
         slot_bytes: int,
         capacity_bytes: int = 0,
+        base_offset_bytes: int = 0,
         use_odirect: bool = True,
         use_uring: bool = False,
         use_uring_cmd: bool = False,
@@ -123,7 +124,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         Args:
             device_path: Raw device path or pre-sized file path used for L2.
             slot_bytes: Fixed data-slot size in bytes.
-            capacity_bytes: Optional cap on usable bytes; zero uses device size.
+            capacity_bytes: Optional byte window size; zero uses remaining size.
+            base_offset_bytes: Byte offset where this raw-block window starts.
             use_odirect: Whether to open the raw path with O_DIRECT.
             use_uring: Whether to use the Rust io_uring I/O path.
             use_uring_cmd: Whether to use NVMe io_uring_cmd passthrough.
@@ -155,6 +157,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         self.device_path = device_path
         self.slot_bytes = int(slot_bytes)
         self.capacity_bytes = int(capacity_bytes)
+        self.base_offset_bytes = int(base_offset_bytes)
         self.use_odirect = bool(use_odirect)
         self.use_uring = bool(use_uring)
         self.use_uring_cmd = bool(use_uring_cmd)
@@ -204,13 +207,12 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         header_bytes = int(d.get("header_bytes", 4096))
         meta_total_bytes = int(d.get("meta_total_bytes", 256 * 1024 * 1024))
         capacity_bytes = int(d.get("capacity_bytes", 0))
+        base_offset_bytes = int(d.get("base_offset_bytes", 0))
         use_uring = bool(d.get("use_uring", False))
         use_uring_cmd = bool(d.get("use_uring_cmd", False))
         use_fdp = bool(d.get("use_fdp", False))
         fdp_ruh_ids = _parse_fdp_ruh_ids(d.get("fdp_ruh_ids", ()))
-        fdp_data_ruh_ids = _parse_fdp_ruh_ids(
-            d.get("fdp_data_ruh_ids", fdp_ruh_ids)
-        )
+        fdp_data_ruh_ids = _parse_fdp_ruh_ids(d.get("fdp_data_ruh_ids", fdp_ruh_ids))
         fdp_metadata_ruh_ids = _parse_fdp_ruh_ids(
             d.get("fdp_metadata_ruh_ids", fdp_ruh_ids)
         )
@@ -232,6 +234,10 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError("slot_bytes must be >= header_bytes + 1")
         if capacity_bytes > 0 and capacity_bytes <= reserved_meta_bytes:
             raise ValueError("capacity_bytes must leave space for at least one slot")
+        if base_offset_bytes < 0:
+            raise ValueError("base_offset_bytes must be >= 0")
+        if base_offset_bytes % block_align != 0:
+            raise ValueError("base_offset_bytes must be a multiple of block_align")
         if use_uring_cmd and not use_uring:
             raise ValueError("use_uring_cmd requires use_uring=true")
         if use_fdp:
@@ -273,6 +279,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             device_path=device_path,
             slot_bytes=slot_bytes,
             capacity_bytes=capacity_bytes,
+            base_offset_bytes=base_offset_bytes,
             use_odirect=bool(d.get("use_odirect", not use_uring_cmd)),
             use_uring=use_uring,
             use_uring_cmd=use_uring_cmd,
@@ -307,7 +314,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "- slot_bytes (int): slot size in bytes, aligned to block_align "
             "(required)\n"
             "- capacity_bytes (int): optional usable capacity cap "
-            "(default 0 = device size)\n"
+            "(default 0 = device size from base_offset_bytes)\n"
+            "- base_offset_bytes (int): byte offset where this raw-block "
+            "window starts (default 0)\n"
             "- use_odirect (bool): enable O_DIRECT raw I/O "
             "(default true, false for use_uring_cmd)\n"
             "- use_uring (bool): enable Rust io_uring I/O (default false)\n"
@@ -351,6 +360,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         return RawBlockCoreConfig(
             device_path=self.device_path,
             capacity_bytes=self.capacity_bytes,
+            base_offset_bytes=self.base_offset_bytes,
             block_align=self.block_align,
             header_bytes=self.header_bytes,
             slot_bytes=self.slot_bytes,
