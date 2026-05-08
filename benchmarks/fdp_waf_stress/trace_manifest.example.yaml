@@ -1,0 +1,31 @@
+traces:
+  - name: small_model_chat
+    class: small_model
+    path: /traces/llama8b_chat_chunk256.lct
+    notes: small model, small chunks, chat-like prompts
+
+  - name: large_model_long_context
+    class: large_model
+    path: /traces/llama70b_longctx_chunk1024.lct
+    notes: larger model layout, larger chunks, long-context prompts
+
+  - name: rag_shared_prefix
+    class: cold_rag
+    path: /traces/rag_shared_prefix_chunk512.lct
+    notes: repeated shared prefixes and longer-lived data
+
+  - name: random_prompt_low_reuse
+    class: hot_churn
+    path: /traces/random_prompts_chunk128.lct
+    notes: low reuse, many unique keys, smaller capacity window
+
+  - name: metadata_heavy_small_objects
+    class: metadata_heavy
+    path: /traces/metadata_heavy_small_objects.lct
+    notes: many small objects and frequent metadata checkpoint pressure
+
+collection_notes:
+  - Storage replay traces do not contain real KV tensor bytes.
+  - Replay writes synthetic payloads based on recorded layout descriptors.
+  - Model family only matters when it changes object sizes, chunk counts,
+    timing, key reuse, and store/retrieve mix.

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agentic MP Trace Manifest",
+  "type": "object",
+  "required": ["traces"],
+  "properties": {
+    "traces": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "trace_id",
+          "trace_path",
+          "dataset",
+          "model",
+          "lmcache",
+          "request_shape",
+          "storage_class",
+          "trace_stats"
+        ],
+        "properties": {
+          "trace_id": {"type": "string"},
+          "trace_path": {"type": "string"},
+          "storage_class": {"type": "string"},
+          "dataset": {
+            "type": "object",
+            "required": ["name", "source_url", "adapter", "access"]
+          },
+          "model": {
+            "type": "object",
+            "required": ["profile", "model_id", "max_model_len"]
+          },
+          "lmcache": {
+            "type": "object",
+            "required": ["chunk_size"]
+          },
+          "request_shape": {
+            "type": "object",
+            "required": ["concurrency", "request_rate_qps"]
+          },
+          "trace_stats": {
+            "type": "object"
+          }
+        }
+      }
+    }
+  }
+}
+

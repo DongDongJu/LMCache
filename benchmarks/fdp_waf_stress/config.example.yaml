@@ -1,0 +1,102 @@
+device_path: /dev/ng1n1
+block_device_path: /dev/nvme1n1
+block_align: 4096
+
+global:
+  l2_store_policy: skip_l1
+  eviction_policy: noop
+  disable_metrics: true
+  quiet: true
+  l1_align_bytes: 4096
+  meta_total_bytes: 67108864
+  use_odirect: false
+  use_uring: true
+  use_uring_cmd: true
+  output_root: /mnt/hc-ssd/lmcache-fdp-waf-stress
+  replay_binary:
+    - uv
+    - run
+    - --no-sync
+    - lmcache
+
+measurement:
+  enabled: true
+  collect_nvme_smart: true
+  collect_fdp_logs: true
+  vendor_media_write_command: null
+  # Optional user-provided shell command returning media/NAND bytes written.
+  # Example:
+  # vendor_media_write_command: "nvme solidigm smart-log-add /dev/nvme1n1 --json"
+
+windows:
+  start_offset_bytes: 2199023255552
+  window_stride_bytes: 2147483648
+  default_capacity_bytes: 1073741824
+  auto_assign: true
+
+modes:
+  mixed:
+    use_fdp: true
+    default_data_ruhs: [0, 1]
+    default_metadata_ruhs: [2]
+  separated:
+    use_fdp: true
+    classes:
+      hot_churn:
+        data_ruhs: [0, 1]
+        metadata_ruhs: [2]
+      cold_rag:
+        data_ruhs: [3, 4]
+        metadata_ruhs: [5]
+      metadata_heavy:
+        data_ruhs: [6]
+        metadata_ruhs: [7]
+      large_model:
+        data_ruhs: [3, 4]
+        metadata_ruhs: [5]
+      small_model:
+        data_ruhs: [0, 1]
+        metadata_ruhs: [2]
+  no_fdp:
+    use_fdp: false
+
+workloads:
+  - name: llama8b_chat_chunk256
+    class: hot_churn
+    trace_path: /traces/llama8b_chat_chunk256.lct
+    concurrency: 2
+    slot_bytes: 4194304
+    capacity_bytes: 1073741824
+    l1_size_gb: 4
+
+  - name: llama70b_longctx_chunk1024
+    class: cold_rag
+    trace_path: /traces/llama70b_longctx_chunk1024.lct
+    concurrency: 1
+    slot_bytes: 33554432
+    capacity_bytes: 2147483648
+    l1_size_gb: 8
+
+  - name: rag_shared_prefix_chunk512
+    class: cold_rag
+    trace_path: /traces/rag_shared_prefix_chunk512.lct
+    concurrency: 2
+    slot_bytes: 16777216
+    capacity_bytes: 1073741824
+    l1_size_gb: 4
+
+  - name: random_prompts_chunk128
+    class: hot_churn
+    trace_path: /traces/random_prompts_chunk128.lct
+    concurrency: 3
+    slot_bytes: 2097152
+    capacity_bytes: 1073741824
+    l1_size_gb: 2
+
+  - name: metadata_heavy_small_objects
+    class: metadata_heavy
+    trace_path: /traces/metadata_heavy_small_objects.lct
+    concurrency: 1
+    slot_bytes: 1048576
+    capacity_bytes: 536870912
+    l1_size_gb: 2

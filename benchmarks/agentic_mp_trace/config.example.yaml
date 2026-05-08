@@ -1,0 +1,386 @@
+record:
+  output_root: /mnt/hc-ssd/lmcache-agentic-records
+  startup_timeout_sec: 300
+  shutdown_timeout_sec: 60
+  base_mp_port: 5555
+  base_http_port: 8080
+  base_vllm_port: 8000
+  port_stride: 10
+  max_workers: 4
+  disable_metrics: true
+  l2_store_policy: skip_l1
+  use_fdp: true
+  fdp_data_ruhs: [0, 1, 2]
+  fdp_metadata_ruhs: [3]
+  slot_bytes: 4194304
+  lmcache_binary:
+    - uv
+    - run
+    - --no-sync
+    - python
+    - -c
+    - |
+      from opentelemetry._logs import set_logger_provider
+      from opentelemetry.sdk._logs import LoggerProvider
+      set_logger_provider(LoggerProvider())
+      import sys
+      from lmcache.cli.main import main
+      sys.argv = ["lmcache"] + sys.argv[1:]
+      main()
+  vllm_binary:
+    - uv
+    - run
+    - --no-sync
+    - vllm
+  windows:
+    start_offset_bytes: 2199023255552
+    window_stride_bytes: 2147483648
+    default_capacity_bytes: 1073741824
+
+dataset_catalog:
+  tau_bench_current:
+    description: "Customer-service tool-agent-user benchmark; use current tau2/tau3-style repo."
+    homepage_url: "https://taubench.com/"
+    repo_url: "https://github.com/sierra-research/tau2-bench"
+    legacy_repo_url: "https://github.com/sierra-research/tau-bench"
+    adapter: tau_bench
+    recommended_subsets: [airline, retail, telecom, banking_knowledge]
+    storage_classes: [tool_agent, metadata_heavy, shared_prefix_heavy]
+    access: public repo
+    priority: required
+    local_path: /datasets/tau2-bench
+
+  swe_bench_lite:
+    description: "Coding-agent workload from real GitHub issues; smaller subset for fast trace collection."
+    hf_url: "https://huggingface.co/datasets/SWE-bench/SWE-bench_Lite"
+    repo_url: "https://github.com/princeton-nlp/SWE-bench"
+    adapter: swe_bench
+    recommended_splits: [dev, test]
+    storage_classes: [coding_agent, long_context_cold]
+    access: public Hugging Face dataset
+    priority: required
+    local_path: /datasets/SWE-bench_Lite
+
+  swe_bench_verified:
+    description: "Human-validated SWE-bench subset; use for higher-quality coding-agent traces."
+    hf_url: "https://huggingface.co/datasets/SWE-bench/SWE-bench_Verified"
+    repo_url: "https://github.com/princeton-nlp/SWE-bench"
+    adapter: swe_bench
+    recommended_splits: [test]
+    storage_classes: [coding_agent, long_context_cold]
+    access: public Hugging Face dataset
+    priority: recommended
+    local_path: /datasets/SWE-bench_Verified
+
+  swe_bench_full:
+    description: "Full SWE-bench issue-resolution dataset."
+    hf_url: "https://huggingface.co/datasets/SWE-bench/SWE-bench"
+    repo_url: "https://github.com/princeton-nlp/SWE-bench"
+    adapter: swe_bench
+    recommended_splits: [train, test]
+    storage_classes: [coding_agent, long_context_cold]
+    access: public Hugging Face dataset
+    priority: optional_large
+    local_path: /datasets/SWE-bench
+
+  webarena:
+    description: "Browser-agent tasks in realistic self-hosted web environments."
+    repo_url: "https://github.com/web-arena-x/webarena"
+    resource_page_url: "https://github.com/web-arena-x/webarena/blob/main/resources/README.md"
+    human_trajectories_url: "https://drive.google.com/drive/folders/1NrN_sawtYK2V_uHnmmS8ugmGIKUAsPgt?usp=sharing"
+    execution_traces_v2_url: "https://drive.google.com/drive/folders/1H4wkzDkY2ufiC63DISMXllri0j-ipWcs?usp=sharing"
+    task_config_url: "https://github.com/web-arena-x/webarena/blob/main/config_files/test.raw.json"
+    adapter: webarena
+    storage_classes: [browser_agent, shared_prefix_heavy, long_context_cold]
+    access: public repo; trace files on Google Drive
+    priority: required
+    local_path: /datasets/webarena
+
+  mind2web:
+    description: "Generalist web-agent dataset with real website tasks, HTML/action traces, and domain diversity."
+    homepage_url: "https://osu-nlp-group.github.io/Mind2Web/"
+    repo_url: "https://github.com/OSU-NLP-Group/Mind2Web"
+    hf_url: "https://huggingface.co/datasets/osunlp/Mind2Web"
+    adapter: mind2web
+    storage_classes: [browser_agent, hot_churn, long_context_cold]
+    access: public Hugging Face dataset
+    priority: required
+    local_path: /datasets/Mind2Web
+
+  appworld:
+    description: "Interactive coding/API-agent tasks over simulated day-to-day apps."
+    homepage_url: "https://appworld.dev/"
+    repo_url: "https://github.com/StonyBrookNLP/appworld"
+    adapter: appworld
+    storage_classes: [tool_agent, coding_agent, metadata_heavy]
+    access: public repo
+    priority: recommended
+    local_path: /datasets/appworld
+
+  toolbench:
+    description: "Tool-use benchmark/data for API/tool-learning style requests."
+    repo_url: "https://github.com/OpenBMB/ToolBench"
+    hf_mirror_url: "https://huggingface.co/datasets/tuandunghcmut/toolbench-v1"
+    adapter: toolbench
+    storage_classes: [tool_agent, metadata_heavy, shared_prefix_heavy]
+    access: public repo; some API execution paths may require API keys
+    priority: recommended
+    local_path: /datasets/toolbench
+
+  agentbench:
+    description: "Multi-environment agent benchmark including OS, DB, KG, web shopping, browsing, and household tasks."
+    repo_url: "https://github.com/THUDM/AgentBench"
+    adapter: agentbench
+    storage_classes: [tool_agent, browser_agent, coding_agent, hot_churn]
+    access: public repo; some environments require Docker/setup
+    priority: optional
+    local_path: /datasets/agentbench
+
+  browsergym:
+    description: "Unified browser-agent framework for WebArena, WorkArena, VisualWebArena, AssistantBench, WebLINX, OpenApps, and others."
+    repo_url: "https://github.com/ServiceNow/BrowserGym"
+    agentlab_repo_url: "https://github.com/ServiceNow/AgentLab"
+    adapter: browsergym
+    storage_classes: [browser_agent, long_context_cold]
+    access: public repo; benchmark-specific access may vary
+    priority: optional_framework
+    local_path: /datasets/browsergym
+
+  workarena:
+    description: "Knowledge-worker browser tasks on ServiceNow-style environments."
+    repo_url: "https://github.com/ServiceNow/WorkArena"
+    instances_hf_url: "https://huggingface.co/datasets/ServiceNow/WorkArena-Instances"
+    adapter: workarena
+    storage_classes: [browser_agent, workplace_agent, long_context_cold]
+    access: gated Hugging Face instances
+    priority: optional_gated
+    local_path: /datasets/workarena
+
+  the_agent_company:
+    description: "Simulated software-company benchmark with web, code, program execution, and coworker communication tasks."
+    homepage_url: "https://the-agent-company.com/"
+    repo_url: "https://github.com/TheAgentCompany/TheAgentCompany"
+    experiments_repo_url: "https://github.com/TheAgentCompany/experiments"
+    adapter: the_agent_company
+    storage_classes: [workplace_agent, coding_agent, browser_agent, mixed_agent]
+    access: public repo; heavier Docker/server setup
+    priority: optional_heavy
+    local_path: /datasets/the-agent-company
+
+  gaia:
+    description: "General AI assistant benchmark with tool-use, web-browsing, multimodal, and reasoning questions."
+    hf_url: "https://huggingface.co/datasets/gaia-benchmark/GAIA"
+    org_url: "https://huggingface.co/gaia-benchmark"
+    adapter: gaia
+    storage_classes: [general_assistant, tool_agent, long_context_cold]
+    access: gated Hugging Face dataset
+    priority: optional_gated
+    local_path: /datasets/gaia
+
+  osworld:
+    description: "Computer-use / desktop-agent benchmark for open-ended tasks in real computer environments."
+    homepage_url: "https://os-world.github.io/"
+    repo_url: "https://github.com/xlang-ai/OSWorld"
+    adapter: osworld
+    storage_classes: [desktop_agent, browser_agent, long_context_cold]
+    access: public repo; heavier VM/desktop setup
+    priority: optional_heavy
+    local_path: /datasets/osworld
+
+model_profiles:
+  small_ctx8k_chunk128:
+    model_id: ${MODEL_SMALL}
+    model_size_class: small
+    lmcache_chunk_size: 128
+    max_model_len: 8192
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.85
+    record_l1_size_gb: 1
+    record_eviction_policy: noop
+
+  medium_ctx16k_chunk256:
+    model_id: ${MODEL_MEDIUM}
+    model_size_class: medium
+    lmcache_chunk_size: 256
+    max_model_len: 16384
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.85
+    record_l1_size_gb: 1
+    record_eviction_policy: noop
+
+  medium_ctx16k_chunk512:
+    model_id: ${MODEL_MEDIUM}
+    model_size_class: medium
+    lmcache_chunk_size: 512
+    max_model_len: 16384
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.85
+    record_l1_size_gb: 1
+    record_eviction_policy: noop
+
+  large_ctx32k_chunk1024:
+    model_id: ${MODEL_LARGE}
+    model_size_class: large
+    lmcache_chunk_size: 1024
+    max_model_len: 32768
+    tensor_parallel_size: 2
+    gpu_memory_utilization: 0.90
+    record_l1_size_gb: 1
+    record_eviction_policy: noop
+
+record_suites:
+  agentic_mix_v1:
+    description: "Realistic multi-agent workload mix for LMCache MP trace recording and FDP replay."
+    jobs:
+      - name: tau_airline_small_chunk128
+        dataset_ref: tau_bench_current
+        subset: airline
+        workload_shape: shared_prefix_heavy
+        model_profile: small_ctx8k_chunk128
+        num_tasks: 200
+        turns_per_task: 6
+        request_concurrency: 16
+        request_rate_qps: 3.0
+        storage_class: tool_agent
+
+      - name: tau_retail_metadata_chunk128
+        dataset_ref: tau_bench_current
+        subset: retail
+        workload_shape: metadata_heavy
+        model_profile: small_ctx8k_chunk128
+        num_tasks: 300
+        turns_per_task: 4
+        request_concurrency: 24
+        request_rate_qps: 5.0
+        storage_class: metadata_heavy
+
+      - name: swe_lite_medium_chunk512
+        dataset_ref: swe_bench_lite
+        split: test
+        workload_shape: coding_agent_long_context
+        model_profile: medium_ctx16k_chunk512
+        num_tasks: 100
+        turns_per_task: 4
+        request_concurrency: 8
+        request_rate_qps: 1.0
+        storage_class: coding_agent
+
+      - name: webarena_human_traj_medium_chunk512
+        dataset_ref: webarena
+        source: human_trajectories
+        workload_shape: browser_agent_multiturn
+        model_profile: medium_ctx16k_chunk512
+        num_tasks: 150
+        turns_per_task: 8
+        request_concurrency: 12
+        request_rate_qps: 2.0
+        storage_class: browser_agent
+
+      - name: mind2web_html_churn_chunk256
+        dataset_ref: mind2web
+        split: train
+        workload_shape: browser_html_hot_churn
+        model_profile: medium_ctx16k_chunk256
+        num_tasks: 300
+        turns_per_task: 5
+        request_concurrency: 20
+        request_rate_qps: 4.0
+        storage_class: hot_churn
+
+      - name: appworld_api_docs_chunk512
+        dataset_ref: appworld
+        split: train
+        workload_shape: api_agent_shared_docs
+        model_profile: medium_ctx16k_chunk512
+        num_tasks: 200
+        turns_per_task: 6
+        request_concurrency: 12
+        request_rate_qps: 2.0
+        storage_class: tool_agent
+
+      - name: toolbench_many_tools_chunk256
+        dataset_ref: toolbench
+        workload_shape: tool_schema_heavy
+        model_profile: medium_ctx16k_chunk256
+        num_tasks: 300
+        turns_per_task: 5
+        request_concurrency: 20
+        request_rate_qps: 4.0
+        storage_class: shared_prefix_heavy
+
+      - name: gaia_general_assistant_chunk512
+        dataset_ref: gaia
+        split: validation
+        workload_shape: general_tool_assistant
+        model_profile: medium_ctx16k_chunk512
+        num_tasks: 100
+        turns_per_task: 3
+        request_concurrency: 8
+        request_rate_qps: 1.0
+        storage_class: general_assistant
+        optional: true
+
+replay:
+  device_path: /dev/ng1n1
+  block_device_path: /dev/nvme1n1
+  block_align: 4096
+  ruh_count: 4
+  start_offset_bytes: 2222650576896
+  window_stride_bytes: 2147483648
+  default_capacity_bytes: 1073741824
+  default_meta_total_bytes: 67108864
+  default_slot_bytes: 4194304
+  replay_l1_size_gb: 1
+  l1_align_bytes: 4096
+  l2_store_policy: skip_l1
+  eviction_policy: noop
+  use_uring: true
+  use_uring_cmd: true
+  use_odirect: false
+  target_host_write_multiplier: 5
+  auto_iterations_for_target: true
+  replay_binary:
+    - uv
+    - run
+    - --no-sync
+    - lmcache
+
+  trace_overrides:
+    tool_agent: {capacity_bytes: 536870912, slot_bytes: 2097152}
+    shared_prefix_heavy: {capacity_bytes: 536870912, slot_bytes: 2097152}
+    metadata_heavy: {capacity_bytes: 536870912, slot_bytes: 1048576}
+    coding_agent: {capacity_bytes: 1073741824, slot_bytes: 16777216}
+    long_context_cold: {capacity_bytes: 2147483648, slot_bytes: 33554432}
+    browser_agent: {capacity_bytes: 1073741824, slot_bytes: 8388608}
+    workplace_agent: {capacity_bytes: 1073741824, slot_bytes: 8388608}
+    general_assistant: {capacity_bytes: 1073741824, slot_bytes: 8388608}
+
+  modes:
+    no_fdp:
+      use_fdp: false
+
+    fdp_mixed:
+      use_fdp: true
+      default_data_ruhs: [0, 1, 2]
+      default_metadata_ruhs: [3]
+
+    fdp_separated:
+      use_fdp: true
+      classes:
+        tool_agent: {data_ruhs: [0], metadata_ruhs: [3]}
+        shared_prefix_heavy: {data_ruhs: [0], metadata_ruhs: [3]}
+        metadata_heavy: {data_ruhs: [0], metadata_ruhs: [3]}
+        hot_churn: {data_ruhs: [0], metadata_ruhs: [3]}
+        coding_agent: {data_ruhs: [1], metadata_ruhs: [3]}
+        long_context_cold: {data_ruhs: [1], metadata_ruhs: [3]}
+        browser_agent: {data_ruhs: [2], metadata_ruhs: [3]}
+        workplace_agent: {data_ruhs: [2], metadata_ruhs: [3]}
+        general_assistant: {data_ruhs: [2], metadata_ruhs: [3]}
+        desktop_agent: {data_ruhs: [2], metadata_ruhs: [3]}
+        mixed_agent: {data_ruhs: [0, 1, 2], metadata_ruhs: [3]}
+
+measurement:
+  enabled: true
+  collect_nvme_smart: true
+  collect_fdp_logs: true
+  vendor_media_write_command: null
