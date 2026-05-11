@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 import ctypes
+import dataclasses
 import json
 import struct
 import threading
@@ -146,7 +147,39 @@ class RawBlockPutManyResult:
     """Result of a RawBlockCore batched write."""
 
     results: list[bool]
+
+    # Newly committed by this put_many() call only.
     stored_keys: list[str]
+    stored_indices: list[int]
+    stored_key_sizes: list[int]
+
+    # Keys already present in raw-block. These are successful stores, but they
+    # do not write media and do not change logical raw-block usage.
+    existing_hit_indices: list[int]
+    existing_hit_key_sizes: list[int]
+
+
+@dataclass
+class RawBlockIoAccounting:
+    """Best-effort logical and media I/O counters for raw-block activity."""
+
+    store_attempted_count: int = 0
+    store_attempted_logical_bytes: int = 0
+
+    store_existing_hit_count: int = 0
+    store_existing_hit_logical_bytes: int = 0
+
+    store_committed_count: int = 0
+    store_committed_logical_bytes: int = 0
+
+    load_attempted_count: int = 0
+    load_index_hit_count: int = 0
+    load_index_hit_logical_bytes: int = 0
+
+    media_write_logical_bytes: int = 0
+    media_write_physical_bytes: int = 0
+    media_read_logical_bytes: int = 0
+    media_read_physical_bytes: int = 0
 
 
 class RawBlockCore:
@@ -255,6 +288,7 @@ class RawBlockCore:
         self._meta_dirty_total: int = 0
         self._meta_persisted: int = 0
         self._inflight_io_count: int = 0
+        self._io_accounting = RawBlockIoAccounting()
         self._last_io_ts: float = time.monotonic()
         self._meta_stop_evt = threading.Event()
         self._meta_thread: Optional[threading.Thread] = None
@@ -459,14 +493,29 @@ class RawBlockCore:
 
         results = [False] * len(keys)
         stored_keys: list[str] = []
+        stored_indices: list[int] = []
+        stored_key_sizes: list[int] = []
+        existing_hit_indices: list[int] = []
+        existing_hit_key_sizes: list[int] = []
 
         for i, (key, obj) in enumerate(zip(keys, objs, strict=False)):
             if self._closed:
                 break
+            attempted_size = int(len(obj.byte_array))
 
             with self._lock:
-                if key.encoded in self._index:
+                self._io_accounting.store_attempted_count += 1
+                self._io_accounting.store_attempted_logical_bytes += attempted_size
+
+                entry = self._index.get(key.encoded)
+                if entry is not None:
                     results[i] = True
+                    existing_hit_indices.append(i)
+                    existing_hit_key_sizes.append(int(entry.meta.size))
+                    self._io_accounting.store_existing_hit_count += 1
+                    self._io_accounting.store_existing_hit_logical_bytes += int(
+                        entry.meta.size
+                    )
                     continue
                 if key.encoded in self._inflight:
                     continue
@@ -514,10 +563,20 @@ class RawBlockCore:
                 self._meta_dirty_total += 1
                 results[i] = True
                 stored_keys.append(key.encoded)
+                stored_indices.append(i)
+                stored_key_sizes.append(int(inflight.meta.size))
+                self._io_accounting.store_committed_count += 1
+                self._io_accounting.store_committed_logical_bytes += int(
+                    inflight.meta.size
+                )
 
         return RawBlockPutManyResult(
             results=results,
             stored_keys=stored_keys,
+            stored_indices=stored_indices,
+            stored_key_sizes=stored_key_sizes,
+            existing_hit_indices=existing_hit_indices,
+            existing_hit_key_sizes=existing_hit_key_sizes,
         )
 
     def exists_many(
@@ -581,6 +640,12 @@ class RawBlockCore:
                 (encoded_key, self._index.get(encoded_key))
                 for encoded_key in encoded_keys
             ]
+            self._io_accounting.load_attempted_count += len(encoded_keys)
+            for _encoded_key, entry in items:
+                if entry is None:
+                    continue
+                self._io_accounting.load_index_hit_count += 1
+                self._io_accounting.load_index_hit_logical_bytes += int(entry.size)
             self._inflight_io_count += 1
 
         results = [False] * len(encoded_keys)
@@ -623,6 +688,9 @@ class RawBlockCore:
                             payload_len,
                             total_len,
                         )
+                    with self._lock:
+                        self._io_accounting.media_read_logical_bytes += payload_len
+                        self._io_accounting.media_read_physical_bytes += total_len
                     objs[i].metadata.cached_positions = entry.meta.cached_positions
                     results[i] = True
                 except Exception as e:
@@ -707,6 +775,19 @@ class RawBlockCore:
             usage = (used_slots * self.slot_bytes) / usable_capacity
             return (usage, usage)
 
+    def snapshot_accounting_entries(self) -> list[tuple[str, int]]:
+        """Return encoded keys and logical byte sizes currently indexed.
+
+        The MP L2 adapter uses this after checkpoint recovery to seed the base
+        adapter's logical byte accounting without firing store notifications for
+        entries that already existed on the raw-block device.
+        """
+        with self._lock:
+            return [
+                (encoded_key, int(entry.meta.size))
+                for encoded_key, entry in self._index.items()
+            ]
+
     def checkpoint_now(self) -> None:
         """Synchronously write a metadata checkpoint."""
         self._checkpoint_once(force=True)
@@ -748,6 +829,7 @@ class RawBlockCore:
                 "metadata_dirty_total": self._meta_dirty_total,
                 "metadata_persisted": self._meta_persisted,
                 "inflight_io_count": self._inflight_io_count,
+                "io_accounting": dataclasses.asdict(self._io_accounting),
                 "use_odirect": self.use_odirect,
                 "enable_zero_copy": self.enable_zero_copy,
                 "io_engine": self.io_engine,
@@ -928,6 +1010,9 @@ class RawBlockCore:
                     payload_len,
                     total_len,
                 )
+                with self._lock:
+                    self._io_accounting.media_write_logical_bytes += payload_len
+                    self._io_accounting.media_write_physical_bytes += total_len
             finally:
                 with self._lock:
                     self._inflight_io_count -= 1

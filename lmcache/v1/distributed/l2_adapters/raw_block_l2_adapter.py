@@ -512,7 +512,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
             if not deleted:
                 continue
             deleted_keys.append(key)
-            deleted_sizes.append(0 if meta is None else int(self._core.slot_bytes))
+            deleted_sizes.append(0 if meta is None else int(meta.size))
         if deleted_keys:
             try:
                 self._notify_keys_deleted(deleted_keys, deleted_sizes)
@@ -587,15 +587,20 @@ class RawBlockL2Adapter(L2AdapterInterface):
 
     def _seed_usage_from_core_snapshot(self) -> None:
         """Seed byte counters for entries recovered by RawBlockCore startup."""
-        recovered_keys = self._snapshot_indexed_object_keys()
-        if not recovered_keys:
-            return
-
-        slot_bytes = int(self._core.slot_bytes)
-        total_delta = len(recovered_keys) * slot_bytes
+        total_delta = 0
         by_salt: dict[str, int] = {}
-        for key in recovered_keys:
-            by_salt[key.cache_salt] = by_salt.get(key.cache_salt, 0) + slot_bytes
+        for encoded_key, size in self._core.snapshot_accounting_entries():
+            try:
+                key = decode_object_key(encoded_key)
+            except ValueError:
+                logger.warning(
+                    "RawBlockL2Adapter skipped recovered non-object key %s",
+                    encoded_key,
+                )
+                continue
+            logical_size = int(size)
+            by_salt[key.cache_salt] = by_salt.get(key.cache_salt, 0) + logical_size
+            total_delta += logical_size
 
         with self._usage_lock:
             self._total_bytes_used += total_delta
@@ -634,19 +639,19 @@ class RawBlockL2Adapter(L2AdapterInterface):
 
             - task success for the whole batch
             - newly stored object keys
-            - raw-block slot byte charges aligned with the newly stored keys
+            - logical byte charges aligned with the newly stored keys
         """
         specs = [encode_object_key(key) for key in keys]
         put_result = self._core.put_many(specs, objects)
-        stored_encoded = set(put_result.stored_keys)
-        slot_bytes = int(self._core.slot_bytes)
         stored_keys: list[ObjectKey] = []
         stored_sizes: list[int] = []
-        for key, spec in zip(keys, specs, strict=False):
-            if spec.encoded not in stored_encoded:
-                continue
-            stored_keys.append(key)
-            stored_sizes.append(slot_bytes)
+        for index, size in zip(
+            put_result.stored_indices,
+            put_result.stored_key_sizes,
+            strict=True,
+        ):
+            stored_keys.append(keys[index])
+            stored_sizes.append(int(size))
         return all(put_result.results), stored_keys, stored_sizes
 
     def _finish_store_task(
