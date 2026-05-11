@@ -6,6 +6,7 @@ from unittest.mock import patch
 import os
 import select
 import tempfile
+import time
 
 # Third Party
 import pytest
@@ -139,6 +140,19 @@ def _wait_event_fd(event_fd: int, timeout: float = 5.0) -> bool:
         except BlockingIOError:
             pass
         return True
+    return False
+
+
+def _wait_for_condition(
+    predicate,
+    timeout: float = 5.0,
+    poll_interval: float = 0.05,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(poll_interval)
     return False
 
 
@@ -724,7 +738,7 @@ def test_raw_block_l2_adapter_evicts_lru_not_recently_loaded_key():
             adapter.close()
 
 
-def test_raw_block_l2_adapter_does_not_notify_duplicate_store():
+def test_raw_block_l2_adapter_duplicate_store_batch_counts_once():
     with tempfile.TemporaryDirectory() as td:
         dev_path = os.path.join(td, "dev.bin")
         with open(dev_path, "wb") as f:
@@ -736,14 +750,181 @@ def test_raw_block_l2_adapter_does_not_notify_duplicate_store():
 
         try:
             key = _create_object_key(25)
-            obj = _create_memory_obj(fill_value=25.0)
+            obj_a = _create_memory_obj(size=512, fill_value=25.0)
+            obj_b = _create_memory_obj(size=1024, fill_value=26.0)
 
-            assert _run_store(adapter, [key], [obj]) is True
-            assert _run_store(adapter, [key], [obj]) is True
+            assert _run_store(adapter, [key, key], [obj_a, obj_b]) is True
+            assert _run_store(adapter, [key], [obj_b]) is True
 
             assert listener.stored == [[key]]
+            assert listener.stored_sizes == [[obj_a.get_size()]]
+            assert adapter.get_usage().total_bytes_used == obj_a.get_size()
+            assert adapter._core.indexed_key_count() == 1
+
+            accounting = adapter.report_status()["core"]["io_accounting"]
+            assert accounting["store_attempted_count"] == 3
+            assert accounting["store_attempted_logical_bytes"] == (
+                obj_a.get_size() + 2 * obj_b.get_size()
+            )
+            assert accounting["store_committed_count"] == 1
+            assert accounting["store_committed_logical_bytes"] == obj_a.get_size()
+            assert accounting["store_existing_hit_count"] == 2
+            assert accounting["store_existing_hit_logical_bytes"] == (
+                2 * obj_a.get_size()
+            )
+            assert accounting["media_write_logical_bytes"] == obj_a.get_size()
         finally:
             adapter.close()
+
+
+def test_raw_block_l2_adapter_delete_subtracts_exact_metadata_size():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        adapter = RawBlockL2Adapter(_make_config(dev_path))
+        try:
+            key_small = _create_object_key(261)
+            key_large = _create_object_key(262)
+            obj_small = _create_memory_obj(size=512, fill_value=26.1)
+            obj_large = _create_memory_obj(size=1024, fill_value=26.2)
+            assert _run_store(
+                adapter,
+                [key_small, key_large],
+                [obj_small, obj_large],
+            ) is True
+
+            assert adapter.get_usage().total_bytes_used == (
+                obj_small.get_size() + obj_large.get_size()
+            )
+
+            adapter.delete([key_small])
+            assert adapter.get_usage().total_bytes_used == obj_large.get_size()
+
+            adapter.delete([key_large])
+            assert adapter.get_usage().total_bytes_used == 0
+            assert adapter._core.indexed_key_count() == 0
+        finally:
+            adapter.close()
+
+
+def test_raw_block_l2_adapter_load_hit_miss_io_accounting():
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        adapter = RawBlockL2Adapter(_make_config(dev_path))
+        try:
+            key = _create_object_key(251)
+            missing_key = _create_object_key(252)
+            obj = _create_memory_obj(size=512, fill_value=25.1)
+            assert _run_store(adapter, [key], [obj]) is True
+
+            before = adapter.report_status()["core"]["io_accounting"]
+            load_buffers = [
+                _create_memory_obj(size=512, fill_value=0.0),
+                _create_memory_obj(size=512, fill_value=0.0),
+            ]
+            _, loaded = _run_load(adapter, [key, missing_key], load_buffers)
+            assert loaded is not None
+            assert loaded.get_indices_list() == [0]
+            assert torch.equal(load_buffers[0].tensor, obj.tensor)
+            assert torch.count_nonzero(load_buffers[1].tensor) == 0
+
+            after = adapter.report_status()["core"]["io_accounting"]
+            assert after["load_attempted_count"] - before["load_attempted_count"] == 2
+            assert after["load_index_hit_count"] - before["load_index_hit_count"] == 1
+            assert (
+                after["load_index_hit_logical_bytes"]
+                - before["load_index_hit_logical_bytes"]
+                == obj.get_size()
+            )
+            assert (
+                after["media_read_logical_bytes"]
+                - before["media_read_logical_bytes"]
+                == obj.get_size()
+            )
+            assert adapter.get_usage().total_bytes_used == obj.get_size()
+        finally:
+            adapter.close()
+
+
+def test_raw_block_l2_adapter_l1_hit_does_not_touch_raw_block_accounting():
+    # This exercises the full StorageManager tiering path. A DRAM/L1 prefix hit
+    # should short-circuit before raw-block lookup/load, so raw-block counters
+    # stay unchanged.
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
+    from lmcache.v1.distributed.config import (
+        EvictionConfig,
+        L1ManagerConfig,
+        L1MemoryManagerConfig,
+        StorageManagerConfig,
+    )
+    from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
+    from lmcache.v1.distributed.storage_manager import StorageManager
+
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(16 * 1024 * 1024)
+
+        config = StorageManagerConfig(
+            l1_manager_config=L1ManagerConfig(
+                memory_config=L1MemoryManagerConfig(
+                    size_in_bytes=16 * 1024 * 1024,
+                    use_lazy=False,
+                    init_size_in_bytes=16 * 1024 * 1024,
+                    align_bytes=4096,
+                ),
+            ),
+            eviction_config=EvictionConfig(eviction_policy="noop"),
+            l2_adapter_config=L2AdaptersConfig(
+                adapters=[
+                    _make_config(
+                        dev_path,
+                        slot_bytes=64 * 1024,
+                        meta_total_bytes=1 * 1024 * 1024,
+                    )
+                ],
+            ),
+        )
+        storage_manager = StorageManager(config)
+        try:
+            adapter = storage_manager._l2_adapters[0]
+            key = _create_object_key(253)
+            layout = MemoryLayoutDesc(
+                shapes=[torch.Size([128])],
+                dtypes=[torch.float32],
+            )
+
+            reserved = storage_manager.reserve_write([key], layout, mode="new")
+            assert list(reserved) == [key]
+            reserved[key].tensor.fill_(25.3)
+            storage_manager.finish_write([key])
+
+            assert _wait_for_condition(lambda: adapter._core.indexed_key_count() == 1)
+            before = adapter.report_status()["core"]["io_accounting"]
+            assert before["store_committed_count"] == 1
+            assert before["media_write_logical_bytes"] == reserved[key].get_size()
+
+            handle = storage_manager.submit_prefetch_task([key], layout)
+            assert handle.prefetch_request_id == -1
+            assert storage_manager.query_prefetch_status(handle) == 1
+
+            after_prefetch = adapter.report_status()["core"]["io_accounting"]
+            assert after_prefetch == before
+
+            with storage_manager.read_prefetched_results([key]) as objs:
+                assert objs is not None
+                assert torch.equal(objs[0].tensor, reserved[key].tensor)
+            storage_manager.finish_read_prefetched([key])
+
+            after_read = adapter.report_status()["core"]["io_accounting"]
+            assert after_read == before
+        finally:
+            storage_manager.close()
 
 
 def test_raw_block_l2_adapter_metadata_full_skips_checkpoint_but_live_data_works():
@@ -855,27 +1036,40 @@ def test_raw_block_l2_adapter_recovery_from_checkpoint():
             f.truncate(8 * 1024 * 1024)
 
         config = _make_config(dev_path)
-        key = _create_object_key(31)
-        obj = _create_memory_obj(fill_value=31.0)
+        key1 = _create_object_key(31)
+        key2 = _create_object_key(32)
+        obj1 = _create_memory_obj(size=512, fill_value=31.0)
+        obj2 = _create_memory_obj(size=1024, fill_value=32.0)
 
         adapter1 = RawBlockL2Adapter(config)
         try:
-            assert _run_store(adapter1, [key], [obj]) is True
+            assert _run_store(adapter1, [key1, key2], [obj1, obj2]) is True
         finally:
             adapter1.close()
 
         adapter2 = RawBlockL2Adapter(config)
         try:
-            _, lookup_bitmap = _run_lookup(adapter2, [key])
-            assert lookup_bitmap is not None
-            assert lookup_bitmap.get_indices_list() == [0]
+            expected_usage = obj1.get_size() + obj2.get_size()
+            assert adapter2.get_usage().total_bytes_used == expected_usage
+            assert adapter2._core.indexed_key_count() == 2
 
-            load_buffer = _create_memory_obj(fill_value=0.0)
-            _, load_bitmap = _run_load(adapter2, [key], [load_buffer])
+            _, lookup_bitmap = _run_lookup(adapter2, [key1, key2])
+            assert lookup_bitmap is not None
+            assert lookup_bitmap.get_indices_list() == [0, 1]
+
+            load_buffer1 = _create_memory_obj(size=512, fill_value=0.0)
+            load_buffer2 = _create_memory_obj(size=1024, fill_value=0.0)
+            _, load_bitmap = _run_load(
+                adapter2,
+                [key1, key2],
+                [load_buffer1, load_buffer2],
+            )
             assert load_bitmap is not None
-            assert load_bitmap.get_indices_list() == [0]
-            assert torch.equal(load_buffer.tensor, obj.tensor)
-            adapter2.submit_unlock([key])
+            assert load_bitmap.get_indices_list() == [0, 1]
+            assert torch.equal(load_buffer1.tensor, obj1.tensor)
+            assert torch.equal(load_buffer2.tensor, obj2.tensor)
+            assert adapter2.get_usage().total_bytes_used == expected_usage
+            adapter2.submit_unlock([key1, key2])
         finally:
             adapter2.close()
 

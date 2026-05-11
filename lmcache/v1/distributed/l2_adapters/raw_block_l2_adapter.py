@@ -439,6 +439,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._max_capacity_bytes = int(
                 self._core.report_status().get("usable_capacity_bytes", 0)
             )
+            self._seed_usage_from_recovered_entries()
 
             self._store_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
             self._lookup_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
@@ -470,6 +471,27 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._store_inflight_tasks: int = 0
         self._lookup_inflight_tasks: int = 0
         self._load_inflight_tasks: int = 0
+
+    def _seed_usage_from_recovered_entries(self) -> None:
+        """Seed base logical usage accounting from recovered raw-block metadata."""
+        per_salt: dict[str, int] = {}
+        total = 0
+        for encoded_key, size in self._core.snapshot_accounting_entries():
+            try:
+                key = decode_object_key(encoded_key)
+            except ValueError:
+                logger.warning(
+                    "RawBlockL2Adapter skipped recovered non-object key %s",
+                    encoded_key,
+                )
+                continue
+            logical_size = int(size)
+            per_salt[key.cache_salt] = per_salt.get(key.cache_salt, 0) + logical_size
+            total += logical_size
+
+        with self._usage_lock:
+            self._total_bytes_used = total
+            self._bytes_by_cache_salt = per_salt
 
     def get_store_event_fd(self) -> int:
         """Return the eventfd signaled when store tasks complete."""
@@ -707,14 +729,15 @@ class RawBlockL2Adapter(L2AdapterInterface):
         """
         specs = [encode_object_key(key) for key in keys]
         put_result = self._core.put_many(specs, objects)
-        stored_encoded = set(put_result.stored_keys)
         stored_keys: list[ObjectKey] = []
         stored_sizes: list[int] = []
-        for key, spec, obj in zip(keys, specs, objects, strict=False):
-            if spec.encoded not in stored_encoded:
-                continue
-            stored_keys.append(key)
-            stored_sizes.append(obj.get_size())
+        for index, size in zip(
+            put_result.stored_indices,
+            put_result.stored_key_sizes,
+            strict=True,
+        ):
+            stored_keys.append(keys[index])
+            stored_sizes.append(int(size))
         evicted_keys: list[ObjectKey] = []
         evicted_sizes: list[int] = []
         for encoded_key, size in zip(
