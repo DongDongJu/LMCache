@@ -151,6 +151,7 @@ class ReplayResult:
         replay_config_digest: SHA-256 of the replay-side
             StorageManagerConfig, for mismatch comparisons.  Empty
             string if the driver could not compute it.
+        storage_status: Final StorageManager status captured after replay.
     """
 
     records_replayed: int
@@ -160,6 +161,7 @@ class ReplayResult:
     header_level: str
     header_digest: str
     replay_config_digest: str
+    storage_status: dict[str, Any]
 
 
 class StorageReplayDriver:
@@ -221,6 +223,7 @@ class StorageReplayDriver:
         self._dispatcher = dispatcher or build_default_dispatcher()
         self._replay_cache_salt_suffix = replay_cache_salt_suffix
         self._closed = False
+        self._final_storage_status: dict[str, Any] | None = None
 
         # Each resource is acquired under its own try/except so that a
         # failure partway through __init__ still releases what has
@@ -281,6 +284,11 @@ class StorageReplayDriver:
         """
         return self._sm
 
+    @property
+    def final_storage_status(self) -> dict[str, Any] | None:
+        """Storage status captured during :meth:`close`, if available."""
+        return self._final_storage_status
+
     def close(self) -> None:
         """Close the StorageManager, stop the bus, and close the reader.
 
@@ -292,6 +300,13 @@ class StorageReplayDriver:
         self._closed = True
         try:
             self._sm.close()
+            try:
+                self._final_storage_status = self._sm.report_status()
+            except Exception:
+                logger.warning(
+                    "trace replay: error capturing final storage status",
+                    exc_info=True,
+                )
         finally:
             try:
                 self._bus.stop()
@@ -415,6 +430,7 @@ class StorageReplayDriver:
         replay_digest = hashlib.sha256(
             json.dumps(safe, sort_keys=True).encode("utf-8")
         ).hexdigest()
+        storage_status = self._sm.report_status()
 
         return ReplayResult(
             records_replayed=replayed,
@@ -424,6 +440,7 @@ class StorageReplayDriver:
             header_level=header.level,
             header_digest=header.sm_config_digest,
             replay_config_digest=replay_digest,
+            storage_status=storage_status,
         )
 
 

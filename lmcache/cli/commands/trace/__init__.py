@@ -403,17 +403,22 @@ class TraceCommand(BaseCommand):
                     + "\n"
                 )
 
+        driver = None
         try:
-            with StorageReplayDriver(
+            driver = StorageReplayDriver(
                 sm_config,
                 args.trace_path,
                 obs_config=obs_config,
                 replay_cache_salt_suffix=args.replay_cache_salt_suffix,
-            ) as driver:
-                result = driver.run(on_record=_on_record)
+            )
+            result = driver.run(on_record=_on_record)
         finally:
+            if driver is not None:
+                driver.close()
             if jsonl_fh is not None:
                 jsonl_fh.close()
+        if driver is not None and driver.final_storage_status is not None:
+            result.storage_status = driver.final_storage_status
 
         if not args.no_csv:
             csv_path = os.path.join(args.output_dir, "trace_replay_ops.csv")
@@ -423,6 +428,11 @@ class TraceCommand(BaseCommand):
             json_path = os.path.join(args.output_dir, "trace_replay_summary.json")
             result.stats.export_json(json_path)
             logger.info("JSON written to %s", json_path)
+        status_path = os.path.join(args.output_dir, "storage_manager_status.json")
+        with open(status_path, "w") as f:
+            json.dump(result.storage_status, f, indent=2, sort_keys=True)
+            f.write("\n")
+        logger.info("Storage status written to %s", status_path)
 
         if not args.quiet:
             self._emit_replay_metrics(result.stats, result)

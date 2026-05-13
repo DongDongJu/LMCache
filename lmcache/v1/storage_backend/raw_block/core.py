@@ -138,10 +138,24 @@ class RawBlockIoAccounting:
     store_committed_count: int = 0
     store_committed_logical_bytes: int = 0
 
+    data_write_logical_bytes: int = 0
+    data_write_payload_physical_bytes: int = 0
+    data_write_header_physical_bytes: int = 0
+    data_write_physical_bytes: int = 0
+
+    metadata_write_logical_bytes: int = 0
+    metadata_write_physical_bytes: int = 0
+
+    total_write_logical_bytes: int = 0
+    total_write_physical_bytes: int = 0
+
     load_attempted_count: int = 0
     load_index_hit_count: int = 0
     load_index_hit_logical_bytes: int = 0
 
+    # Legacy names retained for existing status consumers.  They now track all
+    # successful raw-block writes, including data slot headers and metadata
+    # checkpoints, so they are comparable with device host-write counters.
     media_write_logical_bytes: int = 0
     media_write_physical_bytes: int = 0
     media_read_logical_bytes: int = 0
@@ -1476,8 +1490,22 @@ class RawBlockCore:
                     fdp_ruh_id=fdp_ruh_id,
                 )
                 with self._lock:
+                    data_logical = int(payload_len)
+                    data_payload_physical = int(total_len)
+                    data_header_physical = int(hdr_total)
+                    data_physical = data_payload_physical + data_header_physical
                     self._io_accounting.media_write_logical_bytes += payload_len
-                    self._io_accounting.media_write_physical_bytes += total_len
+                    self._io_accounting.media_write_physical_bytes += data_physical
+                    self._io_accounting.data_write_logical_bytes += data_logical
+                    self._io_accounting.data_write_payload_physical_bytes += (
+                        data_payload_physical
+                    )
+                    self._io_accounting.data_write_header_physical_bytes += (
+                        data_header_physical
+                    )
+                    self._io_accounting.data_write_physical_bytes += data_physical
+                    self._io_accounting.total_write_logical_bytes += data_logical
+                    self._io_accounting.total_write_physical_bytes += data_physical
             finally:
                 with self._lock:
                     self._inflight_io_count -= 1
@@ -1837,8 +1865,16 @@ class RawBlockCore:
             fdp_ruh_id=fdp_ruh_id,
         )
 
-        if update_counters:
-            with self._lock:
+        with self._lock:
+            metadata_logical = int(payload_len) + int(self.block_align)
+            metadata_physical = int(payload_total_len) + int(self.block_align)
+            self._io_accounting.metadata_write_logical_bytes += metadata_logical
+            self._io_accounting.metadata_write_physical_bytes += metadata_physical
+            self._io_accounting.total_write_logical_bytes += metadata_logical
+            self._io_accounting.total_write_physical_bytes += metadata_physical
+            self._io_accounting.media_write_logical_bytes += metadata_logical
+            self._io_accounting.media_write_physical_bytes += metadata_physical
+            if update_counters:
                 self._meta_seq = int(next_seq)
                 self._meta_persisted = max(
                     self._meta_persisted, int(dirty_total_snapshot)

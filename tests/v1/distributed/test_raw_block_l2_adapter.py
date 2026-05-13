@@ -773,6 +773,27 @@ def test_raw_block_l2_adapter_duplicate_store_batch_counts_once():
                 2 * obj_a.get_size()
             )
             assert accounting["media_write_logical_bytes"] == obj_a.get_size()
+            assert accounting["data_write_logical_bytes"] == obj_a.get_size()
+            assert accounting["data_write_payload_physical_bytes"] == obj_a.get_size()
+            assert accounting["data_write_header_physical_bytes"] > 0
+            assert accounting["data_write_physical_bytes"] == (
+                accounting["data_write_payload_physical_bytes"]
+                + accounting["data_write_header_physical_bytes"]
+            )
+            assert accounting["total_write_physical_bytes"] == accounting[
+                "data_write_physical_bytes"
+            ]
+
+            adapter._core.checkpoint_now()
+            after_checkpoint = adapter.report_status()["core"]["io_accounting"]
+            assert after_checkpoint["metadata_write_physical_bytes"] > 0
+            assert after_checkpoint["total_write_physical_bytes"] == (
+                after_checkpoint["data_write_physical_bytes"]
+                + after_checkpoint["metadata_write_physical_bytes"]
+            )
+            assert after_checkpoint["media_write_physical_bytes"] == after_checkpoint[
+                "total_write_physical_bytes"
+            ]
         finally:
             adapter.close()
 
