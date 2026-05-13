@@ -80,10 +80,97 @@ test-region capacity. The summary records:
 
 - `target_host_write_bytes`
 - `host_write_bytes_delta`
+- `lmcache_store_attempted_logical_bytes`
+- `lmcache_store_committed_logical_bytes`
+- `lmcache_successful_data_write_physical_bytes`
+- `lmcache_successful_metadata_write_physical_bytes`
+- `lmcache_successful_write_physical_bytes`
+- `host_vs_lmcache_successful_physical_delta_bytes`
+- `host_vs_lmcache_successful_physical_ratio`
 - `target_host_write_bytes_reached`
 - `waf`
-- `waf_available`
-- `waf_unavailable_reason`
+- `waf_status`
+
+Use the committed/successful LMCache counters when validating device-side
+accounting. Attempted trace store bytes include failed stores, no-free-slot
+cases, and duplicate/existing-key hits that do not necessarily reach the NVMe
+namespace. The successful physical counter includes raw-block data payloads,
+slot headers, and metadata checkpoint writes exported by each replay process in
+`storage_manager_status.json`.
 
 WAF is only available when a vendor media/NAND write counter is configured.
 
+## Multi-Window Raw-Block Planner
+
+`replay_multi_window_raw_block.py` splits one NVMe namespace into multiple
+non-overlapping raw-block byte windows and builds one `lmcache trace replay`
+command per active window. The default mode is dry-run/plan-only; it writes
+`resolved_plan.json`, `resolved_plan.yaml`, and `commands.sh` without touching
+the device.
+
+Example plan for four windows and four available RUHs:
+
+```bash
+uv run --no-sync python benchmarks/agentic_mp_trace/replay_multi_window_raw_block.py \
+  --trace-manifest /mnt/hc-ssd/lmcache-agentic-records/trace_manifest.yaml \
+  --device-path /dev/ng1n1 \
+  --block-device-path /dev/nvme1n1 \
+  --output-dir /mnt/hc-ssd/lmcache-multi-window-plan \
+  --device-capacity-bytes auto \
+  --start-offset-bytes 0 \
+  --num-windows 4 \
+  --num-workloads 4 \
+  --window-capacity-policy equal \
+  --use-fdp true \
+  --ruh-count 4 \
+  --ruh-assignment mixed \
+  --application-placement fixed \
+  --stop-policy iterations \
+  --iterations 1 \
+  --plan-only
+```
+
+The generated replay write path is:
+
+```text
+lmcache trace replay
+  -> StoreController / PrefetchController
+  -> RawBlockL2Adapter
+  -> RawBlockCore
+  -> Rust raw-block I/O
+  -> NVMe namespace
+```
+
+For an actual destructive run, pass `--allow-destructive-device-write` and then
+type exactly `RUN` at the prompt. For non-interactive automation, both `--yes`
+and `--allow-destructive-device-write` are required. The tool does not claim
+GPU-direct disk I/O support; use `--gpu-io-mode cpu_stage` to document the
+current replay path through CPU/L1 staging and asynchronous LMCache store
+workers.
+
+If the SSD exposes a vendor media/NAND write counter, pass it with
+`--media-write-counter-command '<command returning JSON or bytes>'`; otherwise
+`summary.json` reports `waf: null` and a WAF unavailable status instead of
+deriving WAF from host writes.
+
+Optional device-gated smoke command for a dedicated raw NVMe namespace:
+
+```bash
+LMCACHE_RAW_BLOCK_TEST_NG_DEVICE=/dev/ng1n1 \
+LMCACHE_RAW_BLOCK_TEST_BLOCK_DEVICE=/dev/nvme1n1 \
+LMCACHE_ALLOW_DESTRUCTIVE_RAW_BLOCK_TEST=1 \
+uv run --no-sync python benchmarks/agentic_mp_trace/replay_multi_window_raw_block.py \
+  --trace-manifest /mnt/hc-ssd/lmcache-agentic-records/trace_manifest.yaml \
+  --device-path "$LMCACHE_RAW_BLOCK_TEST_NG_DEVICE" \
+  --block-device-path "$LMCACHE_RAW_BLOCK_TEST_BLOCK_DEVICE" \
+  --output-dir /mnt/hc-ssd/lmcache-multi-window-smoke \
+  --device-capacity-bytes auto \
+  --num-windows 2 \
+  --num-workloads 2 \
+  --use-fdp true \
+  --ruh-count 4 \
+  --ruh-assignment mixed \
+  --stop-policy iterations \
+  --iterations 1 \
+  --allow-destructive-device-write
+```
