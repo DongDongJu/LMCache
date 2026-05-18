@@ -406,6 +406,8 @@ def test_adapter_json_and_meta_magic_are_correct(monkeypatch, tmp_path):
         "8",
         "--num-lookup-workers",
         "9",
+        "--use-odirect",
+        "true",
         monkeypatch=monkeypatch,
     )
     magics = [window["meta_magic"] for window in plan["windows"]]
@@ -416,6 +418,7 @@ def test_adapter_json_and_meta_magic_are_correct(monkeypatch, tmp_path):
     assert adapter["capacity_bytes"] == plan["windows"][0]["capacity_bytes"]
     assert adapter["fdp_data_ruh_ids"] == [0]
     assert adapter["fdp_metadata_ruh_ids"] == [3]
+    assert adapter["use_odirect"] is True
     assert adapter["num_store_workers"] == 7
     assert adapter["num_load_workers"] == 8
     assert adapter["num_lookup_workers"] == 9
@@ -490,3 +493,104 @@ def test_raw_block_status_accounting_is_extracted_and_aggregated(tmp_path):
     assert aggregate["eviction_count"] == 6
     assert aggregate["eviction_logical_bytes"] == 600
     assert aggregate["total_write_physical_bytes"] == 32768
+
+
+def test_total_written_size_progress_prefers_lmcache_actual_written_bytes():
+    progress_bytes, progress_source = multiwin.total_written_size_progress(
+        [
+            {
+                "iteration": -1,
+                "io_accounting": {
+                    "store_attempted_logical_bytes": 10_000,
+                    "total_write_physical_bytes": 10_000,
+                },
+            },
+            {
+                "iteration": 0,
+                "io_accounting": {
+                    "store_attempted_logical_bytes": 9_999,
+                    "total_write_physical_bytes": 1_200,
+                },
+            },
+        ],
+        host_write_delta=5_000,
+    )
+    assert progress_bytes == 1_200
+    assert progress_source == multiwin.END_CONDITION_ACTUAL_WRITTEN_SOURCE
+
+    progress_bytes, progress_source = multiwin.total_written_size_progress(
+        [],
+        host_write_delta=5_000,
+        defer_host_fallback_until_result=True,
+    )
+    assert progress_bytes is None
+    assert progress_source == multiwin.END_CONDITION_ACTUAL_WRITTEN_SOURCE
+
+    progress_bytes, progress_source = multiwin.total_written_size_progress(
+        [{"iteration": 0, "io_accounting": None}],
+        host_write_delta=5_000,
+        defer_host_fallback_until_result=True,
+    )
+    assert progress_bytes == 5_000
+    assert progress_source == multiwin.END_CONDITION_HOST_WRITE_SOURCE
+
+
+def test_run_plan_total_written_size_stops_on_lmcache_actual_written_bytes(
+    monkeypatch,
+    tmp_path,
+):
+    plan = _plan(
+        tmp_path,
+        "--stop-policy",
+        "total_written_size",
+        "--target-host-write-bytes",
+        "3000",
+        "--iterations",
+        "10",
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setattr(multiwin, "capture_host_write_bytes", lambda _path: 0)
+    monkeypatch.setattr(multiwin, "capture_media_write_bytes", lambda _command: None)
+    iterations = []
+
+    def fake_run_iteration(
+        plan,
+        *,
+        iteration,
+        timeout_seconds,
+        stop_check=None,
+    ):
+        del plan, timeout_seconds, stop_check
+        iterations.append(iteration)
+        return [
+            {
+                "window_index": 0,
+                "iteration": iteration,
+                "exit_code": 0,
+                "log_path": "worker.log",
+                "jsonl_out": "records.jsonl",
+                "failed_records": 0,
+                "io_accounting": {
+                    "store_attempted_logical_bytes": 10_000,
+                    "total_write_physical_bytes": 2_000,
+                },
+                "ended_at": "now",
+            }
+        ]
+
+    monkeypatch.setattr(multiwin, "run_iteration", fake_run_iteration)
+
+    summary = multiwin.run_plan(plan, str(tmp_path / "run"))
+
+    assert iterations == [0, 1]
+    assert summary["host_write_bytes_delta"] == 0
+    assert summary["target_host_write_bytes_reached"] is False
+    assert summary["lmcache_store_attempted_logical_bytes"] == 20_000
+    assert summary["lmcache_successful_write_physical_bytes"] == 4_000
+    assert (
+        summary["total_written_size_end_condition_source"]
+        == multiwin.END_CONDITION_ACTUAL_WRITTEN_SOURCE
+    )
+    assert summary["total_written_size_end_condition_bytes"] == 4_000
+    assert summary["total_written_size_target_bytes"] == 3_000
+    assert summary["total_written_size_target_reached"] is True

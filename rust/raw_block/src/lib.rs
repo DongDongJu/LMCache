@@ -156,6 +156,10 @@ fn round_up(x: usize, align: usize) -> usize {
     (x + align - 1) / align * align
 }
 
+fn is_aligned(value: usize, align: usize) -> bool {
+    align != 0 && value % align == 0
+}
+
 // Fetch errno for the last libc call on this thread.
 fn errno() -> i32 {
     // SAFETY: libc call.
@@ -1908,7 +1912,7 @@ impl RawBlockDevice {
 
         // Check if the buffer is aligned for O_DIRECT
         let ptr_aligned = if self.use_odirect {
-            (ptr as usize).is_multiple_of(align)
+            is_aligned(ptr as usize, align)
         } else {
             true
         };
@@ -2072,7 +2076,7 @@ impl RawBlockDevice {
 
         // Check if the buffer is aligned for O_DIRECT
         let ptr_aligned = if self.use_odirect {
-            (ptr as usize).is_multiple_of(align)
+            is_aligned(ptr as usize, align)
         } else {
             true
         };
@@ -2470,7 +2474,7 @@ impl RawBlockDevice {
         let ptr_usize = ptr as usize;
         let res = py.allow_threads(move || {
             let src = ptr_usize as *const u8;
-            let src_aligned = (src as usize).is_multiple_of(align);
+            let src_aligned = is_aligned(src as usize, align);
             if total_len == payload_len && !self.use_odirect {
                 // direct write without padding
                 return pwrite_from_ptr(fd, offset, src, payload_len);
@@ -2610,7 +2614,7 @@ impl RawBlockDevice {
         let dst_usize = ptr as usize;
         let res = py.allow_threads(move || {
             let dst = dst_usize as *mut u8;
-            let dst_aligned = (dst as usize).is_multiple_of(align);
+            let dst_aligned = is_aligned(dst as usize, align);
             if total_len == payload_len && !self.use_odirect {
                 return pread_into(fd, offset, dst, payload_len);
             }

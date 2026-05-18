@@ -60,6 +60,8 @@ VALID_PLACEMENTS = ("fixed", "random")
 VALID_WORKLOAD_KEYS = ("storage_class", "dataset_adapter", "trace_name")
 VALID_LAUNCH_POLICIES = ("simultaneous", "random_jitter")
 VALID_GPU_IO_MODES = ("none", "cpu_stage", "gds_if_supported")
+END_CONDITION_ACTUAL_WRITTEN_SOURCE = "lmcache_successful_write_physical_bytes"
+END_CONDITION_HOST_WRITE_SOURCE = "host_write_bytes_delta"
 RAW_BLOCK_ACCOUNTING_FIELDS = (
     "store_attempted_count",
     "store_attempted_logical_bytes",
@@ -148,6 +150,7 @@ class WindowPlan:
 
 
 ACTIVE_PROCS: list[subprocess.Popen] = []
+LAST_HOST_WRITE_COUNTER_SOURCE: str | None = None
 
 
 def utc_now() -> str:
@@ -661,6 +664,7 @@ def build_adapter_json(
     meta_total_bytes: int,
     use_uring: bool,
     use_uring_cmd: bool,
+    use_odirect: bool,
     use_fdp: bool,
     fdp_data_ruh_ids: list[int],
     fdp_metadata_ruh_ids: list[int],
@@ -679,7 +683,7 @@ def build_adapter_json(
         "meta_magic": window.meta_magic,
         "block_align": block_align,
         "header_bytes": header_bytes,
-        "use_odirect": False,
+        "use_odirect": use_odirect,
         "use_uring": use_uring,
         "use_uring_cmd": use_uring_cmd,
         "use_fdp": use_fdp,
@@ -913,6 +917,7 @@ def resolve_plan(args: argparse.Namespace, manifest: dict[str, Any]) -> dict[str
             meta_total_bytes=args.meta_total_bytes,
             use_uring=use_uring,
             use_uring_cmd=use_uring_cmd,
+            use_odirect=args.use_odirect,
             use_fdp=use_fdp,
             fdp_data_ruh_ids=data_ruhs,
             fdp_metadata_ruh_ids=ruh_policy.metadata_ruhs if use_fdp else [],
@@ -1021,6 +1026,7 @@ def resolve_plan(args: argparse.Namespace, manifest: dict[str, Any]) -> dict[str
         "use_fdp": use_fdp,
         "use_uring": use_uring,
         "use_uring_cmd": use_uring_cmd,
+        "use_odirect": args.use_odirect,
         "ruh_assignment": args.ruh_assignment,
         "available_ruhs": ruh_policy.available_ruhs,
         "metadata_ruh_ids": ruh_policy.metadata_ruhs if use_fdp else [],
@@ -1033,6 +1039,10 @@ def resolve_plan(args: argparse.Namespace, manifest: dict[str, Any]) -> dict[str
         "warmup_iterations": args.warmup_iterations,
         "target_host_write_bytes": target_host_write_bytes,
         "target_host_write_multiplier": args.target_host_write_multiplier,
+        "total_written_size_end_condition_preference": [
+            END_CONDITION_ACTUAL_WRITTEN_SOURCE,
+            END_CONDITION_HOST_WRITE_SOURCE,
+        ],
         "total_configured_window_capacity_bytes": total_window_capacity,
         "estimated_usable_raw_block_data_capacity_bytes": sum(
             window.usable_capacity_bytes for window in windows
@@ -1090,6 +1100,11 @@ def print_run_plan(plan: dict[str, Any]) -> None:
         f"{plan['estimated_usable_raw_block_data_capacity_bytes']}"
     )
     print(f"  target_host_write_bytes: {plan['target_host_write_bytes']}")
+    print(
+        "  total_written_size_end_condition_preference: "
+        f"{plan['total_written_size_end_condition_preference']}"
+    )
+    print(f"  use_odirect: {plan['use_odirect']}")
     print(f"  stop_policy: {plan['stop_policy']}")
     print(f"  warmup_iterations: {plan['warmup_iterations']}")
     print(f"  estimated_runtime: {plan['estimated_runtime']}")
@@ -1129,8 +1144,10 @@ def confirm_destructive_run(plan: dict[str, Any], *, yes: bool, allow: bool) -> 
 
 
 def capture_host_write_bytes(block_device_path: str) -> int | None:
+    global LAST_HOST_WRITE_COUNTER_SOURCE
+    LAST_HOST_WRITE_COUNTER_SOURCE = None
     if not shutil.which("nvme"):
-        return None
+        return capture_sysfs_host_write_bytes(block_device_path)
     proc = subprocess.run(
         ["nvme", "smart-log", block_device_path],
         check=False,
@@ -1138,12 +1155,29 @@ def capture_host_write_bytes(block_device_path: str) -> int | None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    if proc.returncode != 0:
+    if proc.returncode == 0:
+        match = re.search(r"Data Units Written\s*:\s*([0-9,]+)", proc.stdout)
+        if match:
+            LAST_HOST_WRITE_COUNTER_SOURCE = "nvme_smart_log_data_units_written"
+            return int(match.group(1).replace(",", "")) * 512_000
+    return capture_sysfs_host_write_bytes(block_device_path)
+
+
+def capture_sysfs_host_write_bytes(block_device_path: str) -> int | None:
+    global LAST_HOST_WRITE_COUNTER_SOURCE
+    stat_path = Path("/sys/class/block") / Path(block_device_path).name / "stat"
+    try:
+        fields = stat_path.read_text().split()
+    except OSError:
         return None
-    match = re.search(r"Data Units Written\s*:\s*([0-9,]+)", proc.stdout)
-    if not match:
+    if len(fields) < 7:
         return None
-    return int(match.group(1).replace(",", "")) * 512_000
+    try:
+        sectors_written = int(fields[6])
+    except ValueError:
+        return None
+    LAST_HOST_WRITE_COUNTER_SOURCE = "sysfs_block_stat_write_sectors"
+    return sectors_written * 512
 
 
 def capture_media_write_bytes(command: str | None) -> int | None:
@@ -1267,12 +1301,37 @@ def aggregate_result_io_accounting(results: list[dict[str, Any]]) -> dict[str, i
     return total
 
 
+def measurement_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [result for result in results if int(result.get("iteration", -1)) >= 0]
+
+
+def total_written_size_progress(
+    results: list[dict[str, Any]],
+    *,
+    host_write_delta: int | None,
+    defer_host_fallback_until_result: bool = False,
+) -> tuple[int | None, str]:
+    measured_results = measurement_results(results)
+    lmcache_accounting_available = any(
+        result.get("io_accounting") is not None for result in measured_results
+    )
+    if lmcache_accounting_available:
+        accounting = aggregate_result_io_accounting(measured_results)
+        return (
+            int(accounting["total_write_physical_bytes"]),
+            END_CONDITION_ACTUAL_WRITTEN_SOURCE,
+        )
+    if defer_host_fallback_until_result and not measured_results:
+        return None, END_CONDITION_ACTUAL_WRITTEN_SOURCE
+    return host_write_delta, END_CONDITION_HOST_WRITE_SOURCE
+
+
 def run_iteration(
     plan: dict[str, Any],
     *,
     iteration: int,
     timeout_seconds: int | None,
-    stop_check: Callable[[], bool] | None = None,
+    stop_check: Callable[[list[dict[str, Any]]], bool] | None = None,
 ) -> list[dict[str, Any]]:
     procs: list[tuple[subprocess.Popen, Path, dict[str, Any], Any]] = []
     results: list[dict[str, Any]] = []
@@ -1337,7 +1396,7 @@ def run_iteration(
                 if proc.poll() is None:
                     proc.terminate()
             break
-        if stop_check is not None and stop_check():
+        if stop_check is not None and stop_check(results):
             for proc, _, _, _ in procs:
                 if proc.poll() is None:
                     proc.terminate()
@@ -1402,12 +1461,17 @@ def run_plan(plan: dict[str, Any], output_dir: str) -> dict[str, Any]:
         max_iterations = int(plan["iterations"] or 1)
         last_counter_check = 0.0
         latest_host_write_bytes: int | None = measurement_start
+        latest_end_condition_bytes: int | None = None
 
-        def target_reached_during_iteration() -> bool:
-            nonlocal last_counter_check, latest_host_write_bytes
+        def target_reached_during_iteration(
+            iteration_results: list[dict[str, Any]],
+        ) -> bool:
+            nonlocal last_counter_check
+            nonlocal latest_host_write_bytes
+            nonlocal latest_end_condition_bytes
             if plan["stop_policy"] != "total_written_size":
                 return False
-            if plan["target_host_write_bytes"] is None or measurement_start is None:
+            if plan["target_host_write_bytes"] is None:
                 return False
             now = time.monotonic()
             if now - last_counter_check < 5.0:
@@ -1416,10 +1480,20 @@ def run_plan(plan: dict[str, Any], output_dir: str) -> dict[str, Any]:
             latest_host_write_bytes = capture_host_write_bytes(
                 plan["block_device_path"]
             )
+            host_write_delta = (
+                latest_host_write_bytes - measurement_start
+                if latest_host_write_bytes is not None
+                and measurement_start is not None
+                else None
+            )
+            latest_end_condition_bytes = total_written_size_progress(
+                [*results, *iteration_results],
+                host_write_delta=host_write_delta,
+                defer_host_fallback_until_result=True,
+            )[0]
             return (
-                latest_host_write_bytes is not None
-                and latest_host_write_bytes - measurement_start
-                >= plan["target_host_write_bytes"]
+                latest_end_condition_bytes is not None
+                and latest_end_condition_bytes >= plan["target_host_write_bytes"]
             )
 
         for iteration in range(max_iterations):
@@ -1440,14 +1514,22 @@ def run_plan(plan: dict[str, Any], output_dir: str) -> dict[str, Any]:
             current = latest_host_write_bytes or capture_host_write_bytes(
                 plan["block_device_path"]
             )
+            host_write_delta = (
+                current - measurement_start
+                if current is not None and measurement_start is not None
+                else None
+            )
+            latest_end_condition_bytes = total_written_size_progress(
+                results,
+                host_write_delta=host_write_delta,
+            )[0]
             if plan["stop_policy"] == "timeout":
                 break
             if (
                 plan["stop_policy"] == "total_written_size"
                 and plan["target_host_write_bytes"] is not None
-                and measurement_start is not None
-                and current is not None
-                and current - measurement_start >= plan["target_host_write_bytes"]
+                and latest_end_condition_bytes is not None
+                and latest_end_condition_bytes >= plan["target_host_write_bytes"]
             ):
                 break
         after = capture_host_write_bytes(plan["block_device_path"])
@@ -1465,10 +1547,19 @@ def run_plan(plan: dict[str, Any], output_dir: str) -> dict[str, Any]:
         if media_after is not None and media_measurement_start is not None
         else None
     )
-    measurement_results = [
-        result for result in results if int(result.get("iteration", -1)) >= 0
-    ]
-    lmcache_io_accounting = aggregate_result_io_accounting(measurement_results)
+    measured_results = measurement_results(results)
+    lmcache_io_accounting = aggregate_result_io_accounting(measured_results)
+    total_written_size_end_condition_bytes, total_written_size_end_condition_source = (
+        total_written_size_progress(
+            results,
+            host_write_delta=host_delta,
+        )
+    )
+    total_written_size_target_reached = (
+        total_written_size_end_condition_bytes is not None
+        and plan["target_host_write_bytes"] is not None
+        and total_written_size_end_condition_bytes >= plan["target_host_write_bytes"]
+    )
     lmcache_successful_write_physical_bytes = int(
         lmcache_io_accounting["total_write_physical_bytes"]
     )
@@ -1498,6 +1589,7 @@ def run_plan(plan: dict[str, Any], output_dir: str) -> dict[str, Any]:
         "completed_iterations": completed_iterations,
         "host_write_bytes_before": before,
         "host_write_bytes_delta": host_delta,
+        "host_write_counter_source": LAST_HOST_WRITE_COUNTER_SOURCE,
         "media_write_bytes_before": media_before,
         "media_write_bytes_delta": media_delta,
         "lmcache_io_accounting": lmcache_io_accounting,
@@ -1532,6 +1624,14 @@ def run_plan(plan: dict[str, Any], output_dir: str) -> dict[str, Any]:
             and plan["target_host_write_bytes"] is not None
             and host_delta >= plan["target_host_write_bytes"]
         ),
+        "total_written_size_end_condition_source": (
+            total_written_size_end_condition_source
+        ),
+        "total_written_size_end_condition_bytes": (
+            total_written_size_end_condition_bytes
+        ),
+        "total_written_size_target_bytes": plan["target_host_write_bytes"],
+        "total_written_size_target_reached": total_written_size_target_reached,
         "waf": waf,
         "waf_status": waf_status,
         "windows": plan["windows"],
@@ -1552,6 +1652,7 @@ def write_summary_md(path: str | Path, summary: dict[str, Any]) -> None:
         f"- block_device_path: {summary['block_device_path']}",
         f"- completed_iterations: {summary['completed_iterations']}",
         f"- host_write_bytes_delta: {summary['host_write_bytes_delta']}",
+        f"- host_write_counter_source: {summary['host_write_counter_source']}",
         f"- media_write_bytes_delta: {summary['media_write_bytes_delta']}",
         "- lmcache_store_attempted_logical_bytes: "
         f"{summary['lmcache_store_attempted_logical_bytes']}",
@@ -1572,6 +1673,14 @@ def write_summary_md(path: str | Path, summary: dict[str, Any]) -> None:
         f"{summary['host_vs_lmcache_successful_physical_ratio']}",
         "- target_host_write_bytes_reached: "
         f"{summary['target_host_write_bytes_reached']}",
+        "- total_written_size_end_condition_source: "
+        f"{summary['total_written_size_end_condition_source']}",
+        "- total_written_size_end_condition_bytes: "
+        f"{summary['total_written_size_end_condition_bytes']}",
+        "- total_written_size_target_bytes: "
+        f"{summary['total_written_size_target_bytes']}",
+        "- total_written_size_target_reached: "
+        f"{summary['total_written_size_target_reached']}",
         f"- waf: {summary['waf']}",
         f"- waf_status: {summary['waf_status']}",
         "",
@@ -1638,6 +1747,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--use-fdp", type=parse_bool, default=False)
     parser.add_argument("--use-uring", type=parse_bool, default=True)
     parser.add_argument("--use-uring-cmd", type=parse_bool, default=False)
+    parser.add_argument("--use-odirect", type=parse_bool, default=False)
     parser.add_argument("--ruh-count", type=int, default=None)
     parser.add_argument("--ruh-start-id", type=int, default=0)
     parser.add_argument("--ruh-ids", default=None)

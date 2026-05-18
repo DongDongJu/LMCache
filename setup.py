@@ -15,7 +15,8 @@ HIPIFY_OUT_DIR = os.path.join(ROOT_DIR, "csrc_hip/")
 
 # python -m build --sdist
 # will run python setup.py sdist --dist-dir dist
-BUILDING_SDIST = "sdist" in sys.argv or os.environ.get("NO_CUDA_EXT", "0") == "1"
+BUILDING_SDIST = "sdist" in sys.argv
+NO_CUDA_EXT = os.environ.get("NO_CUDA_EXT", "0") == "1"
 
 # New environment variable to choose between CUDA and HIP
 BUILD_WITH_HIP = os.environ.get("BUILD_WITH_HIP", "0") == "1"
@@ -403,6 +404,73 @@ def rocm_extension() -> tuple[list, dict]:
     return ext_modules, cmdclass
 
 
+def cpu_extension() -> tuple[list, dict]:
+    # Third Party
+    from torch.utils import cpp_extension
+
+    print("Building CPU native extensions")
+    global ENABLE_CXX11_ABI
+    if ENABLE_CXX11_ABI:
+        flag_cxx_abi = "-D_GLIBCXX_USE_CXX11_ABI=1"
+    else:
+        flag_cxx_abi = "-D_GLIBCXX_USE_CXX11_ABI=0"
+
+    storage_manager_sources = [
+        "csrc/storage_manager/bitmap.cpp",
+        "csrc/storage_manager/pybind.cpp",
+        "csrc/storage_manager/ttl_lock.cpp",
+        "csrc/storage_manager/utils.cpp",
+    ]
+    redis_sources = [
+        "csrc/storage_backends/redis/pybind.cpp",
+        "csrc/storage_backends/redis/connector.cpp",
+    ]
+    fs_sources = [
+        "csrc/storage_backends/fs/pybind.cpp",
+        "csrc/storage_backends/fs/connector.cpp",
+    ]
+    blkio_sources = [
+        "csrc/storage_backends/blkio/pybind.cpp",
+        "csrc/storage_backends/blkio/connector.cpp",
+    ]
+    mooncake_sources = [
+        "csrc/storage_backends/mooncake/pybind.cpp",
+        "csrc/storage_backends/mooncake/connector.cpp",
+    ]
+    ext_modules = [
+        cpp_extension.CppExtension(
+            "lmcache.native_storage_ops",
+            sources=storage_manager_sources,
+            include_dirs=["csrc/storage_manager"],
+            extra_compile_args={
+                "cxx": [flag_cxx_abi, "-O3", "-std=c++17"],
+            },
+        ),
+        cpp_extension.CppExtension(
+            "lmcache.lmcache_redis",
+            sources=redis_sources,
+            include_dirs=["csrc/storage_backends", "csrc/storage_backends/redis"],
+            extra_compile_args={
+                "cxx": [flag_cxx_abi, "-O3", "-std=c++17"],
+            },
+        ),
+        cpp_extension.CppExtension(
+            "lmcache.lmcache_fs",
+            sources=fs_sources,
+            include_dirs=["csrc/storage_backends", "csrc/storage_backends/fs"],
+            extra_compile_args={
+                "cxx": [flag_cxx_abi, "-O3", "-std=c++17"],
+            },
+        ),
+    ]
+    ext_modules.extend(
+        _mooncake_extension(cpp_extension, mooncake_sources, [flag_cxx_abi])
+    )
+    ext_modules.extend(_blkio_extension(cpp_extension, blkio_sources, [flag_cxx_abi]))
+    cmdclass = {"build_ext": cpp_extension.BuildExtension}
+    return ext_modules, cmdclass
+
+
 def source_dist_extension() -> tuple[list, dict]:
     print("Not building CUDA/HIP extensions for sdist")
     return [], {}
@@ -413,6 +481,8 @@ if __name__ == "__main__":
         get_extension = source_dist_extension
     elif BUILD_WITH_HIP:
         get_extension = rocm_extension
+    elif NO_CUDA_EXT:
+        get_extension = cpu_extension
     else:
         get_extension = cuda_extension
 
