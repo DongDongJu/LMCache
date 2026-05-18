@@ -82,6 +82,8 @@ test-region capacity. The summary records:
 - `host_write_bytes_delta`
 - `lmcache_store_attempted_logical_bytes`
 - `lmcache_store_committed_logical_bytes`
+- `lmcache_eviction_count`
+- `lmcache_eviction_logical_bytes`
 - `lmcache_successful_data_write_physical_bytes`
 - `lmcache_successful_metadata_write_physical_bytes`
 - `lmcache_successful_write_physical_bytes`
@@ -96,7 +98,9 @@ accounting. Attempted trace store bytes include failed stores, no-free-slot
 cases, and duplicate/existing-key hits that do not necessarily reach the NVMe
 namespace. The successful physical counter includes raw-block data payloads,
 slot headers, and metadata checkpoint writes exported by each replay process in
-`storage_manager_status.json`.
+`storage_manager_status.json`. The eviction counters report raw-block LRU slot
+evictions caused by capacity pressure; they do not include explicit deletes or
+failed stores that never acquired a reusable slot.
 
 WAF is only available when a vendor media/NAND write counter is configured.
 

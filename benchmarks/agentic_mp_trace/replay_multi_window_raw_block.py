@@ -67,6 +67,8 @@ RAW_BLOCK_ACCOUNTING_FIELDS = (
     "store_existing_hit_logical_bytes",
     "store_committed_count",
     "store_committed_logical_bytes",
+    "eviction_count",
+    "eviction_logical_bytes",
     "data_write_logical_bytes",
     "data_write_payload_physical_bytes",
     "data_write_header_physical_bytes",
@@ -1505,6 +1507,10 @@ def run_plan(plan: dict[str, Any], output_dir: str) -> dict[str, Any]:
         "lmcache_store_committed_logical_bytes": lmcache_io_accounting[
             "store_committed_logical_bytes"
         ],
+        "lmcache_eviction_count": lmcache_io_accounting["eviction_count"],
+        "lmcache_eviction_logical_bytes": lmcache_io_accounting[
+            "eviction_logical_bytes"
+        ],
         "lmcache_successful_data_write_physical_bytes": lmcache_io_accounting[
             "data_write_physical_bytes"
         ],
@@ -1551,6 +1557,9 @@ def write_summary_md(path: str | Path, summary: dict[str, Any]) -> None:
         f"{summary['lmcache_store_attempted_logical_bytes']}",
         "- lmcache_store_committed_logical_bytes: "
         f"{summary['lmcache_store_committed_logical_bytes']}",
+        f"- lmcache_eviction_count: {summary['lmcache_eviction_count']}",
+        "- lmcache_eviction_logical_bytes: "
+        f"{summary['lmcache_eviction_logical_bytes']}",
         "- lmcache_successful_data_write_physical_bytes: "
         f"{summary['lmcache_successful_data_write_physical_bytes']}",
         "- lmcache_successful_metadata_write_physical_bytes: "

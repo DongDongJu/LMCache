@@ -448,6 +448,8 @@ def test_raw_block_status_accounting_is_extracted_and_aggregated(tmp_path):
                     "io_accounting": {
                         "store_attempted_logical_bytes": 1000,
                         "store_committed_logical_bytes": 700,
+                        "eviction_count": 3,
+                        "eviction_logical_bytes": 300,
                         "data_write_payload_physical_bytes": 8192,
                         "data_write_header_physical_bytes": 4096,
                         "data_write_physical_bytes": 12288,
@@ -461,6 +463,8 @@ def test_raw_block_status_accounting_is_extracted_and_aggregated(tmp_path):
     accounting = multiwin.extract_raw_block_accounting(status)
     assert accounting["store_attempted_logical_bytes"] == 1000
     assert accounting["store_committed_logical_bytes"] == 700
+    assert accounting["eviction_count"] == 3
+    assert accounting["eviction_logical_bytes"] == 300
     assert accounting["data_write_physical_bytes"] == 12288
     assert accounting["metadata_write_physical_bytes"] == 4096
     assert accounting["total_write_physical_bytes"] == 16384
@@ -483,4 +487,6 @@ def test_raw_block_status_accounting_is_extracted_and_aggregated(tmp_path):
         ]
     )
     assert aggregate["store_attempted_logical_bytes"] == 2000
+    assert aggregate["eviction_count"] == 6
+    assert aggregate["eviction_logical_bytes"] == 600
     assert aggregate["total_write_physical_bytes"] == 32768
