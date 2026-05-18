@@ -574,6 +574,9 @@ def test_raw_block_l2_adapter_listeners_usage_and_internal_eviction():
             assert status["is_healthy"] is True
             assert status["type"] == "RawBlockL2Adapter"
             assert status["core"]["usable_capacity_bytes"] == slot_bytes
+            accounting = status["core"]["io_accounting"]
+            assert accounting["eviction_count"] == 1
+            assert accounting["eviction_logical_bytes"] == obj1.get_size()
 
             _, bitmap1 = _run_lookup(adapter, [key1])
             assert bitmap1 is not None
@@ -623,6 +626,9 @@ def test_raw_block_l2_adapter_full_locked_store_fails_then_evicts_after_unlock()
 
             assert listener.stored == [[key1]]
             assert listener.deleted == []
+            before_eviction = adapter.report_status()["core"]["io_accounting"]
+            assert before_eviction["eviction_count"] == 0
+            assert before_eviction["eviction_logical_bytes"] == 0
 
             assert _run_store(adapter, [key2], [obj2]) is True
             assert listener.deleted == [[key1]]
@@ -633,6 +639,9 @@ def test_raw_block_l2_adapter_full_locked_store_fails_then_evicts_after_unlock()
             _, after_eviction = _run_lookup(adapter, [key1, key2])
             assert after_eviction is not None
             assert after_eviction.get_indices_list() == [1]
+            after_accounting = adapter.report_status()["core"]["io_accounting"]
+            assert after_accounting["eviction_count"] == 1
+            assert after_accounting["eviction_logical_bytes"] == obj1.get_size()
             adapter.submit_unlock([key1, key2])
         finally:
             adapter.close()
@@ -768,6 +777,8 @@ def test_raw_block_l2_adapter_duplicate_store_batch_counts_once():
             )
             assert accounting["store_committed_count"] == 1
             assert accounting["store_committed_logical_bytes"] == obj_a.get_size()
+            assert accounting["eviction_count"] == 0
+            assert accounting["eviction_logical_bytes"] == 0
             assert accounting["store_existing_hit_count"] == 2
             assert accounting["store_existing_hit_logical_bytes"] == (
                 2 * obj_a.get_size()

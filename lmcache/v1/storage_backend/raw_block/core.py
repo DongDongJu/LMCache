@@ -138,6 +138,9 @@ class RawBlockIoAccounting:
     store_committed_count: int = 0
     store_committed_logical_bytes: int = 0
 
+    eviction_count: int = 0
+    eviction_logical_bytes: int = 0
+
     data_write_logical_bytes: int = 0
     data_write_payload_physical_bytes: int = 0
     data_write_header_physical_bytes: int = 0
@@ -1627,6 +1630,8 @@ class RawBlockCore:
             self._lock_refcnt.pop(victim, None)
             self._append_free_slot_locked(self._offset_to_slot(int(entry.offset)))
             self._meta_dirty_total += 1
+            self._io_accounting.eviction_count += 1
+            self._io_accounting.eviction_logical_bytes += int(entry.size)
             return victim, int(entry.size)
         return None
 
