@@ -867,13 +867,17 @@ def resolve_plan(args: argparse.Namespace, manifest: dict[str, Any]) -> dict[str
     else:
         target_host_write_bytes = None
 
-    iterations = args.iterations
-    if args.stop_policy == "total_written_size" and iterations is None:
+    estimated_iterations_for_target = None
+    if args.stop_policy == "total_written_size":
         target = int(target_host_write_bytes or 1)
-        iterations = max(
+        estimated_iterations_for_target = max(
             1,
             math.ceil(target / estimate_iteration_bytes(window_workloads)),
         )
+    iterations = args.iterations
+    runtime_iterations = iterations
+    if args.stop_policy == "total_written_size" and runtime_iterations is None:
+        runtime_iterations = estimated_iterations_for_target
 
     rng = random.Random(args.seed)
     warnings: list[str] = []
@@ -1003,7 +1007,7 @@ def resolve_plan(args: argparse.Namespace, manifest: dict[str, Any]) -> dict[str
 
     estimated_runtime = estimate_runtime_seconds(
         window_workloads,
-        iterations=iterations,
+        iterations=runtime_iterations,
         warmup_iterations=args.warmup_iterations,
         stop_policy=args.stop_policy,
         duration_seconds=args.duration_seconds,
@@ -1036,6 +1040,7 @@ def resolve_plan(args: argparse.Namespace, manifest: dict[str, Any]) -> dict[str
         "stop_policy": args.stop_policy,
         "duration_seconds": args.duration_seconds,
         "iterations": iterations,
+        "estimated_iterations_for_target": estimated_iterations_for_target,
         "warmup_iterations": args.warmup_iterations,
         "target_host_write_bytes": target_host_write_bytes,
         "target_host_write_multiplier": args.target_host_write_multiplier,
@@ -1458,7 +1463,6 @@ def run_plan(plan: dict[str, Any], output_dir: str) -> dict[str, Any]:
         media_measurement_start = capture_media_write_bytes(
             plan.get("media_write_counter_command")
         )
-        max_iterations = int(plan["iterations"] or 1)
         last_counter_check = 0.0
         latest_host_write_bytes: int | None = measurement_start
         latest_end_condition_bytes: int | None = None
@@ -1496,8 +1500,21 @@ def run_plan(plan: dict[str, Any], output_dir: str) -> dict[str, Any]:
                 and latest_end_condition_bytes >= plan["target_host_write_bytes"]
             )
 
-        for iteration in range(max_iterations):
+        iteration = 0
+        while True:
             if stop_requested:
+                break
+            if plan["stop_policy"] == "iterations" and iteration >= int(
+                plan["iterations"]
+            ):
+                break
+            if (
+                plan["stop_policy"] == "total_written_size"
+                and plan["iterations"] is not None
+                and iteration >= int(plan["iterations"])
+            ):
+                break
+            if plan["stop_policy"] == "timeout" and iteration > 0:
                 break
             timeout = (
                 plan["duration_seconds"] if plan["stop_policy"] == "timeout" else None
@@ -1532,6 +1549,7 @@ def run_plan(plan: dict[str, Any], output_dir: str) -> dict[str, Any]:
                 and latest_end_condition_bytes >= plan["target_host_write_bytes"]
             ):
                 break
+            iteration += 1
         after = capture_host_write_bytes(plan["block_device_path"])
         media_after = capture_media_write_bytes(plan.get("media_write_counter_command"))
     finally:

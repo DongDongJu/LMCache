@@ -95,7 +95,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         slot_bytes: int,
         capacity_bytes: int = 0,
         base_offset_bytes: int = 0,
-        use_odirect: bool = True,
+        use_odirect: bool = False,
         use_uring: bool = False,
         use_uring_cmd: bool = False,
         use_fdp: bool = False,
@@ -280,7 +280,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             slot_bytes=slot_bytes,
             capacity_bytes=capacity_bytes,
             base_offset_bytes=base_offset_bytes,
-            use_odirect=bool(d.get("use_odirect", not use_uring_cmd)),
+            use_odirect=bool(d.get("use_odirect", False)),
             use_uring=use_uring,
             use_uring_cmd=use_uring_cmd,
             use_fdp=use_fdp,
@@ -318,7 +318,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "- base_offset_bytes (int): byte offset where this raw-block "
             "window starts (default 0)\n"
             "- use_odirect (bool): enable O_DIRECT raw I/O "
-            "(default true, false for use_uring_cmd)\n"
+            "(default false)\n"
             "- use_uring (bool): enable Rust io_uring I/O (default false)\n"
             "- use_uring_cmd (bool): enable NVMe io_uring_cmd path "
             "(default false, requires use_uring)\n"

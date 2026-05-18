@@ -594,3 +594,55 @@ def test_run_plan_total_written_size_stops_on_lmcache_actual_written_bytes(
     assert summary["total_written_size_end_condition_bytes"] == 4_000
     assert summary["total_written_size_target_bytes"] == 3_000
     assert summary["total_written_size_target_reached"] is True
+
+
+def test_run_plan_total_written_size_auto_iterations_do_not_cap_target(
+    monkeypatch,
+    tmp_path,
+):
+    args, manifest = _args(
+        tmp_path,
+        "--stop-policy",
+        "total_written_size",
+        "--target-host-write-bytes",
+        "3000",
+    )
+    args.iterations = None
+    monkeypatch.setattr(multiwin, "validate_ng_device_path", lambda *a, **k: None)
+    plan = multiwin.resolve_plan(args, manifest)
+    assert plan["iterations"] is None
+    assert plan["estimated_iterations_for_target"] == 1
+
+    monkeypatch.setattr(multiwin, "capture_host_write_bytes", lambda _path: 0)
+    monkeypatch.setattr(multiwin, "capture_media_write_bytes", lambda _command: None)
+    iterations = []
+
+    def fake_run_iteration(
+        plan,
+        *,
+        iteration,
+        timeout_seconds,
+        stop_check=None,
+    ):
+        del plan, timeout_seconds, stop_check
+        iterations.append(iteration)
+        return [
+            {
+                "window_index": 0,
+                "iteration": iteration,
+                "exit_code": 0,
+                "log_path": "worker.log",
+                "jsonl_out": "records.jsonl",
+                "failed_records": 0,
+                "io_accounting": {"total_write_physical_bytes": 500},
+                "ended_at": "now",
+            }
+        ]
+
+    monkeypatch.setattr(multiwin, "run_iteration", fake_run_iteration)
+
+    summary = multiwin.run_plan(plan, str(tmp_path / "run"))
+
+    assert iterations == [0, 1, 2, 3, 4, 5]
+    assert summary["total_written_size_end_condition_bytes"] == 3_000
+    assert summary["total_written_size_target_reached"] is True

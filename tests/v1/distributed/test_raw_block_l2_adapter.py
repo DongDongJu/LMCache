@@ -203,6 +203,15 @@ def _run_store(adapter: RawBlockL2Adapter, keys, objects) -> bool:
 
 
 def test_raw_block_l2_adapter_config_parses_uring_flags():
+    default_cfg = RawBlockL2AdapterConfig.from_dict(
+        {
+            "type": "raw_block",
+            "device_path": "/tmp/raw-block-dev",
+            "slot_bytes": 64 * 1024,
+        }
+    )
+    assert default_cfg.use_odirect is False
+
     cfg = RawBlockL2AdapterConfig.from_dict(
         {
             "type": "raw_block",
