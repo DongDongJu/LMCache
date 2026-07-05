@@ -250,6 +250,8 @@ class MessageQueueClient:
         self.is_finished.set()
         self.worker_thread.join()
         self.socket.close()
+        self.task_notifier.close()
+        self.task_waiter.close()
 
 
 ResponseType = TypeVar("ResponseType", covariant=True)

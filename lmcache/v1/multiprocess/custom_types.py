@@ -124,6 +124,45 @@ class CudaIPCWrapper:
         return pickle.loads(data)
 
 
+# Raw CUDA IPC mappings opened by RawCudaIPCWrapper.to_tensor, keyed by the
+# imported view pointer (allocation base + suballocation offset) and valued
+# by (device_index, mapped base pointer). Unlike torch's own IPC path, raw
+# mappings are not reference-counted by anyone: they must be closed
+# explicitly when a KV cache is unregistered. A leaked mapping is not just
+# wasted address space — if the exporting engine frees the buffer and a
+# later registration reuses the same allocation, the identical IPC handle
+# silently resolves to the stale mapping and the server reads/writes freed
+# memory.
+_OPEN_RAW_IPC_MAPPINGS: dict[int, tuple[int, int]] = {}
+
+
+def close_raw_ipc_mapping(view_ptr: int) -> None:
+    """Close a raw CUDA IPC mapping previously opened by ``to_tensor``.
+
+    No-op for pointers not opened via ``RawCudaIPCWrapper`` (e.g. torch's
+    reference-counted IPC path).
+    """
+    entry = _OPEN_RAW_IPC_MAPPINGS.pop(view_ptr, None)
+    if entry is None:
+        return
+    device_index, base_ptr = entry
+    # Third Party
+    import cupy
+
+    try:
+        # Third Party
+        from cuda.bindings import runtime as cudart
+    except ImportError:
+        # Third Party
+        from cuda import cudart
+
+    with cupy.cuda.Device(device_index):
+        cudart.cudaDeviceSynchronize()
+        (err,) = cudart.cudaIpcCloseMemHandle(base_ptr)
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaIpcCloseMemHandle failed: {err}")
+
+
 class RawCudaIPCWrapper(CudaIPCWrapper):
     """IPC wrapper for CUDA tensors allocated outside PyTorch's caching
     allocator.
@@ -157,16 +196,43 @@ class RawCudaIPCWrapper(CudaIPCWrapper):
             # Third Party
             from cuda import cudart
 
+        # Third Party
+        import cupy
+
+        try:
+            # Third Party
+            from cuda.bindings import driver as cuda_driver
+        except ImportError:
+            # Third Party
+            from cuda import cuda as cuda_driver
+
+        # Both calls need the tensor's own device context current —
+        # cuMemGetAddressRange returns CUDA_ERROR_NOT_FOUND for pointers
+        # owned by another device's context (seen with TP>1 shards).
         data_ptr = tensor.data_ptr()
-        err, ipc_handle = cudart.cudaIpcGetMemHandle(data_ptr)
-        if err != cudart.cudaError_t.cudaSuccess:
-            raise RuntimeError(
-                f"cudaIpcGetMemHandle failed: {err} (ptr=0x{data_ptr:x})"
+        with cupy.cuda.Device(tensor.device.index):
+            err, ipc_handle = cudart.cudaIpcGetMemHandle(data_ptr)
+            if err != cudart.cudaError_t.cudaSuccess:
+                raise RuntimeError(
+                    f"cudaIpcGetMemHandle failed: {err} (ptr=0x{data_ptr:x})"
+                )
+
+            # cudaIpcGetMemHandle returns a handle for the whole allocation
+            # containing data_ptr, and the importer's cudaIpcOpenMemHandle
+            # returns the allocation BASE. Buffers suballocated from a
+            # larger pool (e.g. MAX's device memory pool) do not start at
+            # the base, so the offset must travel with the handle — without
+            # it the importer silently reads/writes the wrong pool region.
+            err_drv, alloc_base, _alloc_size = cuda_driver.cuMemGetAddressRange(
+                data_ptr
             )
+            if int(err_drv) != 0:
+                raise RuntimeError(f"cuMemGetAddressRange failed: {err_drv}")
 
         # Store only what's needed for reconstruction.
         self._ipc_handle_reserved = bytes(ipc_handle.reserved)
         self._nbytes = tensor.untyped_storage().nbytes()
+        self._base_offset = int(data_ptr) - int(alloc_base)
 
         # CudaIPCWrapper interface fields. ``handle`` is unused —
         # ``to_tensor`` is overridden to bypass it — but kept for
@@ -194,21 +260,32 @@ class RawCudaIPCWrapper(CudaIPCWrapper):
 
         device_index = CudaIPCWrapper._get_device_index_from_uuid(self.device_uuid)
 
-        handle = cudart.cudaIpcMemHandle_t()
-        handle.reserved = self._ipc_handle_reserved
-        err, ptr = cudart.cudaIpcOpenMemHandle(
-            handle, cudart.cudaIpcMemLazyEnablePeerAccess
-        )
-        if err != cudart.cudaError_t.cudaSuccess:
-            raise RuntimeError(f"cudaIpcOpenMemHandle failed: {err}")
-
-        # Wrap as a flat ``uint8`` CuPy array, DLPack to torch, then view
-        # as the original dtype/shape. ``uint8`` avoids dtype-conversion
-        # gaps (bfloat16, fp8 have no direct CuPy/NumPy equivalent without
-        # ml_dtypes).
+        # The IPC mapping must be created in the owning device's context:
+        # opening under another device maps the pointer into that device's
+        # context instead, and kernels on the owning device's stream stall
+        # forever when they touch it (observed with TP>1 shards).
         with cupy.cuda.Device(device_index):
-            mem = cupy.cuda.UnownedMemory(ptr, self._nbytes, owner=self)
-            memptr = cupy.cuda.MemoryPointer(mem, 0)
+            handle = cudart.cudaIpcMemHandle_t()
+            handle.reserved = self._ipc_handle_reserved
+            err, ptr = cudart.cudaIpcOpenMemHandle(
+                handle, cudart.cudaIpcMemLazyEnablePeerAccess
+            )
+            if err != cudart.cudaError_t.cudaSuccess:
+                raise RuntimeError(f"cudaIpcOpenMemHandle failed: {err}")
+            # Older pickled wrappers predate _base_offset.
+            offset = int(getattr(self, "_base_offset", 0))
+            _OPEN_RAW_IPC_MAPPINGS[int(ptr) + offset] = (
+                device_index,
+                int(ptr),
+            )
+
+            # Wrap as a flat ``uint8`` CuPy array, DLPack to torch, then view
+            # as the original dtype/shape. ``uint8`` avoids dtype-conversion
+            # gaps (bfloat16, fp8 have no direct CuPy/NumPy equivalent without
+            # ml_dtypes). The view starts at the suballocation offset within
+            # the imported base allocation.
+            mem = cupy.cuda.UnownedMemory(ptr, offset + self._nbytes, owner=self)
+            memptr = cupy.cuda.MemoryPointer(mem, offset)
             cp_flat = cupy.ndarray(self._nbytes, dtype=cupy.uint8, memptr=memptr)
 
         raw = torch.from_dlpack(cp_flat)
@@ -240,15 +317,6 @@ class DeviceBufferDescriptor:
     storage_offset_bytes: int
     layout_format: str
     layout_hints: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class DeviceEventDescriptor:
-    """Backend-neutral event descriptor for future async synchronization."""
-
-    backend: str
-    handle_type: str
-    handle: bytes | object | None
 
 
 class DeviceBufferImporter:

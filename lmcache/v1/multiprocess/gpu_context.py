@@ -37,6 +37,7 @@ from lmcache.v1.multiprocess.custom_types import (
     DeviceBufferDescriptor,
     DeviceBufferImporter,
     KVCache,
+    close_raw_ipc_mapping,
 )
 
 # Backend selection (c_ops when CUDA is available, otherwise a pure-Python
@@ -85,6 +86,9 @@ class GPUCacheContext:
         engine_type: EngineType = EngineType.VLLM,
     ):
         unwrapped = unwrap_kv_cache_tensors(kv_caches)
+        # Base pointers of the imported buffers; raw CUDA IPC mappings must
+        # be closed when this context is dropped (see close_ipc_mappings).
+        self.ipc_base_ptrs_ = [int(t.data_ptr()) for t in unwrapped]
         self.gpu_kv_format_, self.kv_caches_ = normalize_kv_and_discover_format(
             unwrapped,
             engine_type,
@@ -379,6 +383,17 @@ class GPUCacheContext:
             numels = self.get_kv_buffer_shape(1, group_idx).numel()
             total += numels * group.dtype.itemsize
         return total
+
+    def close_ipc_mappings(self) -> None:
+        """Close raw CUDA IPC mappings imported for this context.
+
+        Must be called when the context is unregistered. A leaked mapping
+        silently aliases stale memory once the exporting engine frees and a
+        later registration reuses the same device allocation.
+        """
+        for base_ptr in self.ipc_base_ptrs_:
+            close_raw_ipc_mapping(base_ptr)
+        self.ipc_base_ptrs_ = []
 
 
 class PlainGPUCacheContext:

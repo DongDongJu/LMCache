@@ -270,8 +270,8 @@ __global__ void multi_layer_block_transfer_kernel(
     case GPUKVFormat::NB_NL_TWO_NH_BS_HS:                           \
       LAUNCH_KERNEL(DIRECTION, GPUKVFormat::NB_NL_TWO_NH_BS_HS);    \
       break;                                                        \
-    case GPUKVFormat::NB_KV_NL_BS_NH_HS:                             \
-      LAUNCH_KERNEL(DIRECTION, GPUKVFormat::NB_KV_NL_BS_NH_HS);      \
+    case GPUKVFormat::NB_KV_NL_BS_NH_HS:                            \
+      LAUNCH_KERNEL(DIRECTION, GPUKVFormat::NB_KV_NL_BS_NH_HS);     \
       break;                                                        \
     default:                                                        \
       TORCH_CHECK(false, "Unsupported GPUKVFormat: ",               \

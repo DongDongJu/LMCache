@@ -235,6 +235,12 @@ class MPCacheEngine:
             layout_hints: See :class:`LayoutHints`.  Forwarded to
                 :class:`GPUCacheContext` for GPU KV format detection.
         """
+        if instance_id in self.gpu_contexts:
+            logger.warning(
+                "Re-registering KV cache for GPU ID %d; closing previous IPC mappings",
+                instance_id,
+            )
+            self.gpu_contexts.pop(instance_id).close_ipc_mappings()
         gpu_context = GPUCacheContext(
             kv_caches,
             self.chunk_size,
@@ -257,8 +263,9 @@ class MPCacheEngine:
             instance_id (int): The GPU instance ID (such as PID).
         """
         if instance_id in self.gpu_contexts:
-            del self.gpu_contexts[instance_id]
+            gpu_context = self.gpu_contexts.pop(instance_id)
             del self.gpu_context_meta[instance_id]
+            gpu_context.close_ipc_mappings()
             logger.info("Unregistered KV cache for GPU ID %d", instance_id)
             torch.cuda.empty_cache()
         else:

@@ -537,9 +537,8 @@ def get_num_blocks(
     if gpu_kv_format in (
         lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS,
         lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS,
+        lmc_ops.GPUKVFormat.NB_KV_NL_BS_NH_HS,
     ):
-        return kv_caches.shape[0]
-    elif gpu_kv_format == lmc_ops.GPUKVFormat.NB_KV_NL_BS_NH_HS:
         return kv_caches.shape[0]
     elif gpu_kv_format in (
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
