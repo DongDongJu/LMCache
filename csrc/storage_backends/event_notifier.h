@@ -2,7 +2,7 @@
 #pragma once
 
 // Cross-platform event notification abstraction (C++ mirror of
-// lmcache/v1/platform/event_notifier.py). Provides a unified
+// lmcache/platform/event_notifier.py). Provides a unified
 // EventNotifier interface for signaling between threads using a
 // poll-able file descriptor.
 //

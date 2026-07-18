@@ -17,25 +17,25 @@ import zmq
 from lmcache import torch_dev
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
 from lmcache.integration.vllm.utils import vllm_layout_hints
-from lmcache.utils import _lmcache_nvtx_annotate, init_logger
-from lmcache.v1.multiprocess.custom_types import (
+from lmcache.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheServerKey,
     KVCache,
 )
-from lmcache.v1.multiprocess.group_view import (
+from lmcache.multiprocess.group_view import (
     EngineGroupInfo,
     expand_engine_block_ids,
 )
-from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
-from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
-from lmcache.v1.multiprocess.transfer_context import (
+from lmcache.multiprocess.mq import MessageQueueClient, MessagingFuture
+from lmcache.multiprocess.protocol import RequestType, get_response_class
+from lmcache.multiprocess.transfer_context import (
     EngineDrivenTransferContext,
     TransferContext,
     create_transfer_context,
 )
-from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSummary
-from lmcache.v1.platform import _registry as platform_registry
+from lmcache.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSummary
+from lmcache.platform import _registry as platform_registry
+from lmcache.utils import _lmcache_nvtx_annotate, init_logger
 
 logger = init_logger(__name__)
 
@@ -175,7 +175,7 @@ def _release_partial_kv_wrappers(wrappers: list[Any]) -> None:
     are silently skipped.
     """
     # First Party
-    from lmcache.v1.multiprocess.posix_shm import shm_unlink
+    from lmcache.multiprocess.posix_shm import shm_unlink
 
     for w in wrappers:
         name = getattr(w, "shm_name", None)
@@ -191,7 +191,7 @@ def wrap_one_kv_cache(tensor: torch.Tensor) -> Any:
     """Dispatch by ``tensor.device.type`` via the platform registry.
 
     Concrete factories are auto-discovered from
-    ``DeviceIPCWrapper`` subclasses under ``lmcache.v1.platform``, so
+    ``DeviceIPCWrapper`` subclasses under ``lmcache.platform``, so
     this call site stays free of if/elif chains and new accelerators
     plug in by shipping a sibling wrapper class.
     """

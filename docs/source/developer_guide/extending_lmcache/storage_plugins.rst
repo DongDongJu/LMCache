@@ -136,7 +136,7 @@ Plugin Contract
 
 A plugin adapter class **must**:
 
-1. Subclass ``L2AdapterInterface`` from ``lmcache.v1.distributed.l2_adapters.base``.
+1. Subclass ``L2AdapterInterface`` from ``lmcache.distributed.l2_adapters.base``.
 2. Implement all abstract methods: ``submit_store_task``, ``pop_completed_store_tasks``,
    ``submit_lookup_and_lock_task``, ``query_lookup_and_lock_result``, ``submit_unlock``,
    ``submit_load_task``, ``query_load_result``, ``close``, and all three event-fd getters.
@@ -149,7 +149,7 @@ A plugin adapter class **must**:
 A plugin adapter class **should**:
 
 1. Create its own asyncio event loop and background thread if it needs async I/O.
-2. Use ``create_event_notifier()`` from ``lmcache.v1.platform`` for the three event fds
+2. Use ``create_event_notifier()`` from ``lmcache.platform`` for the three event fds
    (cross-platform: ``os.eventfd`` on Linux, ``os.pipe`` fallback elsewhere).
 3. Clean up all resources (event fds, threads, connections) in ``close()``.
 
@@ -196,11 +196,11 @@ Minimal Example
     import threading
 
     from lmcache.native_storage_ops import Bitmap
-    from lmcache.v1.distributed.l2_adapters.base import (
+    from lmcache.distributed.l2_adapters.base import (
         L2AdapterInterface,
         L2TaskId,
     )
-    from lmcache.v1.platform import create_event_notifier
+    from lmcache.platform import create_event_notifier
 
 
     class MyL2Adapter(L2AdapterInterface):
@@ -242,7 +242,7 @@ See ``examples/lmc_external_l2_adapter/`` for a complete, pip-installable exampl
 Additional Resources
 ~~~~~~~~~~~~~~~~~~~~
 
-- Plugin adapter source: ``lmcache/v1/distributed/l2_adapters/plugin_l2_adapter.py``
-- Native plugin adapter: ``lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py``
-- Design document: ``lmcache/v1/distributed/l2_adapters/design_docs/plugin.md``
-- L2 adapter base interface: ``lmcache/v1/distributed/l2_adapters/base.py``
+- Plugin adapter source: ``lmcache/distributed/l2_adapters/plugin_l2_adapter.py``
+- Native plugin adapter: ``lmcache/distributed/l2_adapters/native_connector_l2_adapter.py``
+- Design document: ``lmcache/distributed/l2_adapters/design_docs/plugin.md``
+- L2 adapter base interface: ``lmcache/distributed/l2_adapters/base.py``

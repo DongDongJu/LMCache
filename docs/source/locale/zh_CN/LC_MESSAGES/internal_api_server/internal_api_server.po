@@ -91,11 +91,11 @@ msgstr "API 类别与路由发现"
 msgid ""
 "The server uses ``APIRegistry`` to automatically discover and register "
 "API endpoint modules. Any file named ``*_api.py`` under "
-"``lmcache/v1/internal_api_server/{common,vllm,controller}/`` that exports"
+"``lmcache/internal_api_server/{common,vllm,controller}/`` that exports"
 " a ``router = APIRouter()`` will be automatically included."
 msgstr ""
 "服务器使用 ``APIRegistry`` 自动发现和注册 API 端点模块。任何位于 "
-"``lmcache/v1/internal_api_server/{common,vllm,controller}/`` 下并导出 "
+"``lmcache/internal_api_server/{common,vllm,controller}/`` 下并导出 "
 "``router = APIRouter()`` 的文件，名称以 ``*_api.py`` 结尾，将会被自动包含。"
 
 #: ../../source/internal_api_server/internal_api_server.rst:75

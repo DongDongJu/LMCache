@@ -13,6 +13,20 @@ import pytest
 import torch
 
 # First Party
+from lmcache.config import LMCacheEngineConfig
+from lmcache.distributed.config import (
+    EvictionConfig,
+    GdsL1Config,
+    L1ManagerConfig,
+    L1MemoryManagerConfig,
+    StorageManagerConfig,
+)
+from lmcache.distributed.l2_adapters.config import (
+    L2AdaptersConfig,
+    get_type_name_for_config,
+)
+from lmcache.metadata import LMCacheMetadata
+from lmcache.multiprocess.config import MPServerConfig
 from lmcache.usage_telemetry import (
     USAGE_SCHEMA_VERSION,
     ContinuousUsageContext,
@@ -26,20 +40,6 @@ from lmcache.usage_telemetry import (
     is_usage_tracking_enabled,
 )
 from lmcache.usage_telemetry.guard import swallow_telemetry_errors
-from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.distributed.config import (
-    EvictionConfig,
-    GdsL1Config,
-    L1ManagerConfig,
-    L1MemoryManagerConfig,
-    StorageManagerConfig,
-)
-from lmcache.v1.distributed.l2_adapters.config import (
-    L2AdaptersConfig,
-    get_type_name_for_config,
-)
-from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.multiprocess.config import MPServerConfig
 
 
 class RecordingSender(UsageMessageSender):
@@ -330,11 +330,11 @@ class TestMPUsage:
         # The FS adapter needs the native storage ops extension; skip on
         # builds without it.
         fs_l2_adapter = pytest.importorskip(
-            "lmcache.v1.distributed.l2_adapters.fs_l2_adapter",
+            "lmcache.distributed.l2_adapters.fs_l2_adapter",
             reason="requires lmcache.native_storage_ops",
         )
         serde = pytest.importorskip(
-            "lmcache.v1.distributed.serde",
+            "lmcache.distributed.serde",
             reason="requires lmcache.native_storage_ops",
         )
         fs_config = fs_l2_adapter.FSL2AdapterConfig(

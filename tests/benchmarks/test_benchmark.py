@@ -13,17 +13,17 @@ import pytest
 import torch
 
 # First Party
+from lmcache.cache_engine import LMCacheEngineBuilder
+from lmcache.config import LMCacheEngineConfig
 from lmcache.utils import mock_up_broadcast_fn, mock_up_broadcast_object_fn
-from lmcache.v1.cache_engine import LMCacheEngineBuilder
-from lmcache.v1.config import LMCacheEngineConfig
-from tests.v1.utils import (
+from tests.utils import (
     create_gpu_connector,
     dumb_metadata,
     generate_kv_cache_paged_list_tensors,
     generate_tokens,
 )
 
-# Optional override for tempfile root; see tests/v1/test_cache_engine.py
+# Optional override for tempfile root; see tests/test_cache_engine.py
 # for rationale.
 _TEST_TMPDIR = os.environ.get("LMCACHE_TEST_TMPDIR") or None
 

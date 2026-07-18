@@ -8,8 +8,8 @@ from __future__ import annotations
 import torch
 
 # First Party
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
-from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContext
+from lmcache.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.multiprocess.transfer_context.base import EngineDrivenContext
 
 
 class ContiguousTransferWrapper:

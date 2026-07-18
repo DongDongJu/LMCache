@@ -1302,10 +1302,10 @@ msgstr "``HS`` —— 注意力头大小（以元素为单位）。"
 msgid ""
 "``dtype`` -- element dtype (e.g. ``float16``, ``bfloat16``, ``float32``, "
 "``uint8``). The full set matches the keys of ``DTYPE_MAP`` in "
-"``lmcache/v1/kv_layer_groups.py``."
+"``lmcache/kv_layer_groups.py``."
 msgstr ""
 "``dtype`` —— 元素数据类型（例如 ``float16``\\ 、\\ ``bfloat16``\\ 、\\ ``float32``\\"
-" 、\\ ``uint8``\\ ），完整集合与 ``lmcache/v1/kv_layer_groups.py`` 中 "
+" 、\\ ``uint8``\\ ），完整集合与 ``lmcache/kv_layer_groups.py`` 中 "
 "``DTYPE_MAP`` 的键一致。"
 
 #: ../../source/cli/bench.rst:840
@@ -1327,10 +1327,10 @@ msgstr "所有组必须共享相同的 ``NB`` 和 ``BS``\\ （这是分页 KV �
 
 #: ../../source/cli/bench.rst:855
 msgid ""
-"See ``parse_kvcache_shape_spec`` in ``lmcache/v1/kv_layer_groups.py`` for"
+"See ``parse_kvcache_shape_spec`` in ``lmcache/kv_layer_groups.py`` for"
 " the authoritative parsing rules and validation errors."
 msgstr ""
-"完整的解析规则和验证错误说明请参阅 ``lmcache/v1/kv_layer_groups.py`` 中的 "
+"完整的解析规则和验证错误说明请参阅 ``lmcache/kv_layer_groups.py`` 中的 "
 "``parse_kvcache_shape_spec``\\ 。"
 
 #: ../../source/cli/bench.rst:862
@@ -1756,13 +1756,13 @@ msgstr "适配器 JSON 规范"
 #: ../../source/cli/bench.rst:1192
 msgid ""
 "The ``--l2-adapter`` JSON is parsed by "
-"``lmcache.v1.distributed.l2_adapters.config.parse_args_to_l2_adapters_config``,"
+"``lmcache.distributed.l2_adapters.config.parse_args_to_l2_adapters_config``,"
 " the same entry point LMCache uses everywhere else. The minimum required "
 "field is ``type``; all remaining fields are forwarded to the adapter "
 "implementation as keyword arguments."
 msgstr ""
 "``--l2-adapter`` JSON 由 "
-"``lmcache.v1.distributed.l2_adapters.config.parse_args_to_l2_adapters_config``"
+"``lmcache.distributed.l2_adapters.config.parse_args_to_l2_adapters_config``"
 " 解析，这也是 LMCache 在其他地方使用的同一入口点。最小必填字段为 ``type``\\ ，其余字段均以关键字参数形式转发给适配器实现。"
 
 #: ../../source/cli/bench.rst:1198
@@ -1771,9 +1771,9 @@ msgstr "本地文件系统适配器示例："
 
 #: ../../source/cli/bench.rst:1210
 msgid ""
-"See the source under ``lmcache/v1/distributed/l2_adapters/`` for the full"
+"See the source under ``lmcache/distributed/l2_adapters/`` for the full"
 " list of adapter types and their accepted fields."
-msgstr "适配器类型及其支持字段的完整列表，请参阅 ``lmcache/v1/distributed/l2_adapters/`` 目录下的源代码。"
+msgstr "适配器类型及其支持字段的完整列表，请参阅 ``lmcache/distributed/l2_adapters/`` 目录下的源代码。"
 
 #: ../../source/cli/bench.rst:1215
 msgid "Example output"

@@ -47,7 +47,7 @@ LMCache ships two server entry points:
      - Description
    * - ``lmcache server``
      - **Recommended.** ZMQ + FastAPI HTTP frontend — see :doc:`http_api`.
-   * - ``python3 -m lmcache.v1.multiprocess.server``
+   * - ``python3 -m lmcache.multiprocess.server``
      - (Legacy) ZMQ-only server with no HTTP endpoints; same
        ``--engine-type`` / ``--supported-transfer-mode`` flags as
        ``lmcache server``. Prefer ``lmcache server``.
@@ -348,7 +348,7 @@ Distributed Storage
 StorageManager
 ~~~~~~~~~~~~~~
 
-``lmcache/v1/distributed/storage_manager.py``
+``lmcache/distributed/storage_manager.py``
 
 The top-level manager that wires together L1, L2, and all controllers.  Key
 methods:
@@ -368,7 +368,7 @@ methods:
 L1Manager
 ~~~~~~~~~
 
-``lmcache/v1/distributed/l1_manager.py``
+``lmcache/distributed/l1_manager.py``
 
 Manages objects in CPU memory with a state machine:
 
@@ -400,7 +400,7 @@ tiers selected at startup (both satisfy ``L1ManagerProtocol``):
 L2 Adapters
 ~~~~~~~~~~~
 
-``lmcache/v1/distributed/l2_adapters/``
+``lmcache/distributed/l2_adapters/``
 
 The ``L2AdapterInterface`` (in ``base.py``) defines three async task methods:
 
@@ -494,14 +494,14 @@ RETRIEVE Flow
 Observability Internals
 -----------------------
 
-**EventBus** (``lmcache/v1/mp_observability/event_bus.py``) is a global
+**EventBus** (``lmcache/mp_observability/event_bus.py``) is a global
 singleton initialized at server startup by ``init_observability()``.
 Producers (L1Manager, StorageManager, MPCacheServer) publish ``Event``
 objects to a bounded queue (``--event-bus-queue-size``, default 10000,
 tail-drop on overflow).  A background drain thread dispatches each
 event to all registered subscribers.
 
-**Subscribers** live under ``lmcache/v1/mp_observability/subscribers/``
+**Subscribers** live under ``lmcache/mp_observability/subscribers/``
 and are grouped by concern: ``metrics/`` (OTel counters and lifecycle
 histograms), ``logging/`` (Python logging handlers, lookup-hash JSONL),
 and ``tracing/`` (OTel spans built from START/END event pairs).
@@ -522,7 +522,7 @@ Adding a new L2 adapter
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
 Create a new ``*_l2_adapter.py`` module under
-``lmcache/v1/distributed/l2_adapters/`` — ``__init__.py`` auto-discovers
+``lmcache/distributed/l2_adapters/`` — ``__init__.py`` auto-discovers
 modules matching that suffix via ``pkgutil`` and imports them lazily on
 first use, so no other files need to be modified.
 
@@ -545,7 +545,7 @@ Adding an observability subscriber
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 1. Create a subscriber class subclassing ``EventSubscriber`` (defined
-   in ``lmcache/v1/mp_observability/event_bus.py``): implement
+   in ``lmcache/mp_observability/event_bus.py``): implement
    ``get_subscriptions()`` to return an ``{EventType: callback}``
    mapping; optionally override ``shutdown()`` for cleanup.
 2. Place the class under the appropriate concern group
@@ -553,7 +553,7 @@ Adding an observability subscriber
    ``subscribers/tracing/``) and export it from that package's
    ``__init__.py``.
 3. Register the subscriber in ``init_observability()``
-   (``lmcache/v1/mp_observability/config.py``) via
+   (``lmcache/mp_observability/config.py``) via
    ``bus.register_subscriber(...)`` inside the branch matching its
    concern (metrics / logging / tracing), gated on the corresponding
    CLI flag if needed.
@@ -582,16 +582,16 @@ Key Source Files
 
    * - File
      - Purpose
-   * - ``lmcache/v1/multiprocess/server.py``
+   * - ``lmcache/multiprocess/server.py``
      - MPCacheServer + ZMQ server entry point
-   * - ``lmcache/v1/multiprocess/config.py``
+   * - ``lmcache/multiprocess/config.py``
      - MPServerConfig, HTTPFrontendConfig
-   * - ``lmcache/v1/multiprocess/engine_context.py``
+   * - ``lmcache/multiprocess/engine_context.py``
      - MPCacheServerContext (shared state passed to every EngineModule)
-   * - ``lmcache/v1/multiprocess/engine_module.py``
+   * - ``lmcache/multiprocess/engine_module.py``
      - ``EngineModule`` protocol, ``HandlerSpec``, ``ThreadPoolType``
        (per-module handler registration)
-   * - ``lmcache/v1/multiprocess/modules/``
+   * - ``lmcache/multiprocess/modules/``
      - Engine module implementations: ``lookup.py`` (``LookupModule``),
        ``management.py`` (``ManagementModule``), ``lmcache_driven_transfer.py``
        (``LMCacheDrivenTransferModule``), ``engine_driven_transfer.py``
@@ -600,43 +600,43 @@ Key Source Files
        ``--engine-type blend_legacy``), and ``blend_v3.py``
        (``BlendV3Module``, the paged-aware CacheBlend V3 pipeline
        selected by ``--engine-type blend``).
-   * - ``lmcache/v1/multiprocess/http_server.py``
+   * - ``lmcache/multiprocess/http_server.py``
      - FastAPI wrapper with health check and many other useful APIs
-   * - ``lmcache/v1/multiprocess/http_api_registry.py``
+   * - ``lmcache/multiprocess/http_api_registry.py``
      - ``HTTPAPIRegistry`` that auto-discovers routers in ``http_apis/``
-   * - ``lmcache/v1/multiprocess/http_apis/``
+   * - ``lmcache/multiprocess/http_apis/``
      - Extensible HTTP endpoints (``/``, ``/healthcheck``,
        ``/cache/clear``, ``/status``)
-   * - ``lmcache/v1/multiprocess/mp_runtime_plugin_launcher.py``
+   * - ``lmcache/multiprocess/mp_runtime_plugin_launcher.py``
      - ``MPRuntimePluginLauncher`` that spawns runtime plugins with the
        full server config serialized into environment variables
-   * - ``lmcache/v1/multiprocess/protocols/base.py``
+   * - ``lmcache/multiprocess/protocols/base.py``
      - RequestType, HandlerType, ProtocolDefinition
-   * - ``lmcache/v1/distributed/storage_manager.py``
+   * - ``lmcache/distributed/storage_manager.py``
      - StorageManager (top-level manager)
-   * - ``lmcache/v1/distributed/config.py``
+   * - ``lmcache/distributed/config.py``
      - StorageManagerConfig hierarchy
-   * - ``lmcache/v1/distributed/l1_manager.py``
+   * - ``lmcache/distributed/l1_manager.py``
      - L1Manager (object state machine)
-   * - ``lmcache/v1/distributed/l2_adapters/config.py``
+   * - ``lmcache/distributed/l2_adapters/config.py``
      - L2 adapter config registry
-   * - ``lmcache/v1/distributed/l2_adapters/base.py``
+   * - ``lmcache/distributed/l2_adapters/base.py``
      - L2AdapterInterface
-   * - ``lmcache/v1/distributed/storage_controllers/store_controller.py``
+   * - ``lmcache/distributed/storage_controllers/store_controller.py``
      - StoreController (event-driven L1->L2)
-   * - ``lmcache/v1/distributed/storage_controllers/eviction_controller.py``
+   * - ``lmcache/distributed/storage_controllers/eviction_controller.py``
      - EvictionController (watermark-triggered)
-   * - ``lmcache/v1/distributed/storage_controllers/prefetch_controller.py``
+   * - ``lmcache/distributed/storage_controllers/prefetch_controller.py``
      - PrefetchController (L2->L1 on miss)
-   * - ``lmcache/v1/mp_observability/config.py``
+   * - ``lmcache/mp_observability/config.py``
      - ObservabilityConfig + ``init_observability()`` entry point
-   * - ``lmcache/v1/mp_observability/event_bus.py``
+   * - ``lmcache/mp_observability/event_bus.py``
      - EventBus singleton and ``EventSubscriber`` base class
-   * - ``lmcache/v1/mp_observability/event.py``
+   * - ``lmcache/mp_observability/event.py``
      - ``Event`` / ``EventType`` definitions
-   * - ``lmcache/v1/mp_observability/otel_init.py``
+   * - ``lmcache/mp_observability/otel_init.py``
      - OTel metrics / tracing provider setup
-   * - ``lmcache/v1/mp_observability/subscribers/``
+   * - ``lmcache/mp_observability/subscribers/``
      - Metrics, logging, and tracing subscribers
-   * - ``lmcache/v1/mp_observability/trace/``
+   * - ``lmcache/mp_observability/trace/``
      - Trace recording (``--trace-level storage``) capture stack

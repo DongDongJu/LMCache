@@ -35,19 +35,19 @@ except ImportError as err:
     ) from err
 
 # First Party
+from lmcache.distributed.api import MemoryLayoutDesc
+from lmcache.distributed.config import L1MemoryManagerConfig
+from lmcache.distributed.error import L1Error
+from lmcache.distributed.memory_manager import L1MemoryManager
+from lmcache.distributed.transfer_channel import (
+    TransferChannelAddress,
+    delete_transfer_channel_context,
+    initialize_transfer_channel_context,
+)
 from lmcache.logging import init_logger
 from lmcache.tools.transfer_channel_benchmark.config import (
     BenchmarkConfig,
     build_config,
-)
-from lmcache.v1.distributed.api import MemoryLayoutDesc
-from lmcache.v1.distributed.config import L1MemoryManagerConfig
-from lmcache.v1.distributed.error import L1Error
-from lmcache.v1.distributed.memory_manager import L1MemoryManager
-from lmcache.v1.distributed.transfer_channel import (
-    TransferChannelAddress,
-    delete_transfer_channel_context,
-    initialize_transfer_channel_context,
 )
 
 logger = init_logger(__name__)

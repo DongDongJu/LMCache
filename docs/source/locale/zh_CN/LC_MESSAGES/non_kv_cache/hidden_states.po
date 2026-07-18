@@ -165,8 +165,8 @@ msgstr "**惰性耦合逐出检查。** KV 与 HS 之间不需要任何回调或
 #: ../../source/non_kv_cache/hidden_states.rst:114
 msgid ""
 "The full internal design (class layering, code paths, follow-up work) lives "
-"at :file:`docs/design/v1/hidden_state_store.md` in the source tree."
-msgstr "完整的内部设计（类的分层、代码路径、后续工作）位于源码树中的 :file:`docs/design/v1/hidden_state_store.md`。"
+"at :file:`docs/design/hidden_state_store.md` in the source tree."
+msgstr "完整的内部设计（类的分层、代码路径、后续工作）位于源码树中的 :file:`docs/design/hidden_state_store.md`。"
 
 #~ msgid "Hidden States"
 #~ msgstr "隐藏状态"

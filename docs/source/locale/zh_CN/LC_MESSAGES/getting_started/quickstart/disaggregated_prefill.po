@@ -238,10 +238,10 @@ msgstr "预填充实例将记录 KV Cache 传输的吞吐量："
 msgid ""
 "LMCache INFO: Store 5271 tokens takes: 6.5000 ms, throughput: 98.9889 "
 "GB/s; offload_time: 2.6594 ms, put_time: 3.4539 ms "
-"(cache_engine.py:190:lmcache.v1.cache_engine)"
+"(cache_engine.py:190:lmcache.cache_engine)"
 msgstr ""
 "LMCache 信息：存储 5271 个 token 耗时：6.5000 毫秒，吞吐量：98.9889 GB/s；卸载时间：2.6594 "
-"毫秒，放置时间：3.4539 毫秒 (cache_engine.py:190:lmcache.v1.cache_engine)"
+"毫秒，放置时间：3.4539 毫秒 (cache_engine.py:190:lmcache.cache_engine)"
 
 #: ../../source/getting_started/quickstart/disaggregated_prefill.rst:188
 msgid ""

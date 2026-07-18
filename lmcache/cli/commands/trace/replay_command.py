@@ -88,8 +88,8 @@ def add_replay_arguments(parser: argparse.ArgumentParser) -> None:
 
     try:
         # First Party
-        from lmcache.v1.distributed.config import add_storage_manager_args
-        from lmcache.v1.mp_observability.config import add_observability_args
+        from lmcache.distributed.config import add_storage_manager_args
+        from lmcache.mp_observability.config import add_observability_args
 
         add_storage_manager_args(parser)
         add_observability_args(parser)
@@ -117,9 +117,9 @@ def run_trace_replay(args: argparse.Namespace) -> None:
     """
     # First Party
     from lmcache.cli.commands.trace._driver import StorageReplayDriver
-    from lmcache.v1.distributed.config import StorageManagerConfig, parse_args_to_config
-    from lmcache.v1.mp_observability.config import parse_args_to_observability_config
-    from lmcache.v1.mp_observability.trace.reader import TraceReader
+    from lmcache.distributed.config import StorageManagerConfig, parse_args_to_config
+    from lmcache.mp_observability.config import parse_args_to_observability_config
+    from lmcache.mp_observability.trace.reader import TraceReader
 
     sm_config: StorageManagerConfig = parse_args_to_config(args)
 
@@ -314,7 +314,7 @@ def _short_op_name(qualname: str) -> str:
 
     Args:
         qualname: Dotted qualname recorded by the tracer, e.g.
-            ``lmcache.v1.distributed.storage_manager.StorageManager.read_prefetched_results.__enter__``.
+            ``lmcache.distributed.storage_manager.StorageManager.read_prefetched_results.__enter__``.
 
     Returns:
         A short label suitable as a metrics row prefix.

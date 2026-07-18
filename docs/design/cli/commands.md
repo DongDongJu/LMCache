@@ -4,7 +4,7 @@
 
 ## Why
 
-Today users must remember `python3 -m lmcache.v1.multiprocess.http_server ...` and
+Today users must remember `python3 -m lmcache.multiprocess.http_server ...` and
 similar module paths. We need a single `lmcache` command as the front door to all
 LMCache functionality.
 
@@ -38,7 +38,7 @@ All client commands use a `--url` flag pointing to the **LMCache HTTP server**
 
 ### `lmcache server`
 
-Replaces `python3 -m lmcache.v1.multiprocess.http_server`. Runs in foreground,
+Replaces `python3 -m lmcache.multiprocess.http_server`. Runs in foreground,
 Ctrl-C to stop. HTTP frontend is enabled by default; use `--no-http` to run
 ZMQ-only.
 
@@ -56,7 +56,7 @@ Server args are composed from existing helpers: `add_mp_server_args()`,
 
 ### `lmcache coordinator`
 
-Replaces `python3 -m lmcache.v1.mp_coordinator`. Runs the mp coordinator's
+Replaces `python3 -m lmcache.mp_coordinator`. Runs the mp coordinator's
 FastAPI/HTTP app in the foreground (Ctrl-C to stop). The coordinator tracks mp
 server instances in a registry and evicts those whose heartbeats lapse.
 
@@ -71,7 +71,7 @@ Config resolves from `MPCoordinatorConfig.from_env()` (the
 `LMCACHE_MP_COORDINATOR_*` environment variables); any CLI flag that is supplied
 overrides the corresponding field. Each flag defaults to unset so env-only
 deployments keep working. See
-[../v1/mp_coordinator/README.md](../v1/mp_coordinator/README.md).
+[../mp_coordinator/README.md](../mp_coordinator/README.md).
 
 ### `lmcache describe`
 
@@ -221,7 +221,7 @@ Resolved KV shape spec: (2,1024,16,8,128):float16:32
 
 With ``--end`` unset, the loop runs forever; stop with ``Ctrl-C``. The KV
 tensor layout is controlled by ``--kvcache-shape-spec`` (see
-``lmcache/v1/kv_layer_groups.py``); see :doc:`bench_server` in the user guide
+``lmcache/kv_layer_groups.py``); see :doc:`bench_server` in the user guide
 for the full flag list.
 
 **`bench l2`** -- store / lookup / load throughput benchmark against an
@@ -302,7 +302,7 @@ in `lmcache/cli/corpora/`.
 
 - **Auto-discovery (N-level):** Commands at all levels are discovered
   automatically via `discover_subclasses()` (in
-  `lmcache/v1/utils/subclass_discovery.py`). No manual registration is needed
+  `lmcache/utils/subclass_discovery.py`). No manual registration is needed
   — adding a new command at any depth is a single-file change.
   - **Leaf commands:** Inherit from `BaseCommand` directly.
   - **Command groups:** Inherit from `CompositeCommand(BaseCommand)`. Its
@@ -379,7 +379,7 @@ lmcache/cli/
 
 - **Entry point:** `lmcache = "lmcache.cli.main:main"` in `pyproject.toml`.
 - **Auto-discovery mechanism:** Powered by `discover_subclasses()` in
-  `lmcache/v1/utils/subclass_discovery.py`. Uses `pkgutil.iter_modules` to
+  `lmcache/utils/subclass_discovery.py`. Uses `pkgutil.iter_modules` to
   scan direct submodules, then `inspect.getmembers` to find concrete
   `BaseCommand` subclasses. Each subclass is yielded at most once.
 - **`CompositeCommand` pattern:** A `CompositeCommand` scans its own package

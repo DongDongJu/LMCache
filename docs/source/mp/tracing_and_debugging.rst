@@ -96,12 +96,12 @@ Before replaying, ``lmcache trace info`` prints a one-screen summary:
       sm_config_digest:     0f685d8a...
       total_records:        1318
       ops:
-        lmcache.v1.distributed.storage_manager.StorageManager.finish_read_prefetched: 133
-        lmcache.v1.distributed.storage_manager.StorageManager.finish_write: 349
-        lmcache.v1.distributed.storage_manager.StorageManager.read_prefetched_results.__enter__: 96
-        lmcache.v1.distributed.storage_manager.StorageManager.read_prefetched_results.__exit__: 96
-        lmcache.v1.distributed.storage_manager.StorageManager.reserve_write: 349
-        lmcache.v1.distributed.storage_manager.StorageManager.submit_prefetch_task: 295
+        lmcache.distributed.storage_manager.StorageManager.finish_read_prefetched: 133
+        lmcache.distributed.storage_manager.StorageManager.finish_write: 349
+        lmcache.distributed.storage_manager.StorageManager.read_prefetched_results.__enter__: 96
+        lmcache.distributed.storage_manager.StorageManager.read_prefetched_results.__exit__: 96
+        lmcache.distributed.storage_manager.StorageManager.reserve_write: 349
+        lmcache.distributed.storage_manager.StorageManager.submit_prefetch_task: 295
 
 Use this to sanity-check that the trace you intend to replay covers
 the expected operation mix and duration.
@@ -325,6 +325,6 @@ See Also
 
 - :ref:`trace-recording` — the short ``Trace Recording`` section in
   the Observability page focuses on the recording-side flags.
-- ``docs/design/v1/mp_observability/trace.md`` in the source tree —
+- ``docs/design/mp_observability/trace.md`` in the source tree —
   full design doc: architecture, replay dispatcher, context-manager
   pairing, stats collector, and test matrix.

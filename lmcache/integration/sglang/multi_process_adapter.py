@@ -28,15 +28,15 @@ from lmcache.integration.vllm.vllm_multi_process_adapter import (
     send_lmcache_request,
 )
 from lmcache.logging import init_logger
-from lmcache.utils import EngineType
-from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
-from lmcache.v1.multiprocess.custom_types import (
+from lmcache.mp_observability.errors import LMCacheTimeoutError
+from lmcache.multiprocess.custom_types import (
     IPCCacheServerKey,
     KVCache,
 )
-from lmcache.v1.multiprocess.mq import MessageQueueClient
-from lmcache.v1.multiprocess.protocol import RequestType
-from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
+from lmcache.multiprocess.mq import MessageQueueClient
+from lmcache.multiprocess.protocol import RequestType
+from lmcache.platform.cuda.ipc_wrapper import CudaIPCWrapper
+from lmcache.utils import EngineType
 
 logger = init_logger(__name__)
 

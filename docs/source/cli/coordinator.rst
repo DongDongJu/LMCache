@@ -6,7 +6,7 @@ standalone HTTP service that tracks the MP server instances in a deployment. MP
 servers register with it and send periodic heartbeats; the coordinator evicts
 any instance whose heartbeat lapses past ``--instance-timeout``.
 
-It replaces ``python -m lmcache.v1.mp_coordinator``. The process runs in the
+It replaces ``python -m lmcache.mp_coordinator``. The process runs in the
 foreground; stop it with ``Ctrl-C``.
 
 .. code-block:: bash

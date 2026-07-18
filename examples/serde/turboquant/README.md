@@ -27,7 +27,7 @@ the original dtype on prefetch.
 The pytest suite includes TurboQuant serde tests that exercise direct CUDA, MockL2, and filesystem-backed L2 round-trips without needing vLLM:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m pytest tests/v1/distributed/serde/test_turboquant.py -q -s
+CUDA_VISIBLE_DEVICES=0 python -m pytest tests/distributed/serde/test_turboquant.py -q -s
 ```
 
 ## Requirements
@@ -81,11 +81,11 @@ To disable serde for an adapter, omit the `serde` field.
 ## Adding a custom serde
 
 1. Implement `Serializer` and `Deserializer` from
-   `lmcache.v1.distributed.serde`
+   `lmcache.distributed.serde`
 2. Register a factory:
 
    ```python
-   from lmcache.v1.distributed.serde import (
+   from lmcache.distributed.serde import (
        AsyncSerdeProcessor,
        register_serde_factory,
    )

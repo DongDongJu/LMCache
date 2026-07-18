@@ -112,7 +112,7 @@ A full docstring must include:
   - A clear, documented meaning
   - A clear invariant (at any point in time, a developer should know what the value should be without running the code)
   - A docstring or inline comment explaining it
-- **Private members must never be directly accessed by other classes.** Interact only through public APIs. This is enforced by CI in `lmcache/v1/multiprocess/` and `lmcache/v1/distributed/`, but applies project-wide.
+- **Private members must never be directly accessed by other classes.** Interact only through public APIs. This is enforced by CI in `lmcache/multiprocess/` and `lmcache/distributed/`, but applies project-wide.
 - Prefer `@property` that derives from existing data over storing redundant fields.
 
 ### 4.5 Config and Dispatch
@@ -129,8 +129,8 @@ A full docstring must include:
 - **A design doc is required** for non-trivial new features or architectural changes.
 - **`docs/design/` mirrors the `lmcache/` package tree.** A design doc for code at
   `lmcache/<path>/` lives at `docs/design/<path>/`. For example, design docs for
-  `lmcache/v1/distributed/l2_adapters/` go under
-  `docs/design/v1/distributed/l2_adapters/`. A doc that spans several sibling
+  `lmcache/distributed/l2_adapters/` go under
+  `docs/design/distributed/l2_adapters/`. A doc that spans several sibling
   submodules belongs at their common parent directory.
 - Use descriptive file names (e.g., `overall.md`, `l2_eviction.md`, `query-command.md`)
   rather than mirroring module file names. See `docs/design/README.md` for the full
@@ -223,7 +223,7 @@ import os
 import torch
 
 # First Party
-from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.config import LMCacheEngineConfig
 
 # Local
 from .utils import helper

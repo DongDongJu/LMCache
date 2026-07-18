@@ -19,10 +19,10 @@ from typing import Callable
 import time
 
 # First Party
+from lmcache.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.distributed.internal_api import L2StoreResult
+from lmcache.memory_management import MemoryObj
 from lmcache.native_storage_ops import Bitmap
-from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
-from lmcache.v1.distributed.internal_api import L2StoreResult
-from lmcache.v1.memory_management import MemoryObj
 
 # Local
 from .data import wait_eventfd

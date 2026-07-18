@@ -32,7 +32,7 @@ The CLI accepts ``--host``, ``--port``, ``--instance-timeout``,
 any flag overrides the matching environment variable below. See
 :doc:`/cli/coordinator` for details.
 Equivalently, the coordinator can still be launched as a module with
-``python3 -m lmcache.v1.mp_coordinator``.
+``python3 -m lmcache.mp_coordinator``.
 
 Configuration
 -------------
@@ -173,7 +173,7 @@ The coordinator's HTTP surface (base URL ``http://localhost:9300``) groups into:
 
 Each endpoint is documented below. Success is ``200`` unless noted, and
 ``{cache_salt}`` uses the ``_default`` sentinel for the empty salt. The wire
-types live in ``lmcache/v1/mp_coordinator/schemas.py``.
+types live in ``lmcache/mp_coordinator/schemas.py``.
 
 Fleet membership and health
 ---------------------------

@@ -202,8 +202,8 @@ msgstr ""
 #: ../../source/non_kv_cache/encoder_cache.rst:110
 msgid ""
 "The full internal design (class layering, code paths, follow-up work) "
-"lives at :file:`docs/design/v1/encoder-cache.md` in the source tree."
-msgstr "完整的内部设计（类层次、代码路径、后续工作）位于源代码树中的 :file:`docs/design/v1/encoder-cache.md`。"
+"lives at :file:`docs/design/encoder-cache.md` in the source tree."
+msgstr "完整的内部设计（类层次、代码路径、后续工作）位于源代码树中的 :file:`docs/design/encoder-cache.md`。"
 
 #: ../../source/non_kv_cache/encoder_cache.rst:114
 msgid "Benchmark"

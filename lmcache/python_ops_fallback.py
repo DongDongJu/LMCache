@@ -22,7 +22,7 @@ import torch
 # First Party
 from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
-from lmcache.v1.platform import current_device_spec
+from lmcache.platform import current_device_spec
 
 # Store the tensor objects in memory so that they can be accessed
 # outside the scope of this file

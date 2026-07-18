@@ -38,7 +38,7 @@ print("torch.xpu.is_available() = True")
 PY
 
 log "running XPU smoke tests"
-pytest -q tests/test_serde.py tests/v1/test_python_ops_fallback.py \
+pytest -q tests/test_serde.py tests/test_python_ops_fallback.py \
   -k "${TEST_SELECTOR}" --maxfail=1
 
 log "xpu smoke test finished successfully"

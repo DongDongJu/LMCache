@@ -5,7 +5,7 @@ multiprocess (MP) mode.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                 lmcache/v1/platform/__init__.py                 │
+│                 lmcache/platform/__init__.py                 │
 │                                                                 │
 │  torch_dev, torch_device_type = _detect_device()                │
 │  _ops = get_backend(torch_device_type)                          │
@@ -21,7 +21,7 @@ multiprocess (MP) mode.
 │                                                                 │
 │  [Registry Discovery Point]                                     │
 │  DeviceSpec subclasses are auto-discovered under                │
-│  lmcache.v1.platform and selected by availability.              │
+│  lmcache.platform and selected by availability.              │
 └──────────────────────────────┬──────────────────────────────────┘
                                │
               ┌────────────────┼──────────────────┐
@@ -85,7 +85,7 @@ multiprocess (MP) mode.
 
 | Layer | Device Reference | Notes |
 |-------|-----------------|-------|
-| **Entry** `v1/platform/__init__.py` | `_detect_device()` + `get_backend()` | Registry-driven detection and backend composition. |
+| **Entry** `platform/__init__.py` | `_detect_device()` + `get_backend()` | Registry-driven detection and backend composition. |
 | **Middle** engine / storage / multiprocess | `from lmcache import torch_dev` | Hardware-agnostic unified code |
 | **Middle** IPC-capable / device-specific APIs | `hasattr(torch_dev, 'xxx')` guard | Graceful runtime degradation |
 | **Bottom** Transfer Context | `create_transfer_context(kv_caches, mode)` | Per-device routing. In `AUTO` mode: CUDA→LMCacheDriven, other devices→EngineDriven. Other IPC-capable devices (e.g. MUSA) can opt-in to LMCacheDriven via explicit `mode=lmcache_driven` when their `DeviceSpec` reports `is_handle_transfer_available() == True`. |
@@ -114,7 +114,7 @@ Override: LMCACHE_MP_TRANSFER_MODE env var or the mode argument to create_transf
 supported accelerators (CUDA, XPU, HPU) is available. In that case
 `torch_device_type` is `"cpu"` and `torch_dev` is either:
 
-- `lmcache.v1.platform.cpu.stub_cpu_device.StubCPUDevice` — when `torch`
+- `lmcache.platform.cpu.stub_cpu_device.StubCPUDevice` — when `torch`
   is importable but no GPU is detected. The stub implements the subset of
   the `torch.cuda` / `torch.xpu` / `torch.hpu` surface used by the middle
   layer (`Event`, `Stream`, `device`, `synchronize`, `set_device`,
@@ -140,7 +140,7 @@ which is wrong for that backend's actual KV cache layout.
 ## Adding New Hardware
 
 1. Add a ``DeviceSpec`` subclass under
-   ``lmcache/v1/platform/<device>/__init__.py``.  ``ops_module = None``
+   ``lmcache/platform/<device>/__init__.py``.  ``ops_module = None``
    is sufficient for basic bring-up — Python fallback handles all ops.
 2. Verify with MP ``engine_driven`` mode (see the :doc:`developer guide
    <../source/developer_guide/extending_lmcache/adding_a_new_device_backend>`).

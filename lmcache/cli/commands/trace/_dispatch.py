@@ -2,10 +2,10 @@
 
 """Dispatcher mapping recorded ``qualname`` strings to live callables.
 
-The recorder writes one :class:`~lmcache.v1.mp_observability.trace.format.Record`
+The recorder writes one :class:`~lmcache.mp_observability.trace.format.Record`
 per decorated call, tagged by the function's fully-qualified name.
 The dispatcher translates those strings back into concrete calls on a
-live :class:`~lmcache.v1.distributed.storage_manager.StorageManager`.
+live :class:`~lmcache.distributed.storage_manager.StorageManager`.
 
 Adding support for a new traced operation is a two-line change: put
 ``@enable_tracing`` on the function, then register a handler here with
@@ -22,9 +22,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 # First Party
+from lmcache.distributed.api import ObjectKey
+from lmcache.distributed.storage_manager import StorageManager
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import ObjectKey
-from lmcache.v1.distributed.storage_manager import StorageManager
 
 logger = init_logger(__name__)
 
@@ -32,7 +32,7 @@ logger = init_logger(__name__)
 #: build the qualnames of all its traced methods.  Kept as a constant
 #: so tests and dispatcher registrations stay in lock-step if the class
 #: is ever renamed or moved.
-_SM_PREFIX = "lmcache.v1.distributed.storage_manager.StorageManager"
+_SM_PREFIX = "lmcache.distributed.storage_manager.StorageManager"
 
 
 @dataclass
@@ -63,7 +63,7 @@ class ReplayContext:
 #: Type of a dispatcher handler: takes a :class:`ReplayContext` and an
 #: already-decoded ``args`` dict (keys = parameter names, values =
 #: native Python values restored by
-#: :mod:`lmcache.v1.mp_observability.trace.codecs`).  Handlers return
+#: :mod:`lmcache.mp_observability.trace.codecs`).  Handlers return
 #: nothing; any return value from the live call is discarded.
 Handler = Callable[[ReplayContext, dict[str, Any]], None]
 

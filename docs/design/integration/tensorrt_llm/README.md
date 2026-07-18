@@ -47,7 +47,7 @@ The two modes share the lifecycle but differ in where state lives.
 | Lookup | `engine.lookup(tokens)` returns chunk count | `LOOKUP` enqueues prefetch; `QUERY_PREFETCH_STATUS` reads result keyed by `request_id` |
 | Configuration | `LMCACHE_CONFIG_FILE` env var | Same; plus `server_url` in connector config (or `LMCACHE_SERVER_URL` env) |
 | Failure mode | One process crash takes down both | Engine survives TRT-LLM crash; multiple TRT-LLM instances can share cache |
-| Setup cost | None | Run `python -m lmcache.v1.multiprocess.server` |
+| Setup cost | None | Run `python -m lmcache.multiprocess.server` |
 
 ## Why **not** subclass `VLLMPagedMemGPUConnectorV3`
 
@@ -66,7 +66,7 @@ V3's transfer path is wrong for TRT-LLM:
 implementation. It also exposes a bespoke
 `register_kv_caches(kv_cache_tensor)` method called by the worker once
 at init — separate from `to_gpu`/`from_gpu`. The factory in
-`lmcache/v1/gpu_connector/__init__.py` constructs it from
+`lmcache/gpu_connector/__init__.py` constructs it from
 `LMCacheMetadata` plus the device, and the adapter wires the pool
 tensor in afterwards.
 

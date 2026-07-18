@@ -31,25 +31,25 @@ import time
 import torch
 
 # First Party
+from lmcache.config import LMCacheEngineConfig
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
-from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_allocators.ad_hoc_memory_allocator import AdHocMemoryAllocator
-from lmcache.v1.memory_management import (
+from lmcache.memory_allocators.ad_hoc_memory_allocator import AdHocMemoryAllocator
+from lmcache.memory_management import (
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
     MemoryObjMetadata,
     TensorMemoryObj,
 )
-from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
-from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
-from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
-from lmcache.v1.storage_backend.plugins.rust_raw_block_backend import (
+from lmcache.metadata import LMCacheMetadata
+from lmcache.storage_backend.abstract_backend import StorageBackendInterface
+from lmcache.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.storage_backend.local_disk_backend import LocalDiskBackend
+from lmcache.storage_backend.plugins.rust_raw_block_backend import (
     RustRawBlockBackend,
 )
-from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+from lmcache.storage_backend.remote_backend import RemoteBackend
+from lmcache.utils import CacheEngineKey
 
 logger = init_logger(__name__)
 # Type aliases

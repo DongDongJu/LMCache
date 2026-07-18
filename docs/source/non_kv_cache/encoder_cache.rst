@@ -108,7 +108,7 @@ Design notes (user-visible)
   when ``metadata.role == "scheduler"``.
 
 The full internal design (class layering, code paths, follow-up work)
-lives at :file:`docs/design/v1/encoder-cache.md` in the source tree.
+lives at :file:`docs/design/encoder-cache.md` in the source tree.
 
 Benchmark
 ---------

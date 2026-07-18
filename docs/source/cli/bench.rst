@@ -836,7 +836,7 @@ Fields:
 * ``HS`` -- head size (in elements).
 * ``dtype`` -- element dtype (e.g. ``float16``, ``bfloat16``, ``float32``,
   ``uint8``). The full set matches the keys of ``DTYPE_MAP`` in
-  ``lmcache/v1/kv_layer_groups.py``.
+  ``lmcache/kv_layer_groups.py``.
 * ``layers`` -- number of layers in this group.
 
 Multi-group specs let you model heterogeneous layers (for example, MLA
@@ -852,7 +852,7 @@ All groups must share the same ``NB`` and ``BS`` (this is a physical
 constraint of paged KV). Layer counts across groups sum to the total
 layer count registered with the server.
 
-See ``parse_kvcache_shape_spec`` in ``lmcache/v1/kv_layer_groups.py``
+See ``parse_kvcache_shape_spec`` in ``lmcache/kv_layer_groups.py``
 for the authoritative parsing rules and validation errors.
 
 
@@ -1190,7 +1190,7 @@ Adapter JSON spec
 ~~~~~~~~~~~~~~~~~
 
 The ``--l2-adapter`` JSON is parsed by
-``lmcache.v1.distributed.l2_adapters.config.parse_args_to_l2_adapters_config``,
+``lmcache.distributed.l2_adapters.config.parse_args_to_l2_adapters_config``,
 the same entry point LMCache uses everywhere else. The minimum required
 field is ``type``; all remaining fields are forwarded to the adapter
 implementation as keyword arguments.
@@ -1207,7 +1207,7 @@ Example for the local-filesystem adapter:
      "use_odirect": false
    }
 
-See the source under ``lmcache/v1/distributed/l2_adapters/`` for the
+See the source under ``lmcache/distributed/l2_adapters/`` for the
 full list of adapter types and their accepted fields.
 
 

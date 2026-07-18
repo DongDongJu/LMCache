@@ -9,7 +9,7 @@ automatically — no edits to this file are required.
 
 # First Party
 from lmcache.cli.commands.base import BaseCommand, CompositeCommand
-from lmcache.v1.utils.subclass_discovery import discover_subclasses
+from lmcache.utils.subclass_discovery import discover_subclasses
 
 
 def _discover_commands() -> list[BaseCommand]:

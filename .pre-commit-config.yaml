@@ -11,7 +11,7 @@ repos:
     name: Ban direct torch device usage
     entry: >-
       bash -c '
-      pattern=$(find lmcache/v1/platform -mindepth 1 -maxdepth 1 -type d \
+      pattern=$(find lmcache/platform -mindepth 1 -maxdepth 1 -type d \
         -exec basename {} \; | grep -v "^__" | grep -v "^base$" | sort | paste -sd "|");
       if [ -z "$pattern" ]; then
         echo "WARNING: no platform dirs found, skipping check";
@@ -24,7 +24,7 @@ repos:
         echo "";
         echo "========================================";
         echo "  BANNED: Direct torch device API usage";
-        echo "  Use lmcache.v1.platform abstractions instead";
+        echo "  Use lmcache.platform abstractions instead";
         echo "========================================";
         echo "";
         echo "$matches";
@@ -35,8 +35,8 @@ repos:
     files: ^lmcache/
     exclude: |
       (?x)^(
-        lmcache/.*/gpu_connector/.*|
-        lmcache/v1/platform/.*
+        lmcache/gpu_connector/.*|
+        lmcache/platform/.*
       )$
   - id: ban-cuda-host-register
     name: Ban cudaHostRegister/Unregister outside platform
@@ -59,8 +59,8 @@ repos:
     files: ^lmcache/
     exclude: |
       (?x)^(
-        lmcache/.*/gpu_connector/.*|
-        lmcache/v1/platform/.*
+        lmcache/gpu_connector/.*|
+        lmcache/platform/.*
       )$
   - id: ban-raw-timeout-error
     name: Ban raw raise of builtin TimeoutError
@@ -72,7 +72,7 @@ repos:
         echo "========================================";
         echo "  BANNED: raw raise of builtin TimeoutError";
         echo "  Fix: raise LMCacheTimeoutError from";
-        echo "       lmcache.v1.mp_observability.errors so the timeout";
+        echo "       lmcache.mp_observability.errors so the timeout";
         echo "       is reported to MP observability (OTel).";
         echo "========================================";
         echo "";

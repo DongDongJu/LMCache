@@ -210,8 +210,8 @@ msgstr "这为您提供了 ``batch_get``\\ 、\\ ``batch_set``\\ 、\\ ``batch_e
 #: ../../source/developer_guide/extending_lmcache/native_connectors.rst:229
 msgid ""
 "**Reference:** "
-"``lmcache/v1/storage_backend/native_clients/resp_client.py``"
-msgstr "**参考:** ``lmcache/v1/storage_backend/native_clients/resp_client.py``"
+"``lmcache/storage_backend/native_clients/resp_client.py``"
+msgstr "**参考:** ``lmcache/storage_backend/native_clients/resp_client.py``"
 
 #: ../../source/developer_guide/extending_lmcache/native_connectors.rst:233
 msgid "Step 5: L2 Adapter (MP Mode)"
@@ -232,12 +232,12 @@ msgstr "在 L2 适配器包中创建一个新文件："
 #: ../../source/developer_guide/extending_lmcache/native_connectors.rst:322
 msgid ""
 "The L2 adapter package uses ``pkgutil.iter_modules`` to auto-discover all"
-" modules in ``lmcache/v1/distributed/l2_adapters/``. Simply creating the "
+" modules in ``lmcache/distributed/l2_adapters/``. Simply creating the "
 "file above is sufficient -- no changes to ``__init__.py`` or any other "
 "existing file are needed."
 msgstr ""
 "L2 适配器包使用 ``pkgutil.iter_modules`` 自动发现 "
-"``lmcache/v1/distributed/l2_adapters/`` 中的所有模块。仅仅创建上述文件就足够了——不需要对 "
+"``lmcache/distributed/l2_adapters/`` 中的所有模块。仅仅创建上述文件就足够了——不需要对 "
 "``__init__.py`` 或任何其他现有文件进行更改。"
 
 #: ../../source/developer_guide/extending_lmcache/native_connectors.rst:326
@@ -649,8 +649,8 @@ msgstr "带有配置类和工厂自注册的 L2 适配器模块（多进程模�
 #: ../../source/developer_guide/extending_lmcache/native_connectors.rst:615
 msgid ""
 "Unit tests (see "
-"``tests/v1/distributed/test_native_connector_l2_adapter.py``)"
-msgstr "单元测试（请参见 ``tests/v1/distributed/test_native_connector_l2_adapter.py``\\ ）"
+"``tests/distributed/test_native_connector_l2_adapter.py``)"
+msgstr "单元测试（请参见 ``tests/distributed/test_native_connector_l2_adapter.py``\\ ）"
 
 #: ../../source/developer_guide/extending_lmcache/native_connectors.rst:616
 msgid "Rebuild with ``pip install -e .`` and verify both modes work"
@@ -719,8 +719,8 @@ msgstr "**MP 模式:**"
 #: ../../source/developer_guide/extending_lmcache/native_connectors.rst:666
 msgid ""
 "Implementation: ``csrc/storage_backends/aerospike/``, "
-"``lmcache/v1/distributed/l2_adapters/aerospike_l2_adapter.py``."
-msgstr "实现：\\ ``csrc/storage_backends/aerospike/``, ``lmcache/v1/distributed/l2_adapters/aerospike_l2_adapter.py``\\ 。"
+"``lmcache/distributed/l2_adapters/aerospike_l2_adapter.py``."
+msgstr "实现：\\ ``csrc/storage_backends/aerospike/``, ``lmcache/distributed/l2_adapters/aerospike_l2_adapter.py``\\ 。"
 
 #: ../../source/developer_guide/extending_lmcache/native_connectors.rst:671
 msgid "Additional Resources"
@@ -765,16 +765,16 @@ msgstr "外部原生连接器示例：\\ ``examples/lmc_external_native_connecto
 #: ../../source/developer_guide/extending_lmcache/native_connectors.rst:682
 msgid ""
 "Native plugin adapter source: "
-"``lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py``"
+"``lmcache/distributed/l2_adapters/native_connector_l2_adapter.py``"
 msgstr ""
 "原生插件适配器源: "
-"``lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py``"
+"``lmcache/distributed/l2_adapters/native_connector_l2_adapter.py``"
 
 #: ../../source/developer_guide/extending_lmcache/native_connectors.rst:684
 msgid ""
 "Design document: "
-"``lmcache/v1/distributed/l2_adapters/design_docs/plugin.md``"
-msgstr "设计文档：\\ ``lmcache/v1/distributed/l2_adapters/design_docs/plugin.md``"
+"``lmcache/distributed/l2_adapters/design_docs/plugin.md``"
+msgstr "设计文档：\\ ``lmcache/distributed/l2_adapters/design_docs/plugin.md``"
 
 #: ../../source/developer_guide/extending_lmcache/native_connectors.rst:686
 msgid ""

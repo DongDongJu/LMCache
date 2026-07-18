@@ -79,7 +79,7 @@ def _declares_slot_compression(spec: KVCacheSpec) -> bool:
 
     Covers ``MLAAttentionSpec.compress_ratio > 1`` (DeepSeek-V4 slot packing)
     and ``TQFullAttentionSpec.tq_slot_size > 0`` (TurboQuant slots); such
-    groups belong to the compression path in ``lmcache.v1.kv_layer_groups``.
+    groups belong to the compression path in ``lmcache.kv_layer_groups``.
     """
     return (
         getattr(spec, "compress_ratio", 1) > 1 or getattr(spec, "tq_slot_size", 0) > 0
@@ -105,7 +105,7 @@ def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
 
     Specs declaring slot compression (``compress_ratio > 1`` /
     ``tq_slot_size > 0``, e.g. DeepSeek-V4) are NOT rejected: they are served
-    by the compression path in ``lmcache.v1.kv_layer_groups`` and merely
+    by the compression path in ``lmcache.kv_layer_groups`` and merely
     skipped by the edits here (see ``_declares_slot_compression``).
 
     Args:

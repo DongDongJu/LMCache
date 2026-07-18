@@ -18,9 +18,9 @@ from collections.abc import Sequence
 import time
 
 # First Party
+from lmcache.distributed.bitmap_ops import fold_unfold_ranked, highest_set_bit
+from lmcache.distributed.bitmap_ops.fold import _fold_python, _unfold_python
 from lmcache.native_storage_ops import Bitmap
-from lmcache.v1.distributed.bitmap_ops import fold_unfold_ranked, highest_set_bit
-from lmcache.v1.distributed.bitmap_ops.fold import _fold_python, _unfold_python
 
 
 def _python_pipeline(found, num_chunks, num_ranks, group_windows):

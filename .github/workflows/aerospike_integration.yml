@@ -8,11 +8,11 @@ on:
       - "release-**"
     paths:
       - "csrc/storage_backends/aerospike/**"
-      - "lmcache/v1/distributed/l2_adapters/aerospike_l2_adapter.py"
-      - "lmcache/v1/storage_backend/native_clients/aerospike_client.py"
+      - "lmcache/distributed/l2_adapters/aerospike_l2_adapter.py"
+      - "lmcache/storage_backend/native_clients/aerospike_client.py"
       - "setup.py"
       - "tests/aerospike_ce.conf.template"
-      - "tests/v1/distributed/test_aerospike_*"
+      - "tests/distributed/test_aerospike_*"
       - ".github/workflows/aerospike_integration.yml"
   pull_request:
     branches:
@@ -20,11 +20,11 @@ on:
       - "release-**"
     paths:
       - "csrc/storage_backends/aerospike/**"
-      - "lmcache/v1/distributed/l2_adapters/aerospike_l2_adapter.py"
-      - "lmcache/v1/storage_backend/native_clients/aerospike_client.py"
+      - "lmcache/distributed/l2_adapters/aerospike_l2_adapter.py"
+      - "lmcache/storage_backend/native_clients/aerospike_client.py"
       - "setup.py"
       - "tests/aerospike_ce.conf.template"
-      - "tests/v1/distributed/test_aerospike_*"
+      - "tests/distributed/test_aerospike_*"
       - ".github/workflows/aerospike_integration.yml"
   workflow_dispatch:
 
@@ -135,7 +135,7 @@ jobs:
 
       - name: Integration tests
         run: |
-          pytest tests/v1/distributed/test_aerospike_l2_integration.py -v --tb=short
+          pytest tests/distributed/test_aerospike_l2_integration.py -v --tb=short
 
       - name: Stop Aerospike CE
         if: always()

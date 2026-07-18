@@ -11,15 +11,15 @@ import select
 import torch
 
 # First Party
-from lmcache.v1.distributed.api import ObjectKey
-from lmcache.v1.distributed.internal_api import L1MemoryDesc
-from lmcache.v1.memory_management import (
+from lmcache.distributed.api import ObjectKey
+from lmcache.distributed.internal_api import L1MemoryDesc
+from lmcache.memory_management import (
     MemoryFormat,
     MemoryObj,
     MemoryObjMetadata,
     TensorMemoryObj,
 )
-from lmcache.v1.platform import consume_fd
+from lmcache.platform import consume_fd
 
 _KB = 1024
 

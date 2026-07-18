@@ -161,8 +161,8 @@ class CoordinatorCommand(BaseCommand):
             import uvicorn
 
             # First Party
-            from lmcache.v1.mp_coordinator.app import create_app
-            from lmcache.v1.mp_coordinator.config import MPCoordinatorConfig
+            from lmcache.mp_coordinator.app import create_app
+            from lmcache.mp_coordinator.config import MPCoordinatorConfig
         except ImportError:
             print(
                 "The 'lmcache coordinator' command requires the full lmcache "

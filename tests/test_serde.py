@@ -5,11 +5,11 @@ import torch
 
 # First Party
 from lmcache import torch_device_type
-from lmcache.storage_backend.serde.cachegen_basics import CacheGenEncoderOutput
-from lmcache.storage_backend.serde.cachegen_decoder import CacheGenDeserializer
-from lmcache.storage_backend.serde.cachegen_encoder import CacheGenSerializer
-from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.config import LMCacheEngineConfig
+from lmcache.metadata import LMCacheMetadata
+from lmcache.serde.cachegen_basics import CacheGenEncoderOutput
+from lmcache.serde.cachegen_decoder import CacheGenDeserializer
+from lmcache.serde.cachegen_encoder import CacheGenSerializer
 
 # CacheGen has hand-written CUDA and SYCL kernels only; gate the test on
 # those backends explicitly (whitelist), so HPU / CPU-only CI / future

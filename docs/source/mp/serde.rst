@@ -120,7 +120,7 @@ transform logic, then register a factory keyed on a name you pick:
 .. code-block:: python
 
     # my_project/my_serde.py
-    from lmcache.v1.distributed.serde import (
+    from lmcache.distributed.serde import (
         AsyncSerdeProcessor,
         Deserializer,
         Serializer,
@@ -177,7 +177,7 @@ adapter, runs vLLM, clears L1, and re-runs the same request to trigger
 the L2 prefetch + fp8 deserialize path lives at
 :file:`examples/serde/fp8/`. A pytest-based filesystem round-trip test
 (no vLLM required) is at
-:file:`tests/v1/distributed/serde/test_serde_fs_e2e.py`.
+:file:`tests/distributed/serde/test_serde_fs_e2e.py`.
 
 Compression methods
 -------------------

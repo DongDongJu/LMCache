@@ -6,7 +6,7 @@
 from typing import Dict
 
 # First Party
-from lmcache.v1.utils.subclass_discovery import discover_subclasses
+from lmcache.utils.subclass_discovery import discover_subclasses
 
 # Local
 from .base import OperationHandler

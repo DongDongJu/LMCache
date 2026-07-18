@@ -26,9 +26,9 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
-from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
-from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.cache_engine import LMCacheEngine, LMCacheEngineBuilder
+from lmcache.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
+from lmcache.metadata import LMCacheMetadata
 
 if importlib.util.find_spec("pytest_benchmark") is None:
 
@@ -102,11 +102,11 @@ def patch_mixed_allocator():
 
     with (
         patch(
-            "lmcache.v1.memory_allocators.mixed_memory_allocator.MixedMemoryAllocator.__init__",
+            "lmcache.memory_allocators.mixed_memory_allocator.MixedMemoryAllocator.__init__",
             fake_mixed_init,
         ),
         patch(
-            "lmcache.v1.memory_allocators.mixed_memory_allocator.MixedMemoryAllocator.close",
+            "lmcache.memory_allocators.mixed_memory_allocator.MixedMemoryAllocator.close",
             fake_mixed_close,
         ),
     ):
@@ -153,11 +153,11 @@ def patch_pin_allocator():
 
     with (
         patch(
-            "lmcache.v1.memory_allocators.pin_memory_allocator.PinMemoryAllocator.__init__",
+            "lmcache.memory_allocators.pin_memory_allocator.PinMemoryAllocator.__init__",
             fake_pin_init,
         ),
         patch(
-            "lmcache.v1.memory_allocators.pin_memory_allocator.PinMemoryAllocator.close",
+            "lmcache.memory_allocators.pin_memory_allocator.PinMemoryAllocator.close",
             fake_pin_close,
         ),
     ):
@@ -703,9 +703,7 @@ def lmserver_v1_process(request):
         port_number = random.randint(10000, 65500)
         print("Starting the lmcache v1 server process on port")
         proc = subprocess.Popen(
-            shlex.split(
-                f"python3 -m lmcache.v1.server localhost {port_number} {device}"
-            )
+            shlex.split(f"python3 -m lmcache.server localhost {port_number} {device}")
         )
 
         # Wait for lmcache process to start

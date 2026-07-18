@@ -319,8 +319,8 @@ msgid "Run the unit tests:"
 msgstr "运行单元测试："
 
 #: ../../source/kv_cache/storage_backends/bigtable.rst:138
-msgid "pytest tests/v1/storage_backend/test_bigtable_connector.py"
-msgstr "pytest tests/v1/storage_backend/test_bigtable_connector.py"
+msgid "pytest tests/storage_backend/test_bigtable_connector.py"
+msgstr "pytest tests/storage_backend/test_bigtable_connector.py"
 
 #: ../../source/kv_cache/storage_backends/bigtable.rst:141
 msgid "Troubleshooting Large Payload Warnings"

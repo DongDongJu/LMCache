@@ -17,9 +17,9 @@ from lmcache.cli.commands.trace._dispatch import (
     ReplayContext,
     build_default_dispatcher,
 )
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.distributed.api import ObjectKey
 
-_SM_PREFIX = "lmcache.v1.distributed.storage_manager.StorageManager"
+_SM_PREFIX = "lmcache.distributed.storage_manager.StorageManager"
 
 
 class _FakeSM:

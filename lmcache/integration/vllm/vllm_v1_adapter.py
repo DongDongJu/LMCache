@@ -30,6 +30,10 @@ import torch
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
 from lmcache import utils
 from lmcache.banner import print_banner_once
+from lmcache.cache_engine import LMCacheEngine
+from lmcache.compute.blend import LMCBlenderBuilder
+from lmcache.config import LMCacheEngineConfig
+from lmcache.config_base import validate_and_set_config_value
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
@@ -38,13 +42,9 @@ from lmcache.integration.vllm.utils import (
 )
 from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
 from lmcache.logging import init_logger
+from lmcache.manager import LMCacheManager
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
-from lmcache.v1.cache_engine import LMCacheEngine
-from lmcache.v1.compute.blend import LMCBlenderBuilder
-from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.config_base import validate_and_set_config_value
-from lmcache.v1.manager import LMCacheManager
 
 if TYPE_CHECKING:
     # Third Party
@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
     # First Party
-    from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
+    from lmcache.lookup_client.abstract_client import LookupClientInterface
 
 logger = init_logger(__name__)
 

@@ -2,7 +2,7 @@
 """Configuration and argument parsing for the transfer channel benchmark.
 
 This module is intentionally free of heavy/optional dependencies (torch, the
-``lmcache.v1.distributed`` runtime) so the CLI can build its argument parser
+``lmcache.distributed`` runtime) so the CLI can build its argument parser
 without importing them. The runtime imports live in ``benchmark.py``.
 """
 

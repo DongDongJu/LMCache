@@ -261,8 +261,8 @@ msgstr "插件适配器类 **必须**\\ ："
 #: ../../source/developer_guide/extending_lmcache/storage_plugins.rst:139
 msgid ""
 "Subclass ``L2AdapterInterface`` from "
-"``lmcache.v1.distributed.l2_adapters.base``."
-msgstr "从 ``lmcache.v1.distributed.l2_adapters.base`` 子类化 ``L2AdapterInterface``\\ 。"
+"``lmcache.distributed.l2_adapters.base``."
+msgstr "从 ``lmcache.distributed.l2_adapters.base`` 子类化 ``L2AdapterInterface``\\ 。"
 
 #: ../../source/developer_guide/extending_lmcache/storage_plugins.rst:140
 msgid ""
@@ -302,10 +302,10 @@ msgstr "如果需要异步 I/O，则应创建自己的 asyncio 事件循环和�
 
 #: ../../source/developer_guide/extending_lmcache/storage_plugins.rst:152
 msgid ""
-"Use ``create_event_notifier()`` from ``lmcache.v1.platform`` for the "
+"Use ``create_event_notifier()`` from ``lmcache.platform`` for the "
 "three event fds (cross-platform: ``os.eventfd`` on Linux, ``os.pipe`` "
 "fallback elsewhere)."
-msgstr "使用 ``lmcache.v1.platform`` 中的 ``create_event_notifier()`` 来处理三个事件文件描述符（跨平台：在 Linux 上使用 ``os.eventfd``\\ ，在其他地方使用 ``os.pipe`` 作为后备）。"
+msgstr "使用 ``lmcache.platform`` 中的 ``create_event_notifier()`` 来处理三个事件文件描述符（跨平台：在 Linux 上使用 ``os.eventfd``\\ ，在其他地方使用 ``os.pipe`` 作为后备）。"
 
 #: ../../source/developer_guide/extending_lmcache/storage_plugins.rst:154
 msgid "Clean up all resources (event fds, threads, connections) in ``close()``."
@@ -358,22 +358,22 @@ msgstr "附加资源"
 #: ../../source/developer_guide/extending_lmcache/storage_plugins.rst:245
 msgid ""
 "Plugin adapter source: "
-"``lmcache/v1/distributed/l2_adapters/plugin_l2_adapter.py``"
-msgstr "插件适配器源代码：\\ ``lmcache/v1/distributed/l2_adapters/plugin_l2_adapter.py``"
+"``lmcache/distributed/l2_adapters/plugin_l2_adapter.py``"
+msgstr "插件适配器源代码：\\ ``lmcache/distributed/l2_adapters/plugin_l2_adapter.py``"
 
 #: ../../source/developer_guide/extending_lmcache/storage_plugins.rst:246
 msgid ""
 "Native plugin adapter: "
-"``lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py``"
-msgstr "原生插件适配器: ``lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py``"
+"``lmcache/distributed/l2_adapters/native_connector_l2_adapter.py``"
+msgstr "原生插件适配器: ``lmcache/distributed/l2_adapters/native_connector_l2_adapter.py``"
 
 #: ../../source/developer_guide/extending_lmcache/storage_plugins.rst:247
 msgid ""
 "Design document: "
-"``lmcache/v1/distributed/l2_adapters/design_docs/plugin.md``"
-msgstr "设计文档：\\ ``lmcache/v1/distributed/l2_adapters/design_docs/plugin.md``"
+"``lmcache/distributed/l2_adapters/design_docs/plugin.md``"
+msgstr "设计文档：\\ ``lmcache/distributed/l2_adapters/design_docs/plugin.md``"
 
 #: ../../source/developer_guide/extending_lmcache/storage_plugins.rst:248
-msgid "L2 adapter base interface: ``lmcache/v1/distributed/l2_adapters/base.py``"
-msgstr "L2 适配器基础接口: ``lmcache/v1/distributed/l2_adapters/base.py``"
+msgid "L2 adapter base interface: ``lmcache/distributed/l2_adapters/base.py``"
+msgstr "L2 适配器基础接口: ``lmcache/distributed/l2_adapters/base.py``"
 

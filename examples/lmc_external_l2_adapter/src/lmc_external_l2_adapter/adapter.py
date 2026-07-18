@@ -19,22 +19,22 @@ import time
 import torch  # noqa: F401  # must precede native_storage_ops
 
 # First Party
-from lmcache.logging import init_logger
-from lmcache.native_storage_ops import Bitmap
-from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
-from lmcache.v1.distributed.internal_api import L2StoreResult
-from lmcache.v1.distributed.l2_adapters.base import (
+from lmcache.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.distributed.internal_api import L2StoreResult
+from lmcache.distributed.l2_adapters.base import (
     L2AdapterInterface,
     L2TaskId,
 )
-from lmcache.v1.distributed.l2_adapters.config import (
+from lmcache.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
 )
-from lmcache.v1.memory_management import (
+from lmcache.logging import init_logger
+from lmcache.memory_management import (
     MemoryObj,
     TensorMemoryObj,
 )
-from lmcache.v1.platform import create_event_notifier
+from lmcache.native_storage_ops import Bitmap
+from lmcache.platform import create_event_notifier
 
 logger = init_logger(__name__)
 

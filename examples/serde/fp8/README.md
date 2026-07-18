@@ -28,7 +28,7 @@ The pytest suite includes a filesystem-backed serde test that exercises
 the same L1 -> disk -> L1 round-trip without needing vLLM:
 
 ```bash
-pytest tests/v1/distributed/serde/test_serde_fs_e2e.py -xvs
+pytest tests/distributed/serde/test_serde_fs_e2e.py -xvs
 ```
 
 ## Requirements
@@ -76,11 +76,11 @@ To disable serde for an adapter, omit the `serde` field.
 ## Adding a custom serde
 
 1. Implement `Serializer` and `Deserializer` from
-   `lmcache.v1.distributed.serde`
+   `lmcache.distributed.serde`
 2. Register a factory:
 
    ```python
-   from lmcache.v1.distributed.serde import (
+   from lmcache.distributed.serde import (
        AsyncSerdeProcessor,
        register_serde_factory,
    )

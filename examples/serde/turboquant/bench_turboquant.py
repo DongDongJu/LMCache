@@ -10,13 +10,13 @@ import time
 import torch
 
 # First Party
-from lmcache.v1.distributed.api import MemoryLayoutDesc
-from lmcache.v1.distributed.serde.turboquant import (
+from lmcache.distributed.api import MemoryLayoutDesc
+from lmcache.distributed.serde.turboquant import (
     TurboQuantDeserializer,
     TurboQuantSerdeConfig,
     TurboQuantSerializer,
 )
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.memory_management import MemoryObj
 
 
 @dataclass

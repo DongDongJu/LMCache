@@ -38,7 +38,7 @@ frontend port** (``--http-port``, default ``8080``):
    serves ``/metrics``, so the standalone Prometheus server is disabled and
    ``--prometheus-port`` has no effect under this command. ``--prometheus-port``
    *is* the metrics endpoint for the frontend-less entrypoints
-   (``python -m lmcache.v1.multiprocess.server`` and ``lmcache trace replay``)
+   (``python -m lmcache.multiprocess.server`` and ``lmcache trace replay``)
    — see :ref:`mp-obs-metrics-endpoint`. Also note metrics are lazy: a series
    only appears *after* the first store/retrieve that produces it, so drive
    some traffic before scraping.
@@ -82,7 +82,7 @@ HTTP frontend start the standalone server on ``--prometheus-port`` instead.
    * - ``lmcache server``
      - yes
      - ``--http-port`` (default ``8080``); ``--prometheus-port`` ignored
-   * - ``python -m lmcache.v1.multiprocess.server``
+   * - ``python -m lmcache.multiprocess.server``
      - no
      - ``--prometheus-port`` (default ``9090``)
    * - ``lmcache trace replay``
@@ -236,7 +236,7 @@ Configuration
    * - ``--prometheus-port``
      - ``9090``
      - Port of the standalone Prometheus ``/metrics`` server. Started only by
-       frontend-less entrypoints (``python -m lmcache.v1.multiprocess.server``,
+       frontend-less entrypoints (``python -m lmcache.multiprocess.server``,
        ``lmcache trace replay``). **Ignored by** ``lmcache server`` — there the
        HTTP frontend serves ``/metrics`` on ``--http-port`` instead, so the
        standalone server is disabled. See :ref:`mp-obs-metrics-endpoint`.

@@ -65,7 +65,7 @@ from lmcache.cli.commands.bench.server_bench.helpers import (
 if TYPE_CHECKING:
     # First Party
     from lmcache.cli.commands.base import BaseCommand
-    from lmcache.v1.multiprocess.custom_types import KVCache
+    from lmcache.multiprocess.custom_types import KVCache
 
 
 # Stash the original (full-install) ImportError so the parser-stub
@@ -150,7 +150,7 @@ def add_server_arguments(parser: argparse.ArgumentParser) -> None:
             "'(1,1024,16,1,128):float16:4;"
             "(2,1024,16,8,128):float16:28'. "
             "All groups must share the same NB and BS. "
-            "See lmcache.v1.kv_layer_groups.parse_kvcache_shape_spec "
+            "See lmcache.kv_layer_groups.parse_kvcache_shape_spec "
             "for the authoritative parser. Default: '%s'"
             % (", ".join(DTYPE_MAP.keys()), _DEFAULT_SHAPE_SPEC)
         ),
@@ -217,12 +217,12 @@ def run_server_bench(
     import zmq
 
     # First Party
-    from lmcache.v1.kv_layer_groups import (
+    from lmcache.kv_layer_groups import (
         format_kvcache_shape_spec,
         parse_kvcache_shape_spec,
     )
-    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
-    from lmcache.v1.multiprocess.mq import MessageQueueClient
+    from lmcache.multiprocess.group_view import EngineGroupInfo
+    from lmcache.multiprocess.mq import MessageQueueClient
 
     quiet = getattr(args, "quiet", False)
 
@@ -402,7 +402,7 @@ def run_server_bench(
         shm_names: list[str] = []
         if use_gpu:
             # First Party
-            from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
+            from lmcache.platform.cuda.ipc_wrapper import CudaIPCWrapper
 
             allocated = _allocate_gpu_kv_cache(groups=layer_groups)
             log(
@@ -416,7 +416,7 @@ def run_server_bench(
             client_kv_tensors = allocated
         else:
             # First Party
-            from lmcache.v1.platform.cpu.shm import CpuShmTensorWrapper
+            from lmcache.platform.cpu.shm import CpuShmTensorWrapper
 
             shm_prefix = CpuShmTensorWrapper.SHM_NAME_PREFIX + str(os.getpid())
             cpu_tensors, cpu_wrappers, shm_names = _allocate_cpu_shm_kv_cache(
@@ -585,7 +585,7 @@ def run_server_bench(
         for _name in shm_names if "shm_names" in locals() else []:
             try:
                 # First Party
-                from lmcache.v1.platform.cpu.shm import shm_unlink
+                from lmcache.platform.cpu.shm import shm_unlink
 
                 shm_unlink(_name)
             except OSError:

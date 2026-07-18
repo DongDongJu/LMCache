@@ -35,10 +35,10 @@ from lmcache import torch_device_type
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.v1.config import LMCacheEngineConfig
-    from lmcache.v1.distributed.config import StorageManagerConfig
-    from lmcache.v1.metadata import LMCacheMetadata
-    from lmcache.v1.multiprocess.config import MPServerConfig
+    from lmcache.config import LMCacheEngineConfig
+    from lmcache.distributed.config import StorageManagerConfig
+    from lmcache.metadata import LMCacheMetadata
+    from lmcache.multiprocess.config import MPServerConfig
 
 
 USAGE_SCHEMA_VERSION = 1
@@ -215,7 +215,7 @@ class MPServerMessage(UsageMessage):
         # load it).
         # First Party
         from lmcache import __version__
-        from lmcache.v1.distributed.l2_adapters.config import (
+        from lmcache.distributed.l2_adapters.config import (
             get_type_name_for_config,
         )
 

@@ -47,8 +47,8 @@ from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
 )
 from lmcache.integration.vllm.utils import mla_enabled, vllm_layout_hints
+from lmcache.multiprocess.group_view import slice_block_ids_per_group
 from lmcache.utils import init_logger as lmcache_init_logger
-from lmcache.v1.multiprocess.group_view import slice_block_ids_per_group
 
 try:
     # First Party
@@ -61,12 +61,12 @@ try:
 
     try:
         # First Party
-        from lmcache.v1.multiprocess.custom_types import (  # type: ignore[attr-defined]
+        from lmcache.multiprocess.custom_types import (  # type: ignore[attr-defined]
             RequestAllocationRecord,
         )
     except ImportError:
         # First Party
-        from lmcache.v1.multiprocess.custom_types import (
+        from lmcache.multiprocess.custom_types import (
             BlockAllocationRecord as RequestAllocationRecord,
         )
 except ImportError:
@@ -79,7 +79,7 @@ except ImportError:
     )
 
     # First Party
-    from lmcache.v1.multiprocess.custom_types import (
+    from lmcache.multiprocess.custom_types import (
         BlockAllocationRecord as RequestAllocationRecord,
     )
 

@@ -254,11 +254,11 @@ msgid ""
 "the L2 prefetch + fp8 deserialize path lives at "
 ":file:`examples/serde/fp8/`. A pytest-based filesystem round-trip test "
 "(no vLLM required) is at "
-":file:`tests/v1/distributed/serde/test_serde_fs_e2e.py`."
+":file:`tests/distributed/serde/test_serde_fs_e2e.py`."
 msgstr ""
 "一个端到端的脚本，它在磁盘适配器上启动一个带有 fp8 的 lmcache 服务器，运行 vLLM，清除 L1，然后重新运行相同的请求以触发 L2"
 " 预取 + fp8 反序列化路径，位于 :file:`examples/serde/fp8/`。一个基于 pytest 的文件系统往返测试（不需要"
-" vLLM）位于 :file:`tests/v1/distributed/serde/test_serde_fs_e2e.py`。"
+" vLLM）位于 :file:`tests/distributed/serde/test_serde_fs_e2e.py`。"
 
 #: ../../source/mp/serde.rst:183
 msgid "Compression methods"

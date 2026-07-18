@@ -198,8 +198,8 @@ def run_l2_adapter_bench(command: "BaseCommand", args: argparse.Namespace) -> No
         bench_lookup,
         bench_store,
     )
-    from lmcache.v1.distributed.l2_adapters import create_l2_adapter
-    from lmcache.v1.distributed.l2_adapters.config import (
+    from lmcache.distributed.l2_adapters import create_l2_adapter
+    from lmcache.distributed.l2_adapters.config import (
         parse_args_to_l2_adapters_config,
     )
 

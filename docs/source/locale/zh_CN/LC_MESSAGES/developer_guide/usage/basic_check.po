@@ -45,8 +45,8 @@ msgid "Overview"
 msgstr "概述"
 
 #: ../../source/developer_guide/usage/basic_check.rst:14
-msgid "The basic check tool (``lmcache.v1.basic_check``) is designed to:"
-msgstr "基本检查工具（``lmcache.v1.basic_check``）旨在："
+msgid "The basic check tool (``lmcache.basic_check``) is designed to:"
+msgstr "基本检查工具（``lmcache.basic_check``）旨在："
 
 #: ../../source/developer_guide/usage/basic_check.rst:16
 msgid "Test remote backend connectivity and functionality"

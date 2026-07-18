@@ -218,8 +218,8 @@ msgstr "**问题**: “未指定配置文件” **解决方案**: 设置 ``LMCAC
 #: ../../source/getting_started/quickstart/standalone_starter.rst:185
 msgid ""
 "**Issue**: \"Failed to connect to controller\" **Solution**: Start "
-"controller first: ``python -m lmcache.v1.api_server``"
-msgstr "**问题**: “无法连接到控制器” **解决方案**: 首先启动控制器: ``python -m lmcache.v1.api_server``"
+"controller first: ``python -m lmcache.api_server``"
+msgstr "**问题**: “无法连接到控制器” **解决方案**: 首先启动控制器: ``python -m lmcache.api_server``"
 
 #: ../../source/getting_started/quickstart/standalone_starter.rst:188
 msgid ""

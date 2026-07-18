@@ -84,7 +84,7 @@ class TestCoordinatorCommandExecute:
     def test_overrides_applied(self, cmd):
         """chunk_size/hash_algorithm/blend_probe_stride flags override the config."""
         # First Party
-        from lmcache.v1.mp_coordinator.config import MPCoordinatorConfig
+        from lmcache.mp_coordinator.config import MPCoordinatorConfig
 
         args = argparse.Namespace(
             host=None,
@@ -109,7 +109,7 @@ class TestCoordinatorCommandExecute:
         with (
             patch("uvicorn.run"),
             patch(
-                "lmcache.v1.mp_coordinator.app.create_app",
+                "lmcache.mp_coordinator.app.create_app",
                 side_effect=fake_create_app,
             ),
         ):

@@ -119,9 +119,9 @@ msgstr "健康监控器使用自动发现机制来查找和实例化健康检查
 
 #: ../../source/production/observability/health_monitor.rst:41
 msgid ""
-"At startup, the monitor scans the ``lmcache.v1.health_monitor.checks`` "
+"At startup, the monitor scans the ``lmcache.health_monitor.checks`` "
 "package"
-msgstr "在启动时，监视器扫描 ``lmcache.v1.health_monitor.checks`` 包"
+msgstr "在启动时，监视器扫描 ``lmcache.health_monitor.checks`` 包"
 
 #: ../../source/production/observability/health_monitor.rst:42
 msgid "All classes that inherit from ``HealthCheck`` are discovered"
@@ -484,8 +484,8 @@ msgstr "扩展健康监控器"
 #: ../../source/production/observability/health_monitor.rst:186
 msgid ""
 "You can add custom health checks by creating a new module in the "
-"``lmcache/v1/health_monitor/checks/`` directory."
-msgstr "您可以通过在 ``lmcache/v1/health_monitor/checks/`` 目录中创建新模块来添加自定义健康检查。"
+"``lmcache/health_monitor/checks/`` directory."
+msgstr "您可以通过在 ``lmcache/health_monitor/checks/`` 目录中创建新模块来添加自定义健康检查。"
 
 #: ../../source/production/observability/health_monitor.rst:188
 msgid ""

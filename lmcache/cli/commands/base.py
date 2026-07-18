@@ -164,7 +164,7 @@ class CompositeCommand(BaseCommand):
         """
         # Deferred import to avoid circular dependency
         # First Party
-        from lmcache.v1.utils.subclass_discovery import discover_subclasses
+        from lmcache.utils.subclass_discovery import discover_subclasses
 
         parser = subparsers.add_parser(
             self.name(),

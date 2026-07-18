@@ -17,7 +17,7 @@ Examples:
 | `lmcache/cli/` | `docs/design/cli/` |
 | `lmcache/cli/commands/ping.py` | `docs/design/cli/commands/ping.md` |
 | `lmcache/cli/commands/bench/engine_bench/` | `docs/design/cli/commands/bench/engine_bench/` |
-| `lmcache/v1/distributed/l2_adapters/` | `docs/design/v1/distributed/l2_adapters/` |
+| `lmcache/distributed/l2_adapters/` | `docs/design/distributed/l2_adapters/` |
 
 Not every module has a design doc — only modules whose design warrants prose
 beyond what the code and docstrings already communicate. Missing directories

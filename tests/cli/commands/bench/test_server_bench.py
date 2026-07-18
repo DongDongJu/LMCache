@@ -30,8 +30,8 @@ from lmcache.cli.commands.bench.server_bench.helpers import (
     _send_lookup,
     _send_unregister_kv_cache,
 )
-from lmcache.v1.multiprocess.mq import MessageQueueClient
-from lmcache.v1.multiprocess.protocols.base import RequestType
+from lmcache.multiprocess.mq import MessageQueueClient
+from lmcache.multiprocess.protocols.base import RequestType
 
 # ------------------------------------------------------------------ #
 #  Fixtures
@@ -390,7 +390,7 @@ class TestAllocateKVCache:
         from types import SimpleNamespace
 
         # First Party
-        from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
+        from lmcache.kv_layer_groups import KVLayerGroupInfo
 
         # Group A: 3 layers of (2, 2, 2, 8, 16), float16
         # Group B: 2 layers of (1, 2, 2, 4, 32), bfloat16

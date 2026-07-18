@@ -52,12 +52,12 @@ jobs:
               - '!operator/**'
             raw_block:
               - 'rust/raw_block/**'
-              - 'lmcache/v1/storage_backend/raw_block/**'
-              - 'lmcache/v1/distributed/l2_adapters/raw_block_l2_adapter.py'
-              - 'lmcache/v1/multiprocess/**'
-              - 'tests/v1/storage_backend/test_raw_block*.py'
-              - 'tests/v1/storage_backend/raw_block_test_utils.py'
-              - 'tests/v1/multiprocess/test_raw_block_l2_adapter.py'
+              - 'lmcache/storage_backend/raw_block/**'
+              - 'lmcache/distributed/l2_adapters/raw_block_l2_adapter.py'
+              - 'lmcache/multiprocess/**'
+              - 'tests/storage_backend/test_raw_block*.py'
+              - 'tests/storage_backend/raw_block_test_utils.py'
+              - 'tests/multiprocess/test_raw_block_l2_adapter.py'
               - '.github/workflows/test.yml'
 
   test:
@@ -113,13 +113,13 @@ jobs:
       - name: "Run non-CUDA unit tests"
         run: |
           pytest --ignore=tests/disagg \
-            --ignore=tests/v1/multiprocess/ \
-            --ignore=tests/v1/distributed/ \
-            --ignore=tests/v1/mp_observability/ \
+            --ignore=tests/multiprocess/ \
+            --ignore=tests/distributed/ \
+            --ignore=tests/mp_observability/ \
             --ignore=tests/skipped \
             --ignore=tests/cli/commands/trace \
-            --ignore=tests/v1/storage_backend/test_eic.py \
-            --ignore=tests/v1/storage_backend/test_p2p_backend_with_controller.py
+            --ignore=tests/storage_backend/test_eic.py \
+            --ignore=tests/storage_backend/test_p2p_backend_with_controller.py
 
   raw-block-tests:
     needs: changes
@@ -169,6 +169,6 @@ jobs:
       - name: Run raw-block tests
         run: |
           pytest -q --basetemp=.pytest-tmp/raw-block \
-            tests/v1/storage_backend/test_raw_block_device.py \
-            tests/v1/storage_backend/test_raw_block_core.py \
-            tests/v1/multiprocess/test_raw_block_l2_adapter.py
+            tests/storage_backend/test_raw_block_device.py \
+            tests/storage_backend/test_raw_block_core.py \
+            tests/multiprocess/test_raw_block_l2_adapter.py

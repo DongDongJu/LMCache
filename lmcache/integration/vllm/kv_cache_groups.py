@@ -10,11 +10,11 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.v1.gpu_connector.utils import LayoutHints
+    from lmcache.gpu_connector.utils import LayoutHints
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.multiprocess.group_view import EngineGroupInfo
 
 logger = init_logger(__name__)
 
@@ -99,7 +99,7 @@ def create_engine_group_infos_from_vllm(
     ``KVCacheGroupSpec.layer_names`` from the v1 KV cache interface), maps each
     engine KV cache group's layer names to registered tensor indices, then
     splits the layers by physical transfer identity using the real tensors (via
-    the shared :func:`lmcache.v1.kv_layer_groups.group_layers_by_identity`).
+    the shared :func:`lmcache.kv_layer_groups.group_layers_by_identity`).
     vLLM-specific field access is intentionally confined to this function.
 
     Args:
@@ -116,14 +116,14 @@ def create_engine_group_infos_from_vllm(
         order used by store/retrieve block IDs.
     """
     # First Party
-    from lmcache.utils import EngineType
-    from lmcache.v1.gpu_connector.utils import (
+    from lmcache.gpu_connector.utils import (
         normalize_and_discover_per_layer_formats,
     )
-    from lmcache.v1.kv_layer_groups import (
+    from lmcache.kv_layer_groups import (
         EXCLUDED_ENGINE_GROUP,
         group_layers_by_identity,
     )
+    from lmcache.utils import EngineType
 
     # vLLM-specific field access (confined to this function): map each
     # registered KV tensor to its vLLM engine KV cache group index. vLLM places

@@ -125,9 +125,9 @@ This guide helps you get LMCache running end-to-end in a couple of minutes. Use 
 
             .. code-block:: text
 
-               [2026-04-22 19:49:56,316] LMCache INFO: Stored 16 tokens in 0.023 seconds (server.py:390:lmcache.v1.multiprocess.server)
-               [2026-04-22 19:49:56,555] LMCache INFO: Stored 16 tokens in 0.005 seconds (server.py:390:lmcache.v1.multiprocess.server)
-               [2026-04-22 19:49:56,691] LMCache INFO: Stored 16 tokens in 0.005 seconds (server.py:390:lmcache.v1.multiprocess.server)
+               [2026-04-22 19:49:56,316] LMCache INFO: Stored 16 tokens in 0.023 seconds (server.py:390:lmcache.multiprocess.server)
+               [2026-04-22 19:49:56,555] LMCache INFO: Stored 16 tokens in 0.005 seconds (server.py:390:lmcache.multiprocess.server)
+               [2026-04-22 19:49:56,691] LMCache INFO: Stored 16 tokens in 0.005 seconds (server.py:390:lmcache.multiprocess.server)
                ...
 
             **Second request** -- the shared prefix is retrieved from CPU
@@ -135,9 +135,9 @@ This guide helps you get LMCache running end-to-end in a couple of minutes. Use 
 
             .. code-block:: text
 
-               [2026-04-22 19:50:04,686] LMCache INFO: Retrieved 16 tokens in 0.003 seconds (server.py:573:lmcache.v1.multiprocess.server)
-               [2026-04-22 19:50:04,832] LMCache INFO: Stored 16 tokens in 0.005 seconds (server.py:390:lmcache.v1.multiprocess.server)
-               [2026-04-22 19:50:04,968] LMCache INFO: Stored 16 tokens in 0.005 seconds (server.py:390:lmcache.v1.multiprocess.server)
+               [2026-04-22 19:50:04,686] LMCache INFO: Retrieved 16 tokens in 0.003 seconds (server.py:573:lmcache.multiprocess.server)
+               [2026-04-22 19:50:04,832] LMCache INFO: Stored 16 tokens in 0.005 seconds (server.py:390:lmcache.multiprocess.server)
+               [2026-04-22 19:50:04,968] LMCache INFO: Stored 16 tokens in 0.005 seconds (server.py:390:lmcache.multiprocess.server)
                ...
 
             For request-level statistics (hit ratio, bytes transferred) see
@@ -302,7 +302,7 @@ This guide helps you get LMCache running end-to-end in a couple of minutes. Use 
          Prefill batch, #new-seq: 1, #new-token: 35, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0,
          Decode batch, #running-req: 1, #token: 74, token usage: 0.00, cuda graph: True, gen throughput (token/s): 1.63, #queue-req: 0,
          Decode batch, #running-req: 1, #token: 114, token usage: 0.00, cuda graph: True, gen throughput (token/s): 87.95, #queue-req: 0,
-         LMCache INFO: Stored 128 out of total 135 tokens. size: 0.0195 GB, cost 12.8890 ms, throughput: 1.5153 GB/s (cache_engine.py:623:lmcache.v1.cache_engine)
+         LMCache INFO: Stored 128 out of total 135 tokens. size: 0.0195 GB, cost 12.8890 ms, throughput: 1.5153 GB/s (cache_engine.py:623:lmcache.cache_engine)
 
       **Second request** -- Radix Cache and LMCache share the prefix; only the new portion is stored:
 
@@ -312,7 +312,7 @@ This guide helps you get LMCache running end-to-end in a couple of minutes. Use 
          Decode batch, #running-req: 1, #token: 64, token usage: 0.00, cuda graph: True, gen throughput (token/s): 8.29, #queue-req: 0,
          Decode batch, #running-req: 1, #token: 104, token usage: 0.00, cuda graph: True, gen throughput (token/s): 87.95, #queue-req: 0,
          Decode batch, #running-req: 1, #token: 144, token usage: 0.00, cuda graph: True, gen throughput (token/s): 87.89, #queue-req: 0,
-         LMCache INFO: Stored 112 out of total 140 tokens. size: 0.0171 GB, cost 11.1986 ms, throughput: 1.5261 GB/s (cache_engine.py:623:lmcache.v1.cache_engine)
+         LMCache INFO: Stored 112 out of total 140 tokens. size: 0.0171 GB, cost 11.1986 ms, throughput: 1.5261 GB/s (cache_engine.py:623:lmcache.cache_engine)
 
       - **Total tokens 140**: SGLang stores KV cache for both prefill and decode tokens together, so total = 40 prompt + 100 generated = 140 tokens.
       - **Cached tokens: 30**: SGLang's Radix Attention Cache reused 30 tokens from the first request.

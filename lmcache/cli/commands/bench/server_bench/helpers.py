@@ -2,7 +2,7 @@
 """Internal helpers for ``lmcache bench server``.
 
 This module owns the heavy runtime imports (``torch`` / ``zmq`` /
-``lmcache.v1.*``) and all pure / low-level helper functions used by
+``lmcache.*``) and all pure / low-level helper functions used by
 the ``server`` bench target. The CLI registration and execute
 orchestration live in :mod:`lmcache.cli.commands.bench.server_bench.command`.
 
@@ -33,7 +33,7 @@ from lmcache import torch_dev, torch_device_type
 
 # ``lmcache bench server`` allocates real CUDA tensors and talks to
 # the MP server via ZMQ, both of which are absent from the thin
-# ``lmcache-cli`` distribution (no torch, no zmq, no lmcache.v1.*).
+# ``lmcache-cli`` distribution (no torch, no zmq, no lmcache.*).
 # Importing them unconditionally would kill the *entire* ``lmcache``
 # CLI at registry load time with an opaque ImportError. Wrap the
 # heavy imports and remember the error so ``add_arguments`` /
@@ -45,31 +45,31 @@ try:
     import zmq  # noqa: F401  # availability probe; used by command.py
 
     # First Party
-    from lmcache.utils import (
-        EngineType,
-        check_interprocess_event_support,
-    )
-    from lmcache.v1.kv_layer_groups import (
+    from lmcache.kv_layer_groups import (
         DTYPE_MAP,
         KVLayerGroupInfo,
     )
-    from lmcache.v1.multiprocess.custom_types import (
+    from lmcache.multiprocess.custom_types import (
         IPCCacheServerKey,
         KVCache,
         RegisterEngineDrivenContextPayload,
     )
-    from lmcache.v1.multiprocess.futures import MessagingFuture
-    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
-    from lmcache.v1.multiprocess.mq import MessageQueueClient
-    from lmcache.v1.multiprocess.posix_shm import shm_open_pool_as_mmap
-    from lmcache.v1.multiprocess.protocols.base import RequestType
-    from lmcache.v1.multiprocess.protocols.engine import (
+    from lmcache.multiprocess.futures import MessagingFuture
+    from lmcache.multiprocess.group_view import EngineGroupInfo
+    from lmcache.multiprocess.mq import MessageQueueClient
+    from lmcache.multiprocess.posix_shm import shm_open_pool_as_mmap
+    from lmcache.multiprocess.protocols.base import RequestType
+    from lmcache.multiprocess.protocols.engine import (
         RegisterEngineDrivenContextResponse,
     )
-    from lmcache.v1.multiprocess.transfer_context.shm import ShmSlotDescriptor
-    from lmcache.v1.platform.cpu.shm import (
+    from lmcache.multiprocess.transfer_context.shm import ShmSlotDescriptor
+    from lmcache.platform.cpu.shm import (
         CpuShmTensorWrapper,
         shm_create_readwrite,
+    )
+    from lmcache.utils import (
+        EngineType,
+        check_interprocess_event_support,
     )
 except ImportError as _exc:
     _IMPORT_ERROR = _exc
@@ -89,7 +89,7 @@ except ImportError as _exc:
 def _require_full_install() -> None:
     """Exit with an install hint if the full LMCache runtime is missing.
 
-    ``lmcache bench server`` needs torch, zmq and ``lmcache.v1.*``
+    ``lmcache bench server`` needs torch, zmq and ``lmcache.*``
     (MP client, KV layer-group parser). When those imports failed at
     module load — almost always because the user installed
     ``lmcache-cli`` instead of the full package — print the shortest

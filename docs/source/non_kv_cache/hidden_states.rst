@@ -112,5 +112,5 @@ Design notes (user-visible)
   uniformly for any backend that implements ``contains()``.
 
 The full internal design (class layering, code paths, follow-up
-work) lives at :file:`docs/design/v1/hidden_state_store.md` in the
+work) lives at :file:`docs/design/hidden_state_store.md` in the
 source tree.

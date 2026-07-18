@@ -1,7 +1,7 @@
 # Transfer Channel Throughput Benchmark
 
 Measures read throughput (GB/s) of the LMCache **transfer channel**
-(`lmcache/v1/distributed/transfer_channel/`) for batched peer-to-peer reads.
+(`lmcache/distributed/transfer_channel/`) for batched peer-to-peer reads.
 
 Unlike a raw-tensor microbenchmark, this tool uses LMCache's `L1MemoryManager`
 to initialize the registered memory region and to **allocate the transferred

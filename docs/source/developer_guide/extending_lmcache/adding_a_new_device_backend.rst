@@ -47,14 +47,14 @@ Your PyTorch backend should support:
 Add a ``FooDeviceSpec``
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-Create ``lmcache/v1/platform/foo/__init__.py``:
+Create ``lmcache/platform/foo/__init__.py``:
 
 .. code-block:: python
 
     # SPDX-License-Identifier: Apache-2.0
     """foo-specific platform primitives."""
 
-    from lmcache.v1.platform.base_device_spec import DeviceSpec
+    from lmcache.platform.base_device_spec import DeviceSpec
 
 
     class FooDeviceSpec(DeviceSpec):
@@ -254,7 +254,7 @@ Implementation notes
   imported eagerly during ``get_backend()``.
 
 For concrete reference implementations, see
-``lmcache/v1/platform/cuda/`` and ``lmcache/v1/platform/musa/``.
+``lmcache/platform/cuda/`` and ``lmcache/platform/musa/``.
 Both are examples of what a vendor *may* do, not templates every new
 backend has to follow.
 
@@ -281,16 +281,16 @@ checks — both must succeed, otherwise the factory raises
 
 1. A ``DeviceIPCWrapper`` subclass with ``device_type`` and ``wrap``
    must be registered.  It is auto-discovered by scanning
-   ``lmcache/v1/platform/`` (see ``lmcache/v1/platform/_registry.py``),
+   ``lmcache/platform/`` (see ``lmcache/platform/_registry.py``),
    so you only need to ship the subclass under
-   ``lmcache/v1/platform/foo/``.
+   ``lmcache/platform/foo/``.
 2. ``DeviceSpec.is_handle_transfer_available()`` must return ``True``
    (the base-class default; override to ``False`` only if your device
    lacks IPC handle transfer).
 
 Separately, the LMCache-driven server module also requires a
 ``BaseCacheContext`` subclass under
-``lmcache/v1/platform/foo/cache_context.py``.  ``create_cache_context``
+``lmcache/platform/foo/cache_context.py``.  ``create_cache_context``
 discovers it lazily at runtime and raises ``ValueError`` if no backend
 matches the device type; it manages the KV cache layout and pointers
 used for IPC transfer.
@@ -332,19 +332,19 @@ References
    * - Topic
      - Path
    * - Device spec base
-     - ``lmcache/v1/platform/base_device_spec.py``
+     - ``lmcache/platform/base_device_spec.py``
    * - Backend loading
-     - ``lmcache/v1/platform/__init__.py``
+     - ``lmcache/platform/__init__.py``
    * - Python fallback
      - ``lmcache/python_ops_fallback.py``
    * - Cache context base
-     - ``lmcache/v1/platform/base_cache_context.py``
+     - ``lmcache/platform/base_cache_context.py``
    * - Cache context factory
-     - ``lmcache/v1/platform/cache_context.py``
+     - ``lmcache/platform/cache_context.py``
    * - Reference ``DeviceSpec`` (engine-driven baseline)
-     - ``lmcache/v1/platform/cuda/__init__.py``
+     - ``lmcache/platform/cuda/__init__.py``
    * - Reference ``DeviceSpec`` (LMCache-driven capable)
-     - ``lmcache/v1/platform/musa/__init__.py``
+     - ``lmcache/platform/musa/__init__.py``
    * - Engine-driven call site
-     - ``lmcache/v1/multiprocess/transfer_context/worker_transfer.py``
+     - ``lmcache/multiprocess/transfer_context/worker_transfer.py``
        (``EngineDrivenTransferContext``, ``create_transfer_context``)

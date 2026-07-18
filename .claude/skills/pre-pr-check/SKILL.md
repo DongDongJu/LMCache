@@ -181,8 +181,8 @@ Run these checks and report the outcome. Do NOT auto-run them; print the command
 
 ```bash
 pre-commit run --all-files
-pytest -xvs tests/v1/distributed/        # if distributed/ changed
-pytest -xvs tests/v1/mp_observability/   # if mp_observability/ changed
+pytest -xvs tests/distributed/        # if distributed/ changed
+pytest -xvs tests/mp_observability/   # if mp_observability/ changed
 ```
 
 ## Output Format
@@ -196,30 +196,30 @@ pytest -xvs tests/v1/mp_observability/   # if mp_observability/ changed
 Grouped by category, with file:line references. E.g.:
 
 **Typing (3 fixes)**
-- `lmcache/v1/foo.py:42` -- replaced `Optional[int]` with `int | None`
-- `lmcache/v1/foo.py:87` -- added type hint for `limit: int` and return type `-> list[str]`
-- `lmcache/v1/bar.py:120` -- replaced `dict` with `dict[str, int]`
+- `lmcache/foo.py:42` -- replaced `Optional[int]` with `int | None`
+- `lmcache/foo.py:87` -- added type hint for `limit: int` and return type `-> list[str]`
+- `lmcache/bar.py:120` -- replaced `dict` with `dict[str, int]`
 
 **Runtime validation (1 fix)**
-- `lmcache/v1/config.py:548` -- replaced `assert config.url is not None` with `if config.url is None: raise ValueError("url is required")`
+- `lmcache/config.py:548` -- replaced `assert config.url is not None` with `if config.url is None: raise ValueError("url is required")`
 
 **Docstrings (2 fixes)**
-- `lmcache/v1/baz.py:15` -- added full docstring for public method `submit_request`
-- `lmcache/v1/baz.py:60` -- updated docstring for `lookup` to reflect new `cache_salt` parameter
+- `lmcache/baz.py:15` -- added full docstring for public method `submit_request`
+- `lmcache/baz.py:60` -- updated docstring for `lookup` to reflect new `cache_salt` parameter
 
 ### Manual review required (needs developer judgment)
 
 Grouped by severity:
 
 **error** (must fix before PR):
-- `lmcache/v1/foo.py:230` -- new feature `BatchProcessor.process_async` has no tests in `tests/v1/`. Add unit tests that exercise the public `process_async` API.
-- `lmcache/v1/bar.py:15` -- `BarAdapter.do_thing` accesses `self._cache._internal_map` directly; use a public accessor or expose a method on `Cache`.
+- `lmcache/foo.py:230` -- new feature `BatchProcessor.process_async` has no tests in `tests/`. Add unit tests that exercise the public `process_async` API.
+- `lmcache/bar.py:15` -- `BarAdapter.do_thing` accesses `self._cache._internal_map` directly; use a public accessor or expose a method on `Cache`.
 
 **warning** (should fix):
-- `lmcache/v1/baz.py:42` -- `register(name: str, force: bool)` uses a boolean parameter. Consider splitting into `register(name)` and `register_overwrite(name)`, or using an enum `RegisterMode`.
+- `lmcache/baz.py:42` -- `register(name: str, force: bool)` uses a boolean parameter. Consider splitting into `register(name)` and `register_overwrite(name)`, or using an enum `RegisterMode`.
 
 **info** (suggestion):
-- `lmcache/v1/baz.py:78` -- filter parameter is named `filter`; consider `key_eligible_filter` for clarity.
+- `lmcache/baz.py:78` -- filter parameter is named `filter`; consider `key_eligible_filter` for clarity.
 
 ### Commands to run next
 

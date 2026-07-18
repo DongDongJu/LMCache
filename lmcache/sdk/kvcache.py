@@ -18,22 +18,22 @@ import torch
 import zmq
 
 # First Party
-from lmcache.integration.vllm.vllm_multi_process_adapter import send_lmcache_request
-from lmcache.logging import init_logger
-from lmcache.sdk.wrapper.contiguous import ContiguousTransferWrapper
-from lmcache.v1.gpu_connector.utils import (
+from lmcache.gpu_connector.utils import (
     DiscoverableKVCache,
     LayoutHints,
     get_block_size,
     get_num_heads,
 )
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
-from lmcache.v1.multiprocess.mq import MessageQueueClient
-from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
-from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+from lmcache.integration.vllm.vllm_multi_process_adapter import send_lmcache_request
+from lmcache.logging import init_logger
+from lmcache.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.multiprocess.mq import MessageQueueClient
+from lmcache.multiprocess.protocol import RequestType, get_response_class
+from lmcache.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     create_transfer_context,
 )
+from lmcache.sdk.wrapper.contiguous import ContiguousTransferWrapper
 import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
