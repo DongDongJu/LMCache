@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Any, Generic, Optional, TypeVar
+from typing import Any, Generic, Optional, TypeVar, cast
 import threading
 
 # First Party
@@ -91,9 +91,8 @@ class MessagingFuture(Generic[T]):
         Returns:
             A DeviceMessagingFuture pending on both this future and the event.
         """
-        # TODO: need extra type checking for the future type
-        return DeviceMessagingFuture.FromMessagingFuture(  # type: ignore
-            self,
+        return DeviceMessagingFuture.FromMessagingFuture(
+            cast(MessagingFuture[tuple[bytes, Any]], self),
             device,
             completion_event=completion_event,
         )

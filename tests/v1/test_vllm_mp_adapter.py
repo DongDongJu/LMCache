@@ -4,7 +4,7 @@ stubbed (see ``fake_adapter``); no GPU or live server needed. End-to-end
 recovery: ``.buildkite/k3_tests/multiprocess/scripts/run-restart-recovery.sh``."""
 
 # Standard
-from typing import Callable, ClassVar
+from typing import Any, Callable, ClassVar
 from unittest.mock import MagicMock
 import gc
 import os
@@ -483,7 +483,7 @@ def test_device_future_without_worker_event_uses_legacy_completion(fake_adapter)
 def test_retrieve_raw_response_failure_propagates(fake_adapter):
     """Malformed raw responses are not mistaken for retryable stream waits."""
     adapter, _send_mock, _future = fake_adapter
-    raw_future = MessagingFuture()
+    raw_future: MessagingFuture[Any] = MessagingFuture()
     raw_future.set_result(None)
     retrieve_future = DeviceMessagingFuture.FromMessagingFuture(
         raw_future,
@@ -507,7 +507,7 @@ def test_unhealthy_retrieve_events_survive_shutdown_until_raw_response(
     """Unhealthy drain retains both event owners until the server responds."""
     adapter, _send_mock, _future = fake_adapter
     adapter.transfer_ctx = MagicMock()
-    raw_future = MessagingFuture()
+    raw_future: MessagingFuture[tuple[bytes, bool]] = MessagingFuture()
     completion_event = FakeCudaEvent()
     producer_event = FakeCudaEvent()
     retrieve_future = DeviceMessagingFuture.FromMessagingFuture(
