@@ -22,6 +22,10 @@ from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheServerKey,
 )
+from lmcache.v1.multiprocess.futures import (
+    DeviceMessagingFuture,
+    DeviceStreamWaitError,
+)
 from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
     expand_engine_block_ids,
@@ -1065,6 +1069,12 @@ class LMCacheMPWorkerAdapter:
         # event object to stay alive until the consumer is done with it.
         self.store_events: dict[str, _IpcEvent] = {}
         self.retrieve_events: dict[str, _IpcEvent] = {}
+        # An unhealthy drain may report recomputation before the MP server
+        # acknowledges recording its worker-owned completion event. Retain
+        # both event owners until that raw response is terminal.
+        self._orphaned_device_retrieves: list[
+            tuple[DeviceMessagingFuture[RetrieveResult], _IpcEvent | None]
+        ] = []
 
         # Block IDs that failed due to retrieve timeout
         self.error_block_ids: set[int] = set()
@@ -1520,14 +1530,23 @@ class LMCacheMPWorkerAdapter:
             take care of deduplicating the request IDs and only return the request
             IDs that have not been returned before.
         """
+        self._reap_orphaned_device_retrieves()
+
         # If unhealthy, drain all pending futures immediately
         if not self.is_healthy:
             finished_stores = set(self.store_futures.keys())
             finished_retrieves = set()
             for request_id, (
-                _r_future,
+                r_future,
                 r_block_ids,
             ) in self.retrieve_futures.items():
+                if (
+                    isinstance(r_future, DeviceMessagingFuture)
+                    and r_future.supports_stream_ordered_completion
+                ):
+                    self._orphaned_device_retrieves.append(
+                        (r_future, self.retrieve_events.get(request_id))
+                    )
                 finished_retrieves.add(request_id)
                 self.error_block_ids.update(r_block_ids)
             self.store_futures.clear()
@@ -1572,10 +1591,29 @@ class LMCacheMPWorkerAdapter:
                 )
 
         for request_id, (r_future, _) in self.retrieve_futures.items():
-            if not r_future.query():
-                continue
-
-            r_result = r_future.result()
+            if (
+                isinstance(r_future, DeviceMessagingFuture)
+                and r_future.supports_stream_ordered_completion
+            ):
+                if not r_future.raw_response_ready():
+                    continue
+                try:
+                    r_result = r_future.result_on_current_stream()
+                except DeviceStreamWaitError:
+                    logger.exception(
+                        "Cannot order retrieve completion on the current "
+                        "device stream for request_id=%s; falling back to "
+                        "host synchronization",
+                        request_id,
+                    )
+                    # Make one correctness fallback attempt. Any host
+                    # synchronization error propagates instead of silently
+                    # leaving this request pending forever.
+                    r_result = r_future.result()
+            else:
+                if not r_future.query():
+                    continue
+                r_result = r_future.result()
             finished_retrieves.add(request_id)
 
             if not r_result:
@@ -1694,8 +1732,17 @@ class LMCacheMPWorkerAdapter:
 
         self.mq_client.close()
         self.request_telemetry.close()
+        self._reap_orphaned_device_retrieves()
 
     # Helper functions
+    def _reap_orphaned_device_retrieves(self) -> None:
+        """Release orphaned event owners whose raw response is terminal."""
+        self._orphaned_device_retrieves = [
+            orphan
+            for orphan in self._orphaned_device_retrieves
+            if not orphan[0].raw_response_ready()
+        ]
+
     def _update_and_get_finished_store(
         self,
     ) -> set[str]:

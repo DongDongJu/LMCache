@@ -74,6 +74,7 @@ REQUEST_NAMES = [
     "COMMIT_STORE",
     "PREPARE_RETRIEVE",
     "COMMIT_RETRIEVE",
+    "RETRIEVE_WITH_WORKER_COMPLETION",
 ]
 
 # Type alias for cache keys
@@ -147,6 +148,19 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         # Returns: tuple[bytes, bool] - (CUDA event handle, success flag)
         "RETRIEVE": ProtocolDefinition(
             payload_classes=[KeyType, int, list[list[int]], bytes, int],
+            response_class=tuple[bytes, bool],
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Retrieve with a distinct worker-owned completion event. This requires
+        # a coordinated upgrade: a new worker needs a server that registers
+        # this request, while a new server continues accepting legacy RETRIEVE.
+        # The server imports and records the final handle but never owns its
+        # lifetime.
+        # Payload fields match RETRIEVE, followed by:
+        #   - completion_event_ipc_handle: worker-owned event the server records
+        # Returns: tuple[bytes, bool] - (echoed completion handle, success flag)
+        "RETRIEVE_WITH_WORKER_COMPLETION": ProtocolDefinition(
+            payload_classes=[KeyType, int, list[list[int]], bytes, int, bytes],
             response_class=tuple[bytes, bool],
             handler_type=HandlerType.BLOCKING,
         ),

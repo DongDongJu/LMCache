@@ -90,6 +90,9 @@ class RequestType(enum.Enum):
     P2P_QUERY_LOOKUP_RESULTS = enum.auto()
     P2P_UNLOCK_OBJECTS = enum.auto()
 
+    # Appended to preserve the wire values of existing request types.
+    RETRIEVE_WITH_WORKER_COMPLETION = enum.auto()
+
 
 @dataclass
 class ProtocolDefinition:

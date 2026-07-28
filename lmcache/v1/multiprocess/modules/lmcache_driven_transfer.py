@@ -794,7 +794,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             ),
             HandlerSpec(
                 RequestType.RETRIEVE,
-                self.retrieve,
+                self._legacy_retrieve_handler,
+                ThreadPoolType.AFFINITY,
+            ),
+            HandlerSpec(
+                RequestType.RETRIEVE_WITH_WORKER_COMPLETION,
+                self._worker_completion_retrieve_handler,
                 ThreadPoolType.AFFINITY,
             ),
         ]
@@ -1152,6 +1157,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         gpu_block_ids: list[list[int]],
         event_ipc_handle: bytes,
         skip_first_n_tokens: int = 0,
+        completion_event_ipc_handle: bytes | None = None,
     ) -> tuple[bytes, bool]:
         """Retrieve the CPU KV cache and put into GPU blocks.
 
@@ -1166,6 +1172,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 the start of the retrieve range. This avoids overwriting
                 APC-shared GPU blocks that may be read concurrently by other
                 requests.
+            completion_event_ipc_handle: Optional worker-owned event for the
+                server to record after retrieval. Legacy callers omit it and
+                receive a server-owned completion event.
 
         Returns:
             A tuple where the first element is the IPC handle of the event
@@ -1228,7 +1237,18 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             torch_dev.device(cache_context.device),
             torch_dev.stream(cache_context.stream),
         ):
-            event = event_backend.create_event(cache_context.device)
+            if completion_event_ipc_handle is None:
+                event = event_backend.create_event(cache_context.device)
+            else:
+                event = event_backend.import_event(
+                    completion_event_ipc_handle,
+                    cache_context.device,
+                )
+
+            def response_event_handle() -> bytes:
+                if completion_event_ipc_handle is not None:
+                    return completion_event_ipc_handle
+                return event_backend.export_event(event, cache_context.device)
 
             # Fail closed: a short block-id list would drive the transfer
             # kernel to write out-of-bounds GPU memory. Checked on the raw
@@ -1250,7 +1270,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     blocks_per_chunk,
                 )
                 event_backend.record_event(event, cache_context.stream)
-                return event_backend.export_event(event, cache_context.device), False
+                return response_event_handle(), False
 
             # Cut and stage all block_ids to GPU once before the transfer
             block_ids_per_group_gpu = downsample_and_stage_block_ids(
@@ -1332,6 +1352,42 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             )
 
         return (
-            event_backend.export_event(event, cache_context.device),
+            response_event_handle(),
             retrieve_succeeded,
+        )
+
+    def _legacy_retrieve_handler(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        gpu_block_ids: list[list[int]],
+        event_ipc_handle: bytes,
+        skip_first_n_tokens: int,
+    ) -> tuple[bytes, bool]:
+        """Serve the original five-payload RETRIEVE wire contract."""
+        return self.retrieve(
+            key,
+            instance_id,
+            gpu_block_ids,
+            event_ipc_handle,
+            skip_first_n_tokens,
+        )
+
+    def _worker_completion_retrieve_handler(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        gpu_block_ids: list[list[int]],
+        event_ipc_handle: bytes,
+        skip_first_n_tokens: int,
+        completion_event_ipc_handle: bytes,
+    ) -> tuple[bytes, bool]:
+        """Serve RETRIEVE with a worker-owned completion event."""
+        return self.retrieve(
+            key,
+            instance_id,
+            gpu_block_ids,
+            event_ipc_handle,
+            skip_first_n_tokens,
+            completion_event_ipc_handle,
         )

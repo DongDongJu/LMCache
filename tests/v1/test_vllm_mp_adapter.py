@@ -24,6 +24,11 @@ from lmcache.integration.vllm.vllm_multi_process_adapter import (
     LoadStoreOp,
     ParallelStrategy,
 )
+from lmcache.v1.multiprocess.futures import (
+    DeviceMessagingFuture,
+    DeviceStreamWaitError,
+    MessagingFuture,
+)
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocol import RequestType
 
@@ -381,6 +386,164 @@ def test_retrieve_keeps_event_until_future_finishes(fake_adapter):
     transfer_ctx.reset_mock()
     gc.collect()
     assert event_ref() is None
+
+
+def test_retrieve_completion_waits_on_current_stream(fake_adapter):
+    """Device retrieves finish after enqueueing a consumer-stream wait."""
+    adapter, _send_mock, _future = fake_adapter
+    retrieve_future = MagicMock(spec=DeviceMessagingFuture)
+    retrieve_future.supports_stream_ordered_completion = True
+    retrieve_future.raw_response_ready.side_effect = [False, True]
+    retrieve_future.result_on_current_stream.return_value = True
+    adapter.retrieve_futures["req-1"] = (retrieve_future, [7])
+    adapter.retrieve_events["req-1"] = FakeCudaEvent()
+
+    finished_stores, finished_retrieves = adapter.get_finished(set())
+
+    assert finished_stores == set()
+    assert finished_retrieves == set()
+    retrieve_future.result_on_current_stream.assert_not_called()
+    assert "req-1" in adapter.retrieve_futures
+
+    finished_stores, finished_retrieves = adapter.get_finished(set())
+
+    assert finished_stores == set()
+    assert finished_retrieves == {"req-1"}
+    retrieve_future.result_on_current_stream.assert_called_once_with()
+    retrieve_future.query.assert_not_called()
+    retrieve_future.result.assert_not_called()
+    assert "req-1" not in adapter.retrieve_futures
+    assert "req-1" not in adapter.retrieve_events
+
+
+def test_retrieve_stream_wait_failure_uses_host_fallback(fake_adapter):
+    """A failed stream wait performs one host synchronization fallback."""
+    adapter, _send_mock, _future = fake_adapter
+    retrieve_future = MagicMock(spec=DeviceMessagingFuture)
+    retrieve_future.supports_stream_ordered_completion = True
+    retrieve_future.raw_response_ready.return_value = True
+    retrieve_future.result_on_current_stream.side_effect = DeviceStreamWaitError(
+        "wait failed"
+    )
+    retrieve_future.result.return_value = True
+    event = FakeCudaEvent()
+    adapter.retrieve_futures["req-1"] = (retrieve_future, [7])
+    adapter.retrieve_events["req-1"] = event
+
+    finished_stores, finished_retrieves = adapter.get_finished(set())
+
+    assert finished_stores == set()
+    assert finished_retrieves == {"req-1"}
+    retrieve_future.result.assert_called_once_with()
+    assert "req-1" not in adapter.retrieve_futures
+    assert "req-1" not in adapter.retrieve_events
+
+
+def test_retrieve_stream_wait_and_host_fallback_failure_propagates(fake_adapter):
+    """A failed host fallback propagates instead of retrying forever."""
+    adapter, _send_mock, _future = fake_adapter
+    retrieve_future = MagicMock(spec=DeviceMessagingFuture)
+    retrieve_future.supports_stream_ordered_completion = True
+    retrieve_future.raw_response_ready.return_value = True
+    retrieve_future.result_on_current_stream.side_effect = DeviceStreamWaitError(
+        "wait failed"
+    )
+    retrieve_future.result.side_effect = RuntimeError("sync failed")
+    event = FakeCudaEvent()
+    adapter.retrieve_futures["req-1"] = (retrieve_future, [7])
+    adapter.retrieve_events["req-1"] = event
+
+    with pytest.raises(RuntimeError, match="sync failed"):
+        adapter.get_finished(set())
+
+    retrieve_future.result.assert_called_once_with()
+    assert adapter.retrieve_futures["req-1"][0] is retrieve_future
+    assert adapter.retrieve_events["req-1"] is event
+
+
+def test_device_future_without_worker_event_uses_legacy_completion(fake_adapter):
+    """Server-owned device events retain the legacy query/result path."""
+    adapter, _send_mock, _future = fake_adapter
+    retrieve_future = MagicMock(spec=DeviceMessagingFuture)
+    retrieve_future.supports_stream_ordered_completion = False
+    retrieve_future.query.return_value = True
+    retrieve_future.result.return_value = True
+    adapter.retrieve_futures["req-1"] = (retrieve_future, [7])
+    adapter.retrieve_events["req-1"] = FakeCudaEvent()
+
+    _, finished_retrieves = adapter.get_finished(set())
+
+    assert finished_retrieves == {"req-1"}
+    retrieve_future.query.assert_called_once_with()
+    retrieve_future.result.assert_called_once_with()
+    retrieve_future.raw_response_ready.assert_not_called()
+    retrieve_future.result_on_current_stream.assert_not_called()
+
+
+def test_retrieve_raw_response_failure_propagates(fake_adapter):
+    """Malformed raw responses are not mistaken for retryable stream waits."""
+    adapter, _send_mock, _future = fake_adapter
+    raw_future = MessagingFuture()
+    raw_future.set_result(None)
+    retrieve_future = DeviceMessagingFuture.FromMessagingFuture(
+        raw_future,
+        device="cpu",
+        completion_event=FakeCudaEvent(),
+    )
+    event = FakeCudaEvent()
+    adapter.retrieve_futures["req-1"] = (retrieve_future, [7])
+    adapter.retrieve_events["req-1"] = event
+
+    with pytest.raises(TypeError, match="cannot unpack"):
+        adapter.get_finished(set())
+
+    assert adapter.retrieve_futures["req-1"][0] is retrieve_future
+    assert adapter.retrieve_events["req-1"] is event
+
+
+def test_unhealthy_retrieve_events_survive_shutdown_until_raw_response(
+    fake_adapter,
+) -> None:
+    """Unhealthy drain retains both event owners until the server responds."""
+    adapter, _send_mock, _future = fake_adapter
+    adapter.transfer_ctx = MagicMock()
+    raw_future = MessagingFuture()
+    completion_event = FakeCudaEvent()
+    producer_event = FakeCudaEvent()
+    retrieve_future = DeviceMessagingFuture.FromMessagingFuture(
+        raw_future,
+        device="cpu",
+        completion_event=completion_event,
+    )
+    future_ref = weakref.ref(retrieve_future)
+    completion_ref = weakref.ref(completion_event)
+    producer_ref = weakref.ref(producer_event)
+    adapter.retrieve_futures["req-1"] = (retrieve_future, [7])
+    adapter.retrieve_events["req-1"] = producer_event
+    adapter._health_event.clear()
+
+    _, finished_retrieves = adapter.get_finished(set())
+
+    assert finished_retrieves == {"req-1"}
+    assert adapter.get_block_ids_with_load_errors() == {7}
+    del retrieve_future, completion_event, producer_event
+    gc.collect()
+    assert future_ref() is not None
+    assert completion_ref() is not None
+    assert producer_ref() is not None
+
+    adapter.shutdown()
+    gc.collect()
+    assert future_ref() is not None
+    assert completion_ref() is not None
+    assert producer_ref() is not None
+
+    raw_future.set_result((b"worker-completion", True))
+    adapter.get_finished(set())
+    gc.collect()
+    assert future_ref() is None
+    assert completion_ref() is None
+    assert producer_ref() is None
 
 
 def test_instance_id_is_uuid_derived_63_bit_int(fake_adapter) -> None:

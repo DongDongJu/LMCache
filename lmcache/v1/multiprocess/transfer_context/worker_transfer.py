@@ -483,12 +483,30 @@ class LMCacheDrivenTransferContext(TransferContext):
                 "LMCache-driven transfer context is not registered. "
                 "Call register() before submit_retrieve()."
             )
-        event_ipc_handle = self._event_backend.export_event(event, self._device)
+        producer_event_ipc_handle = self._event_backend.export_event(
+            event,
+            self._device,
+        )
+        completion_event = self._event_backend.create_event(self._device)
+        completion_event_ipc_handle = self._event_backend.export_event(
+            completion_event,
+            self._device,
+        )
         return self._send_request(
             self._mq_client,
-            RequestType.RETRIEVE,
-            [key, instance_id, block_ids, event_ipc_handle, skip_first_n_tokens],
-        ).to_device_future(device=self._device)
+            RequestType.RETRIEVE_WITH_WORKER_COMPLETION,
+            [
+                key,
+                instance_id,
+                block_ids,
+                producer_event_ipc_handle,
+                skip_first_n_tokens,
+                completion_event_ipc_handle,
+            ],
+        ).to_device_future(
+            device=self._device,
+            completion_event=completion_event,
+        )
 
     def close(self) -> None:
         """Release the message queue and cached event-backend state."""

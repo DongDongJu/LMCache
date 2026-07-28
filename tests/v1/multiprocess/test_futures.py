@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from typing import Any
+import gc
 import multiprocessing as mp
 import threading
 import time
+import weakref
 
 # Third Party
 import pytest
@@ -29,6 +32,25 @@ def _create_cuda_event_in_process(event_queue: mp.Queue, delay: float = 0.0):
 
     # Send the event handle to the main process
     event_queue.put(event_bytes)
+
+
+def _record_worker_owned_cuda_event(
+    event_handle: bytes,
+    device_index: int,
+    ready_queue: Any,
+    release_event: Any,
+    delay_cycles: int,
+) -> None:
+    """Record a parent-owned IPC event after queued child GPU work."""
+    torch.cuda.init()
+    torch.cuda.set_device(device_index)
+    event = torch.cuda.Event.from_ipc_handle(device_index, event_handle)
+    stream = torch.cuda.Stream(device=device_index)
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(delay_cycles)
+        event.record(stream)
+    ready_queue.put(True)
+    release_event.wait(timeout=30)
 
 
 def test_messaging_future_basic_usage():
@@ -586,6 +608,69 @@ def test_cuda_messaging_future_with_explicit_device():
     assert result == "explicit device", f"Expected 'explicit device', got {result}"
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for worker-owned IPC event tests",
+)
+def test_worker_owned_event_orders_consumer_stream_across_processes():
+    """CUDA consumer work survives immediate worker-event object destruction."""
+    torch.cuda.init()
+    device_index = torch.cuda.current_device()
+    device = torch.device("cuda", device_index)
+    marker = torch.zeros(1, device=device)
+    completion_event = torch.cuda.Event(interprocess=True)
+    completion_ref = weakref.ref(completion_event)
+    event_handle = completion_event.ipc_handle()
+
+    ctx = mp.get_context("spawn")
+    ready_queue = ctx.Queue()
+    release_event = ctx.Event()
+    process = ctx.Process(
+        target=_record_worker_owned_cuda_event,
+        args=(
+            event_handle,
+            device_index,
+            ready_queue,
+            release_event,
+            2_000_000_000,
+        ),
+    )
+    process.start()
+
+    try:
+        assert ready_queue.get(timeout=30) is True
+
+        raw_future = MessagingFuture[tuple[bytes, bool]]()
+        future = raw_future.to_device_future(
+            device=device,
+            completion_event=completion_event,
+        )
+        raw_future.set_result((event_handle, True))
+
+        consumer_stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(consumer_stream):
+            assert future.raw_response_ready()
+            assert future.result_on_current_stream() is True
+            marker.fill_(1)
+
+        del future, raw_future, completion_event
+        gc.collect()
+        assert completion_ref() is None
+        assert not consumer_stream.query()
+        consumer_stream.synchronize()
+        assert marker.item() == 1
+    finally:
+        release_event.set()
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        ready_queue.close()
+        ready_queue.join_thread()
+
+    assert process.exitcode == 0
+
+
 # ==============================================================================
 # Device-neutral future wiring (no CUDA required)
 # ==============================================================================
@@ -617,6 +702,7 @@ def test_device_future_stub_end_to_end():
 
     raw = MessagingFuture[tuple[bytes, int]]()
     fut = DeviceMessagingFuture.FromMessagingFuture(raw, device="cpu")
+    assert not fut.supports_stream_ordered_completion
     assert not fut.query()
     raw.set_result((b"stub_ipc_handle", 7))
     assert fut.wait() is True
@@ -660,6 +746,86 @@ def test_device_future_delegates_to_backend(monkeypatch):
     assert ("check", "dev") in calls
     assert ("import", b"h", "dev") in calls
     assert any(c[0] == "sync" for c in calls)
+    with pytest.raises(RuntimeError, match="caller-owned event"):
+        fut.result_on_current_stream()
+
+
+def test_device_future_orders_worker_event_on_current_stream(monkeypatch):
+    """A ready response enqueues a stream wait without host synchronization."""
+    # First Party
+    from lmcache.v1.multiprocess import futures
+    from lmcache.v1.multiprocess.futures import (
+        DeviceMessagingFuture,
+        DeviceStreamWaitError,
+    )
+
+    calls = []
+    fail_wait = False
+
+    class _CompletionEvent:
+        pass
+
+    class _FakeBackend:
+        device_type = "fake"
+
+        def check_event_support(self, device):
+            calls.append(("check", device))
+
+        def import_event(self, handle, device):
+            raise AssertionError("worker-owned event must not be imported")
+
+        def wait_event(self, event, stream):
+            if fail_wait:
+                raise RuntimeError("backend wait failed")
+            calls.append(("wait", event, stream))
+
+        def synchronize_event(self, event, device):
+            raise AssertionError("current-stream completion must not host-sync")
+
+    monkeypatch.setattr(
+        futures,
+        "get_event_ipc_backend",
+        lambda device=None: _FakeBackend(),
+    )
+    monkeypatch.setattr(
+        futures.torch_dev,
+        "current_stream",
+        lambda device: "consumer-stream",
+    )
+
+    raw = MessagingFuture[tuple[bytes, bool]]()
+    completion_event = _CompletionEvent()
+    event_ref = weakref.ref(completion_event)
+    future = DeviceMessagingFuture.FromMessagingFuture(
+        raw,
+        device="dev",
+        completion_event=completion_event,
+    )
+
+    assert future.supports_stream_ordered_completion
+    del completion_event
+    gc.collect()
+    assert event_ref() is not None
+    assert not future.raw_response_ready()
+    with pytest.raises(
+        TimeoutError,
+        match="raw response is not available",
+    ):
+        future.result_on_current_stream()
+
+    raw.set_result((b"worker-completion", True))
+
+    assert future.raw_response_ready()
+    assert future.result_on_current_stream() is True
+    assert calls == [
+        ("check", "dev"),
+        ("wait", event_ref(), "consumer-stream"),
+    ]
+
+    fail_wait = True
+    with pytest.raises(DeviceStreamWaitError, match="Cannot order") as exc_info:
+        future.result_on_current_stream()
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
 
 
 def test_device_future_checks_backend_support_during_initialization(

@@ -175,15 +175,29 @@ def test_worker_exports_events_through_platform_backend(
         ["key", 1, [[0]], b"completion-handle"],
     )
     assert sent[2] == (
-        RequestType.RETRIEVE,
-        ["key", 1, [[0]], b"completion-handle", 2],
+        RequestType.RETRIEVE_WITH_WORKER_COMPLETION,
+        [
+            "key",
+            1,
+            [[0]],
+            b"completion-handle",
+            2,
+            b"completion-handle",
+        ],
     )
     assert [call[0] for call in backend.calls] == [
         "check",
         "export",
         "export",
+        "create",
+        "export",
     ]
-    assert all(call[-1] == torch.device("cpu") for call in backend.calls)
+    assert all(
+        call[-1] == torch.device("cpu")
+        for call in backend.calls
+        if call[0] in {"check", "export"}
+    )
+    assert backend.calls[3][1] == torch.device("cpu")
 
 
 def test_server_store_and_retrieve_delegate_event_ordering(
@@ -275,17 +289,41 @@ def test_server_store_and_retrieve_delegate_event_ordering(
         b"completion-handle",
         True,
     )
-    assert module.retrieve(key, 1, [[]], b"retrieve-producer") == (
+    assert module.retrieve(key, 1, [[]], b"legacy-retrieve-producer") == (
         b"completion-handle",
+        False,
+    )
+    assert module.retrieve(
+        key,
+        1,
+        [[]],
+        b"worker-retrieve-producer",
+        completion_event_ipc_handle=b"retrieve-completion",
+    ) == (
+        b"retrieve-completion",
         False,
     )
 
     imported_handles = [call[1] for call in backend.calls if call[0] == "import"]
     waited_handles = [call[1][1] for call in backend.calls if call[0] == "wait"]
-    assert imported_handles == [b"store-producer", b"retrieve-producer"]
-    assert waited_handles == [b"store-producer", b"retrieve-producer"]
-    assert sum(call[0] == "record" for call in backend.calls) == 2
+    assert imported_handles == [
+        b"store-producer",
+        b"legacy-retrieve-producer",
+        b"retrieve-completion",
+        b"worker-retrieve-producer",
+    ]
+    assert waited_handles == [
+        b"store-producer",
+        b"legacy-retrieve-producer",
+        b"worker-retrieve-producer",
+    ]
+    assert sum(call[0] == "record" for call in backend.calls) == 3
     assert sum(call[0] == "export" for call in backend.calls) == 2
+    assert (
+        "record",
+        ("remote", b"retrieve-completion"),
+        "transfer-stream",
+    ) in backend.calls
     for index, call in enumerate(backend.calls):
         if call[0] == "export":
             assert backend.calls[index - 1][0] == "record"

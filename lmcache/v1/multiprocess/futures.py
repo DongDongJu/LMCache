@@ -12,6 +12,10 @@ from lmcache.v1.platform.base.event_ipc import get_event_ipc_backend
 T = TypeVar("T")
 
 
+class DeviceStreamWaitError(RuntimeError):
+    """Raised when device completion cannot be ordered on the current stream."""
+
+
 class MessagingFuture(Generic[T]):
     def __init__(self):
         self.is_done_ = threading.Event()
@@ -73,18 +77,26 @@ class MessagingFuture(Generic[T]):
     def to_device_future(
         self,
         device: Any | None = None,
+        completion_event: Any | None = None,
     ) -> "DeviceMessagingFuture":
         """Wrap this future in a device-aware future.
 
         Args:
             device: The device whose event backend orders completion. Defaults
                 to the active device.
+            completion_event: Optional caller-owned event that the remote
+                process records. When supplied, the future retains and waits
+                on this event instead of importing the response handle.
 
         Returns:
             A DeviceMessagingFuture pending on both this future and the event.
         """
         # TODO: need extra type checking for the future type
-        return DeviceMessagingFuture.FromMessagingFuture(self, device)  # type: ignore
+        return DeviceMessagingFuture.FromMessagingFuture(  # type: ignore
+            self,
+            device,
+            completion_event=completion_event,
+        )
 
     @lmcache_deprecate("Use to_device_future() instead")
     def to_cuda_future(
@@ -115,10 +127,12 @@ class DeviceMessagingFuture(MessagingFuture[T]):
         self,
         raw_future: MessagingFuture[tuple[bytes, T]],
         device: Any | None = None,
+        completion_event: Any | None = None,
     ) -> None:
         super().__init__()
         self.raw_future_ = raw_future
         self.event_: Any | None = None
+        self._completion_event = completion_event
         self.result_: T | None = None
         self.device_ = device if device is not None else torch_dev.current_device()
         self._event_backend = get_event_ipc_backend(self.device_)
@@ -131,7 +145,10 @@ class DeviceMessagingFuture(MessagingFuture[T]):
         event_bytes, result = self.raw_future_.result()
         self.result_ = result
 
-        self.event_ = self._event_backend.import_event(event_bytes, self.device_)
+        if self._completion_event is not None:
+            self.event_ = self._completion_event
+        else:
+            self.event_ = self._event_backend.import_event(event_bytes, self.device_)
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         """
@@ -206,6 +223,67 @@ class DeviceMessagingFuture(MessagingFuture[T]):
 
         return False
 
+    def raw_response_ready(self) -> bool:
+        """Return whether the message response is available.
+
+        Unlike :meth:`query`, this method does not inspect device completion.
+        It lets a caller enqueue a stream dependency after the remote process
+        has recorded the completion event, without blocking the host.
+
+        Returns:
+            ``True`` if the response is available; otherwise ``False``.
+        """
+        return self.event_ is not None or self.raw_future_.query()
+
+    @property
+    def supports_stream_ordered_completion(self) -> bool:
+        """Return whether this future owns a stream-wait-safe event.
+
+        Returns:
+            ``True`` when the caller owns and the future retains the
+            completion event; otherwise ``False``.
+        """
+        return self._completion_event is not None
+
+    def result_on_current_stream(self) -> T:
+        """Order device completion on the current stream and return the result.
+
+        This method requires the raw response to be available. It enqueues a
+        wait on the current device stream without synchronizing the host.
+
+        Returns:
+            The response result.
+
+        Raises:
+            LMCacheTimeoutError: If the raw response is not yet available.
+            RuntimeError: If this future does not retain a caller-owned
+                completion event.
+            DeviceStreamWaitError: If the current-stream wait cannot be
+                enqueued.
+        """
+        if self._completion_event is None:
+            raise RuntimeError(
+                "Stream-ordered completion requires a caller-owned event"
+            )
+        if self.event_ is None:
+            if not self.raw_future_.query():
+                raise LMCacheTimeoutError(
+                    "DeviceMessagingFuture raw response is not available"
+                )
+            self._on_raw_future_complete()
+
+        assert self.event_ is not None
+        try:
+            stream = torch_dev.current_stream(self.device_)
+            self._event_backend.wait_event(self.event_, stream)
+        except Exception as exc:
+            raise DeviceStreamWaitError(
+                "Cannot order device completion on the current stream"
+            ) from exc
+
+        assert self.result_ is not None
+        return self.result_
+
     def set_result(self, result: T) -> None:
         raise NotImplementedError(
             "DeviceMessagingFuture does not support set_result directly"
@@ -215,8 +293,13 @@ class DeviceMessagingFuture(MessagingFuture[T]):
     def FromMessagingFuture(
         raw_future: MessagingFuture[tuple[bytes, T]],
         device: Any | None = None,
+        completion_event: Any | None = None,
     ) -> "DeviceMessagingFuture[T]":
-        return DeviceMessagingFuture(raw_future, device)
+        return DeviceMessagingFuture(
+            raw_future,
+            device,
+            completion_event=completion_event,
+        )
 
 
 # Backward-compatible alias for existing imports.
