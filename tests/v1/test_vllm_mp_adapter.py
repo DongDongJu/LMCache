@@ -416,8 +416,8 @@ def test_retrieve_completion_waits_on_current_stream(fake_adapter):
     assert "req-1" not in adapter.retrieve_events
 
 
-def test_retrieve_stream_wait_failure_uses_host_fallback(fake_adapter):
-    """A failed stream wait performs one host synchronization fallback."""
+def test_retrieve_stream_wait_failure_propagates(fake_adapter):
+    """A failed stream wait is reported to the caller."""
     adapter, _send_mock, _future = fake_adapter
     retrieve_future = MagicMock(spec=DeviceMessagingFuture)
     retrieve_future.supports_stream_ordered_completion = True
@@ -425,38 +425,14 @@ def test_retrieve_stream_wait_failure_uses_host_fallback(fake_adapter):
     retrieve_future.result_on_current_stream.side_effect = DeviceStreamWaitError(
         "wait failed"
     )
-    retrieve_future.result.return_value = True
     event = FakeCudaEvent()
     adapter.retrieve_futures["req-1"] = (retrieve_future, [7])
     adapter.retrieve_events["req-1"] = event
 
-    finished_stores, finished_retrieves = adapter.get_finished(set())
-
-    assert finished_stores == set()
-    assert finished_retrieves == {"req-1"}
-    retrieve_future.result.assert_called_once_with()
-    assert "req-1" not in adapter.retrieve_futures
-    assert "req-1" not in adapter.retrieve_events
-
-
-def test_retrieve_stream_wait_and_host_fallback_failure_propagates(fake_adapter):
-    """A failed host fallback propagates instead of retrying forever."""
-    adapter, _send_mock, _future = fake_adapter
-    retrieve_future = MagicMock(spec=DeviceMessagingFuture)
-    retrieve_future.supports_stream_ordered_completion = True
-    retrieve_future.raw_response_ready.return_value = True
-    retrieve_future.result_on_current_stream.side_effect = DeviceStreamWaitError(
-        "wait failed"
-    )
-    retrieve_future.result.side_effect = RuntimeError("sync failed")
-    event = FakeCudaEvent()
-    adapter.retrieve_futures["req-1"] = (retrieve_future, [7])
-    adapter.retrieve_events["req-1"] = event
-
-    with pytest.raises(RuntimeError, match="sync failed"):
+    with pytest.raises(DeviceStreamWaitError, match="wait failed"):
         adapter.get_finished(set())
 
-    retrieve_future.result.assert_called_once_with()
+    retrieve_future.result.assert_not_called()
     assert adapter.retrieve_futures["req-1"][0] is retrieve_future
     assert adapter.retrieve_events["req-1"] is event
 
@@ -475,7 +451,7 @@ def test_device_future_without_worker_event_uses_legacy_completion(fake_adapter)
 
     assert finished_retrieves == {"req-1"}
     retrieve_future.query.assert_called_once_with()
-    retrieve_future.result.assert_called_once_with()
+    retrieve_future.result.assert_called_once_with(timeout=60)
     retrieve_future.raw_response_ready.assert_not_called()
     retrieve_future.result_on_current_stream.assert_not_called()
 

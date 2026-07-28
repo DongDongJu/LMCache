@@ -24,7 +24,6 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.futures import (
     DeviceMessagingFuture,
-    DeviceStreamWaitError,
 )
 from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
@@ -1580,7 +1579,7 @@ class LMCacheMPWorkerAdapter:
             if not s_future.query():
                 continue
 
-            s_result = s_future.result()
+            s_result = s_future.result(timeout=60)
             finished_stores.add(request_id)
 
             if not s_result:
@@ -1597,23 +1596,11 @@ class LMCacheMPWorkerAdapter:
             ):
                 if not r_future.raw_response_ready():
                     continue
-                try:
-                    r_result = r_future.result_on_current_stream()
-                except DeviceStreamWaitError:
-                    logger.exception(
-                        "Cannot order retrieve completion on the current "
-                        "device stream for request_id=%s; falling back to "
-                        "host synchronization",
-                        request_id,
-                    )
-                    # Make one correctness fallback attempt. Any host
-                    # synchronization error propagates instead of silently
-                    # leaving this request pending forever.
-                    r_result = r_future.result()
+                r_result = r_future.result_on_current_stream()
             else:
                 if not r_future.query():
                     continue
-                r_result = r_future.result()
+                r_result = r_future.result(timeout=60)
             finished_retrieves.add(request_id)
 
             if not r_result:
