@@ -36,6 +36,7 @@ lmcache/v1/distributed/shared_l1/
 
 tests/v1/distributed/shared_l1/
     test_pool.py
+    test_visibility.py
 ```
 
 `pool.py` currently provides:
@@ -45,10 +46,58 @@ tests/v1/distributed/shared_l1/
 - `SharedRegionContract`: region identity, capacity, alignment, layout ID, and
   generation epoch;
 - `SharedObjectHandle`: `{region_id, offset, length, generation}`;
+- `SharedMemoryVisibility`: the exact-range publish/acquire protocol;
 - opaque write and read reservation tokens.
+
+No platform visibility implementation is bundled. Character-device mappings
+fail closed unless the caller supplies a separately qualified
+`SharedMemoryVisibility` implementation.
 
 M0 is an executable reference implementation. It is not yet connected to the
 MP coordinator or the existing `L1Manager`.
+
+The required mapped-region ordering is explicit:
+
+```python
+with SharedMemoryRegion(
+    dax_path,
+    pool.region_contract(),
+    mapping_offset,
+    visibility=qualified_visibility,
+) as region:
+    write = pool.reserve_write(object_key, len(payload))
+    try:
+        region.write(write.handle, payload)
+        region.publish(write.handle)
+    except BaseException:
+        pool.abort_write(write)
+        raise
+    else:
+        pool.finish_write(write)
+
+    read = pool.reserve_read(object_key, write.handle)
+    assert read is not None
+    try:
+        with region.read_view(read.handle) as view:
+            consume(view)
+    except BaseException:
+        pool.abort_read(read)
+        raise
+    else:
+        pool.finish_read(read)
+```
+
+Here, `qualified_visibility` is supplied by platform integration after
+bidirectional qualification on the exact Device-DAX layout.
+
+`read()` and `read_view()` acquire the exact handle range before exposing
+bytes. A publish failure must be followed by `abort_write`; an acquire failure
+must be followed by `abort_read`. Neither failure may be converted into a
+successful coordinator transition.
+
+The visibility primitive advertises its writeback/invalidation granularity.
+The region rejects layouts whose allocation alignment could place independent
+objects in the same visibility unit.
 
 ## Coordinator process model
 
@@ -196,6 +245,8 @@ FREE -> WRITING -> VALID -> EVICTING -> FREE
 - Only the token owner may publish or abort the write.
 - `finish_write` follows D2H completion and the platform publish operation.
 - `reserve_read` returns a handle only for `VALID`.
+- `SharedMemoryRegion.read` and `read_view` apply the platform acquire before
+  the first payload load.
 - A read lease remains active until every dependent H2D operation completes.
 - Eviction first enters `EVICTING`, which rejects new readers.
 - Reclamation waits for all leases and fenced clients before returning the
@@ -311,6 +362,9 @@ A CPU mmap view is not a no-copy GPU transfer. Report one of:
 
 `MAP_SHARED`, `mmap.flush()`, and `msync()` do not prove cross-host visibility.
 Two-host enablement requires a qualified publish/acquire mechanism.
+Character-device mappings therefore fail closed without an explicit visibility
+primitive, and their `flush()` method is rejected rather than treated as a
+publication boundary.
 
 ## Verification
 
@@ -319,6 +373,8 @@ The in-tree gates are:
 - unit tests for region contracts, reservations, stale handles, and read pins;
 - two processes mapping one regular file at independent virtual addresses;
 - duplicate-writer and concurrent non-overlapping-allocation tests;
+- fail-closed character-device routing tests with an injected visibility
+  primitive;
 - import checks using the `pool.py` module.
 
 The destructive Device-DAX mutation/restore diagnostic is intentionally kept
@@ -342,7 +398,9 @@ Before enabling real two-host Device-DAX:
 - No batched/idempotent coordinator wire contract.
 - No TTL sweeper, free-list reuse, or automatic failed-client fencing.
 - No `TensorMemoryObj` integration.
-- No real two-host visibility or GPU-direct qualification.
+- No portable two-host visibility or GPU-direct qualification. Every platform
+  visibility implementation and Device-DAX layout still requires an external
+  bidirectional qualification and restoration gate.
 - P2P, GDS, hybrid DRAM+DAX, and runtime shared-pool hotplug are unsupported.
 
 Related architecture:

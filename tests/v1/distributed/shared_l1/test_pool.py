@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Functional tests for the minimal shared-L1 pool state."""
 
+# Future
 from __future__ import annotations
 
 # Standard
+from dataclasses import fields, replace
+from multiprocessing.managers import BaseManager
+from multiprocessing.process import BaseProcess
+from pathlib import Path
+from typing import Any
 import hashlib
 import mmap
 import multiprocessing
-from dataclasses import fields, replace
-from multiprocessing.managers import BaseManager
-from pathlib import Path
-from typing import Any
 
 # Third Party
 import pytest
@@ -40,7 +42,15 @@ def _deterministic_payload(length: int, seed: int) -> bytes:
 
 
 class _PoolManager(BaseManager):
-    pass
+    def create_pool(
+        self,
+        region_id: str,
+        capacity: int,
+        alignment: int,
+        layout_id: str,
+    ) -> Any:
+        """Return the dynamically registered shared-pool proxy."""
+        raise NotImplementedError
 
 
 _PoolManager.register(
@@ -69,7 +79,7 @@ def _spawn_writer(
         mapping_offset,
     ) as region:
         region.write(reservation.handle, payload)
-        region.flush()
+        region.publish(reservation.handle)
     result_queue.put(reservation.handle)
     ready.set()
     if not publish.wait(timeout=20):
@@ -157,7 +167,7 @@ def _spawn_pinned_reader(
     pool.finish_read(reservation)
 
 
-def _join_process(process: multiprocessing.Process) -> None:
+def _join_process(process: BaseProcess) -> None:
     process.join(timeout=30)
     if process.is_alive():
         process.terminate()
@@ -478,7 +488,10 @@ def test_mapping_rejects_region_contract_mismatch(
         _LAYOUT_ID,
     )
     advertised = pool.region_contract()
-    local_expected = replace(advertised, **{field_name: wrong_value})
+    local_expected = replace(
+        advertised,
+        **{field_name: wrong_value},  # type: ignore[arg-type]
+    )
 
     with pytest.raises(RegionContractMismatchError):
         SharedMemoryRegion(
