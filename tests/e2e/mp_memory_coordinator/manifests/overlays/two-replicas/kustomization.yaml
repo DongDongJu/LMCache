@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# TEST-ONLY overlay: two coordinator replicas on shared test storage to
+# verify ordinary Lease handoff. It makes no claim about partitioned
+# stale-leader fencing. Production uses ../../base (replicas 1, RWOP PVC).
+namespace: lmcache-memcoord-e2e
+
+resources:
+  - ../kind
+
+patches:
+  - path: replicas-patch.yaml

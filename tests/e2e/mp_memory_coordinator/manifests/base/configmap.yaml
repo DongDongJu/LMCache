@@ -1,0 +1,29 @@
+# Production defaults: observation only (actuation_enabled: false), 10 s
+# polling, three stable samples, five-minute cooldown, Kubernetes Lease.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lmcache-mp-memory-coordinator
+data:
+  mp-memory-coordinator.yaml: |
+    mp_coordinator_url: http://lmcache-mp-coordinator:8000
+    memory_allocation_url: http://memory-allocation-service:8080
+    poll_interval_seconds: 10
+    stable_samples: 3
+    high_ratio: 0.75
+    low_ratio: 0.40
+    minimum_ratio_gap: 0.25
+    projected_donor_max_ratio: 0.70
+    cooldown_seconds: 300
+    adapter_index: 0
+    min_devices_per_instance: 1
+    allowed_device_path_prefix: /dev/dax-cxl/
+    drain_timeout_seconds: 300
+    state_directory: /var/lib/lmcache-memory-coordinator
+    actuation_enabled: false
+    http_host: 0.0.0.0
+    http_port: 9400
+    leader_election: kubernetes
+    lease_name: lmcache-mp-memory-coordinator
+    lease_duration_seconds: 15
+    lease_renew_interval_seconds: 5

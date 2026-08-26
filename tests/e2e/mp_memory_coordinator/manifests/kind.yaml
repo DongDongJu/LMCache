@@ -1,0 +1,8 @@
+# kind cluster for the MP Memory Coordinator CI E2E (one control-plane node
+# is enough: every component is a plain Deployment with loopback-free
+# networking; the two-replicas overlay shares a hostPath on this node).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: lmcache-memcoord-e2e
+nodes:
+  - role: control-plane

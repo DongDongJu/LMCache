@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# CI E2E topology in a kind cluster: the real coordinator (from ../../base),
+# the scenario server (fake MP Coordinator + fake donor/receiver MP), and the
+# strict mock Memory Allocation service, each as its own Pod. The coordinator
+# receives only public URLs; admin ports are separate Services used by the
+# E2E runner alone (see networkpolicy.yaml).
+namespace: lmcache-memcoord-e2e
+
+resources:
+  - ../../base
+  - ../../e2e-common
+  - scenario-server.yaml
+  - networkpolicy.yaml
+
+images:
+  - name: lmcache/vllm-openai
+    newName: lmcache-memcoord
+    newTag: e2e
+
+patches:
+  - path: configmap-patch.yaml
+  - path: deployment-patch.yaml

@@ -1,0 +1,35 @@
+# The admin ports of both test services are reachable only from outside the
+# Pod network (the E2E runner via port-forward / the API server proxy), never
+# from the coordinator Pod: it must be unable to tell that either dependency
+# is a fake. kind's default CNI (kindnet) does not enforce NetworkPolicy; the
+# policy documents the intent and is enforced on clusters with a policy CNI.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: e2e-admin-ports-runner-only
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: ["scenario-server", "mock-memory-allocation-service"]
+  policyTypes: ["Ingress"]
+  ingress:
+    # Production-facing ports: open to every Pod in the namespace.
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 9300
+        - port: 8081
+        - port: 8181
+        - port: 8082
+        - port: 8182
+        - port: 8080
+    # Admin ports: only from outside the Pod CIDR (port-forward / host).
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: ["10.244.0.0/16"]
+      ports:
+        - port: 9091
+        - port: 9090

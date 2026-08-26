@@ -1,0 +1,13 @@
+# Dedicated journal volume. ReadWriteOncePod guarantees that at most one Pod
+# mounts it, so a rollout (strategy Recreate) terminates the old Pod and
+# releases the volume before the new Pod can read the journal and mutate.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lmcache-mp-memory-coordinator-journal
+spec:
+  accessModes:
+    - ReadWriteOncePod
+  resources:
+    requests:
+      storage: 1Gi

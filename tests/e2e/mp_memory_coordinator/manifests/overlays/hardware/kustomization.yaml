@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Real two-worker Device-DAX simulation gate (PLAN.md section 9): the real
+# coordinator against the real MP Coordinator and two real MP servers, with
+# the strict mock allocator as the only logical allocator of the allowlisted
+# devices. Fill in the ConfigMap patch with the lab's URLs and the explicit
+# adoption allowlist (real worker IPs, paths, sizes) before applying.
+namespace: lmcache-memcoord-e2e
+
+resources:
+  - ../../base
+  - ../../e2e-common
+
+patches:
+  - path: configmap-patch.yaml

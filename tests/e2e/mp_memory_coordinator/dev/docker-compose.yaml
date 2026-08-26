@@ -1,0 +1,20 @@
+# Development-only Memory Allocation mock (PLAN.md Phase 1A).
+#
+# Usage (from anywhere):
+#   docker compose -f tests/e2e/mp_memory_coordinator/dev/docker-compose.yaml up --build
+#   curl -s http://127.0.0.1:18080/v2/apps/lmcache | jq
+#   curl -s http://127.0.0.1:19090/__test/health | jq
+#
+# The public listener (container port 8080) exposes only the three frozen outside
+# routes; the admin listener (container port 9090) exposes only the /__test routes.
+# Both are bound to loopback on the host so the admin API is never reachable from
+# other machines.
+services:
+  memory-allocation-mock:
+    build:
+      context: ../../../..
+      dockerfile: tests/e2e/mp_memory_coordinator/mock_memory_allocation_service/Dockerfile
+    image: lmcache-memory-allocation-mock:e2e
+    ports:
+      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:19090:9090"

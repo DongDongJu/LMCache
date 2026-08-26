@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Shared by the kind and hardware overlays: the dedicated E2E namespace and
+# the strict mock Memory Allocation service (public 8080, admin 9090).
+resources:
+  - namespace.yaml
+  - mock-memory-allocation-service.yaml

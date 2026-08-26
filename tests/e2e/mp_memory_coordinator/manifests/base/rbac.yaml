@@ -1,0 +1,23 @@
+# Namespace-scoped Lease permissions only: the coordinator reads and renews
+# its own pre-created Lease and never creates or deletes other objects.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lmcache-mp-memory-coordinator-lease
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["lmcache-mp-memory-coordinator"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lmcache-mp-memory-coordinator-lease
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: lmcache-mp-memory-coordinator-lease
+subjects:
+  - kind: ServiceAccount
+    name: lmcache-mp-memory-coordinator

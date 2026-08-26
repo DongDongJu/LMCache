@@ -1,0 +1,40 @@
+# E2E-only timings: 1 s polling, three samples, 10 s cooldown, short bounded
+# timeouts, actuation enabled. Production defaults stay in ../../base.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lmcache-mp-memory-coordinator
+data:
+  mp-memory-coordinator.yaml: |
+    mp_coordinator_url: http://scenario-server:9300
+    memory_allocation_url: http://mock-memory-allocation-service:8080
+    poll_interval_seconds: 1
+    stable_samples: 3
+    high_ratio: 0.75
+    low_ratio: 0.40
+    minimum_ratio_gap: 0.25
+    projected_donor_max_ratio: 0.70
+    cooldown_seconds: 10
+    adapter_index: 0
+    min_devices_per_instance: 1
+    allowed_device_path_prefix: /dev/dax-cxl/
+    drain_timeout_seconds: 30
+    state_directory: /var/lib/lmcache-memory-coordinator
+    actuation_enabled: true
+    http_host: 0.0.0.0
+    http_port: 9400
+    request_timeout_seconds: 3
+    get_retry_attempts: 2
+    dax_poll_interval_seconds: 0.5
+    dax_add_max_attempts: 3
+    leader_election: kubernetes
+    lease_name: lmcache-mp-memory-coordinator
+    lease_duration_seconds: 5
+    lease_renew_interval_seconds: 1
+    adoption_file: /etc/lmcache/adoption.yaml
+  adoption.yaml: |
+    allocations:
+      - worker_ip: 192.0.2.40
+        device_path: /dev/dax-cxl/lmcache-e2e--mp-196/dax0.1
+        allocation_size_gib: 64
+        device_map_size_bytes: 68719476736

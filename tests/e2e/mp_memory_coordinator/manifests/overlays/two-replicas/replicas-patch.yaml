@@ -1,0 +1,19 @@
+# Two replicas sharing one hostPath journal directory on the single kind
+# node (shared test storage). Only the Lease holder writes the journal; the
+# standby reloads it when it becomes leader.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lmcache-mp-memory-coordinator
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+  template:
+    spec:
+      volumes:
+        - name: journal
+          $patch: replace
+          hostPath:
+            path: /var/lib/lmcache-memcoord-e2e-shared
+            type: DirectoryOrCreate

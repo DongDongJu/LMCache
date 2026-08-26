@@ -1,0 +1,273 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Happy-path E2E: one exact move through the real coordinator.
+
+Every assertion from PLAN.md section 8 "Required happy-path assertions" is
+made from the two services' endpoint-local audits, their admin state, and
+the coordinator's durable journal -- correlated by request id, device path,
+and confirmed phase, never by cross-process wall clocks.
+"""
+
+# Third Party
+import pytest
+
+# Local
+from .conftest import (
+    DONOR_IP,
+    DONOR_RUNTIME,
+    DONOR_SPARE,
+    GIB,
+    RECEIVER_IP,
+    RECEIVER_RUNTIME,
+    RECEIVER_SPARE,
+    Harness,
+)
+
+pytestmark = pytest.mark.kind
+
+
+def _usage_reads_before_first_post(records: list[dict]) -> int:
+    """Count ``/instances/usage`` reads the coordinator made before mutating."""
+    count = 0
+    for record in records:
+        if record["kind"] != "request":
+            continue
+        if record["method"] == "POST":
+            break
+        if record["path"] == "/instances/usage":
+            count += 1
+    return count
+
+
+def test_happy_path_moves_exactly_one_device(harness: Harness) -> None:
+    initial = harness.allocator.state()
+    assert initial["global"]["assigned_runtime_gib"] == 64
+    assert harness.outside_status() == {DONOR_IP: [DONOR_RUNTIME], RECEIVER_IP: []}
+
+    harness.memcoord.seed_inventory()
+    assert harness.scenario_posts() == [] and harness.allocator_posts() == []
+    harness.memcoord.start()
+    move = harness.memcoord.client.wait_terminal(timeout=120)
+    assert move["state"] == "COMPLETE", move
+    assert move["outcome"] == "SUCCEEDED", move
+
+    scenario_audit = harness.scenario.audit()
+    allocator_audit = harness.allocator.audit()
+
+    # 1. Two eligible samples cause zero mutation; the third permits one move.
+    assert _usage_reads_before_first_post(scenario_audit) >= 3
+    # Preflight: both /status reads precede any mutation.
+    first_post = next(i for i, r in enumerate(scenario_audit) if r["method"] == "POST")
+    statuses = {
+        r["service"]
+        for r in scenario_audit[:first_post]
+        if r["kind"] == "request" and r["path"] == "/status"
+    }
+    assert statuses == {"mp-donor", "mp-receiver"}
+
+    # 2. Exact mutation subsequence per service, and the causal order across
+    #    services from the journal's effect ledger.
+    mp_posts = harness.scenario_posts()
+    assert [
+        (r["service"], r["path"], (r["body"] or {}).get("mode")) for r in mp_posts
+    ] == [
+        ("mp-donor", "/reconfigure/dax/remove", "drain"),
+        ("mp-donor", "/reconfigure/dax/remove", "evict"),
+        ("mp-receiver", "/reconfigure/dax/add", None),
+    ]
+    assert [r["operation"] for r in harness.allocator_posts()] == [
+        "deallocate",
+        "allocate",
+    ]
+    effects = move["effects"]
+    order = ["donor_drain", "donor_evict", "deallocate", "allocate", "receiver_add"]
+    assert list(effects) == order
+    intents = [effects[name]["intent_at"] for name in order]
+    assert intents == sorted(intents)
+    # 3. Deallocation only after the old path is no longer readable: the
+    #    evict was confirmed from status before the deallocation intent.
+    assert effects["donor_evict"]["confirmed"] is True
+    assert effects["donor_evict"]["confirmed_at"] <= effects["deallocate"]["intent_at"]
+    donor_state = next(
+        i
+        for i in harness.scenario.state()["instances"]
+        if i["instance_id"] == "mp-donor"
+    )
+    tombstones = [
+        d for d in donor_state["devices"] if d["device_path"] == DONOR_RUNTIME
+    ]
+    assert [d["state"] for d in tombstones] == ["removed"]
+
+    # 4. Exact frozen bodies, no extra fields; 5. every echo and size validated.
+    posts = harness.allocator_posts()
+    deallocation, allocation = posts[0]["body"], posts[1]["body"]
+    assert deallocation == {
+        "request_id": move["deallocation_request_id"],
+        "target_node": DONOR_IP,
+        "device_path": DONOR_RUNTIME,
+    }
+    assert allocation == {
+        "request_id": move["allocation_request_id"],
+        "target_node": RECEIVER_IP,
+        "request_size_gib": 64,
+        "mode": "devdax",
+        "purpose": "lmcache-dax",
+        "access": "exclusive",
+    }
+    assert move["deallocation_request_id"] and move["allocation_request_id"]
+    assert move["deallocation_request_id"] != move["allocation_request_id"]
+    responses = [
+        r
+        for r in allocator_audit
+        if r["kind"] == "response" and r["operation"] != "status"
+    ]
+    assert responses[0]["body"]["request_id"] == move["deallocation_request_id"]
+    assert responses[1]["body"]["request_id"] == move["allocation_request_id"]
+    assert set(responses[0]["body"]) == {
+        "status",
+        "request_id",
+        "target_node",
+        "device_path",
+        "released_size_gib",
+    }
+    assert set(responses[1]["body"]) == {
+        "status",
+        "request_id",
+        "target_node",
+        "device_path",
+        "requested_size_gib",
+        "granted_size_gib",
+    }
+    assert move["released_size_gib"] == move["granted_size_gib"] == 64
+    assert effects["deallocate"]["response"]["released_size_gib"] == 64
+    assert effects["allocate"]["response"]["requested_size_gib"] == 64
+
+    # 6. Receiver add uses adapter 0, the returned path, and "64GiB".
+    assert mp_posts[2]["body"] == {
+        "adapter_index": 0,
+        "device_path": RECEIVER_RUNTIME,
+        "size": "64GiB",
+    }
+    assert move["new_path"] == RECEIVER_RUNTIME
+
+    # 7. COMPLETE only after the new path is active and capacity converged.
+    assert effects["receiver_add"]["confirmed"] is True
+    instances = {i["instance_id"]: i for i in harness.scenario.state()["instances"]}
+    assert instances["mp-donor"]["capacity_bytes"] == 64 * GIB
+    assert instances["mp-receiver"]["capacity_bytes"] == 128 * GIB
+    receiver_devices = {
+        d["device_path"]: d for d in instances["mp-receiver"]["devices"]
+    }
+    assert receiver_devices[RECEIVER_RUNTIME]["state"] == "active"
+
+    # 8. Final outside assigned GiB equals the pre-move value; a zero-assigned
+    #    gap existed between the two outside mutations.
+    final = harness.allocator.state()
+    assert final["global"]["assigned_runtime_gib"] == 64
+    mutations = [r for r in allocator_audit if r["kind"] == "mutation"]
+    assert [(m["operation"], m["device_path"]) for m in mutations] == [
+        ("deallocate", DONOR_RUNTIME),
+        ("allocate", RECEIVER_RUNTIME),
+    ]
+    assert harness.outside_status() == {DONOR_IP: [], RECEIVER_IP: [RECEIVER_RUNTIME]}
+
+    # 9. Managed inventory holds the receiver path; the mock still holds both
+    #    paths under their original workers.
+    journal = harness.memcoord.client.journal()
+    assert [a["device_path"] for a in journal["inventory"]] == [RECEIVER_RUNTIME]
+    assert journal["inventory"][0]["worker_ip"] == RECEIVER_IP
+    nodes = final["nodes"]
+    assert {d["path"] for d in nodes[DONOR_IP]["devices"]} >= {
+        DONOR_RUNTIME,
+        DONOR_SPARE,
+    }
+    assert {d["path"] for d in nodes[RECEIVER_IP]["devices"]} >= {
+        RECEIVER_RUNTIME,
+        RECEIVER_SPARE,
+    }
+
+    # 10. Cooldown prevents a second move.
+    harness.memcoord.client.wait_cycles(4, timeout=30)
+    assert harness.memcoord.client.active_move() is None
+    assert len(harness.allocator_posts()) == 2
+    rejections = harness.memcoord.client.status()["last_cycle"]["rejections"]
+    assert any(r["reason"] == "cooldown" for r in rejections), rejections
+
+    # 11. Exactly one deallocation, one allocation, one successful add.
+    assert len(harness.scenario_posts()) == 3
+    assert harness.memcoord.client.status()["counters"]["succeeded"] == 1
+
+    # 12. Conservation and immutable bindings/sizes.
+    for node_ip, node in nodes.items():
+        assert (
+            node["free_runtime_gib"] + node["assigned_runtime_gib"]
+            == node["fixed_runtime_inventory_gib"]
+        ), node_ip
+        for device in node["devices"]:
+            assert device["size_gib"] == 64
+            assert device["path"] in {
+                d["path"] for d in initial["nodes"][node_ip]["devices"]
+            }
+    assert (
+        final["global"]["free_runtime_gib"] + final["global"]["assigned_runtime_gib"]
+        == final["global"]["fixed_runtime_inventory_gib"]
+    )
+    assert harness.memcoord.client.readyz().status_code == 200
+
+
+def test_dry_run_proposes_but_never_mutates(harness: Harness) -> None:
+    harness.memcoord.seed_inventory()
+    harness.memcoord.start(actuation_enabled=False)
+    harness.memcoord.client.wait_cycles(6, timeout=60)
+    status = harness.memcoord.client.status()
+    assert status["last_cycle"]["proposal"] is not None
+    assert status["last_cycle"]["proposal"]["donor"] == "mp-donor"
+    assert status["last_cycle"]["proposal"]["receiver"] == "mp-receiver"
+    assert any(
+        r["reason"] == "actuation_disabled" for r in status["last_cycle"]["rejections"]
+    )
+    assert harness.scenario_posts() == []
+    assert harness.allocator_posts() == []
+    assert harness.memcoord.client.active_move() is None
+    assert status["counters"]["proposed"] >= 1
+
+
+@pytest.mark.local_only
+def test_explicit_adoption_command_populates_inventory(harness: Harness) -> None:
+    """Adoption requires the exact (worker_ip, path, size) tuple."""
+    result = harness.memcoord.adopt(
+        {
+            "allocations": [
+                {
+                    "worker_ip": DONOR_IP,
+                    "device_path": DONOR_RUNTIME,
+                    "allocation_size_gib": 64,
+                    "device_map_size_bytes": 64 * GIB,
+                },
+                {  # bootstrap: rejected (index 0)
+                    "worker_ip": DONOR_IP,
+                    "device_path": "/dev/dax-cxl/lmcache-e2e--mp-196/dax0.0",
+                    "allocation_size_gib": 64,
+                    "device_map_size_bytes": 64 * GIB,
+                },
+                {  # free at the outside service: rejected
+                    "worker_ip": RECEIVER_IP,
+                    "device_path": RECEIVER_RUNTIME,
+                    "allocation_size_gib": 64,
+                    "device_map_size_bytes": 64 * GIB,
+                },
+            ]
+        }
+    )
+    assert result.returncode == 0, result.stderr
+    assert f"adopted {DONOR_RUNTIME}" in result.stdout
+    assert "rejected /dev/dax-cxl/lmcache-e2e--mp-196/dax0.0" in result.stdout
+    assert f"rejected {RECEIVER_RUNTIME}" in result.stdout
+    assert harness.scenario_posts() == [] and harness.allocator_posts() == []
+
+    harness.memcoord.config_overrides = {}
+    harness.memcoord.start()
+    journal = harness.memcoord.client.journal()
+    assert journal["initialized"] is True
+    assert [a["device_path"] for a in journal["inventory"]] == [DONOR_RUNTIME]
+    move = harness.memcoord.client.wait_terminal(timeout=120)
+    assert move["outcome"] == "SUCCEEDED"

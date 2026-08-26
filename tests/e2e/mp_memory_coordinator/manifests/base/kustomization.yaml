@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Production base for the standalone MP Memory Coordinator: one Deployment
+# (replicas: 1, Recreate), its own ServiceAccount with namespace-scoped
+# Lease permissions, a pre-created Lease, a dedicated ReadWriteOncePod PVC
+# for the journal, and a ConfigMap with actuation_enabled: false. It has no
+# owner reference or lifecycle dependency on the MP Coordinator Deployment.
+resources:
+  - serviceaccount.yaml
+  - rbac.yaml
+  - lease.yaml
+  - pvc.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+
+labels:
+  - includeSelectors: true
+    pairs:
+      app.kubernetes.io/name: lmcache-mp-memory-coordinator
+      app.kubernetes.io/part-of: lmcache

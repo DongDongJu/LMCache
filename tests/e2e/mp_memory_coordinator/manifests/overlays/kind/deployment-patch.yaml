@@ -1,0 +1,17 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lmcache-mp-memory-coordinator
+spec:
+  template:
+    spec:
+      containers:
+        - name: coordinator
+          # The image is loaded into kind with `kind load docker-image`.
+          imagePullPolicy: Never
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              memory: 1Gi

@@ -1,0 +1,38 @@
+# Hardware gate settings: production thresholds, dry run first
+# (actuation_enabled: false), explicit adoption allowlist with the REAL
+# worker IPs / paths / sizes captured in DAX_INVENTORY_FILE. Enable actuation
+# only after the dry run selects the expected donor/receiver.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lmcache-mp-memory-coordinator
+data:
+  mp-memory-coordinator.yaml: |
+    mp_coordinator_url: http://lmcache-mp-coordinator:9300
+    memory_allocation_url: http://mock-memory-allocation-service:8080
+    poll_interval_seconds: 5
+    stable_samples: 3
+    high_ratio: 0.75
+    low_ratio: 0.40
+    minimum_ratio_gap: 0.25
+    projected_donor_max_ratio: 0.70
+    cooldown_seconds: 300
+    adapter_index: 0
+    min_devices_per_instance: 1
+    allowed_device_path_prefix: /dev/dax-cxl/
+    drain_timeout_seconds: 300
+    state_directory: /var/lib/lmcache-memory-coordinator
+    actuation_enabled: false
+    http_host: 0.0.0.0
+    http_port: 9400
+    leader_election: kubernetes
+    lease_name: lmcache-mp-memory-coordinator
+    lease_duration_seconds: 15
+    lease_renew_interval_seconds: 5
+    adoption_file: /etc/lmcache/adoption.yaml
+  adoption.yaml: |
+    allocations:
+      - worker_ip: REPLACE_WITH_DONOR_WORKER_IP
+        device_path: /dev/dax-cxl/REPLACE_WITH_DONOR_POD/dax0.1
+        allocation_size_gib: 64
+        device_map_size_bytes: 68719476736
