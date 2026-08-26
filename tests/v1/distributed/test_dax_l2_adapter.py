@@ -360,6 +360,41 @@ def test_dax_hotplug_remove_evict_notifies_logical_delete(tmp_path):
         adapter.close()
 
 
+def test_dax_hotplug_evict_tombstone_does_not_poison_adapter_health(tmp_path):
+    """A controlled remove leaves a ``removed`` tombstone whose own
+    ``is_healthy`` is ``False``; the adapter aggregate must ignore it, both
+    right after the remove and after the same path is added back."""
+    adapter = make_hotplug_adapter(tmp_path)
+    try:
+        devices = adapter.hotplug_status()["devices"]
+        source_path = devices[1]["device_path"]
+        source_size = devices[1]["max_dax_size_bytes"]
+
+        result = adapter.hotplug_remove_device(source_path, "evict")
+        assert result["state"] == "removed"
+
+        after_remove = adapter.report_status()
+        tombstone = after_remove["devices"][1]
+        assert tombstone["state"] == "removed"
+        assert tombstone["is_healthy"] is False
+        assert after_remove["is_healthy"] is True
+        assert after_remove["closing"] is False
+        # Capacity already excluded the tombstone; health now agrees with it.
+        assert after_remove["max_dax_size_bytes"] == devices[0]["max_dax_size_bytes"]
+
+        readded = adapter.hotplug_add_device(source_path, source_size)
+        assert readded["device"]["state"] == "active"
+        after_add = adapter.report_status()
+        assert after_add["is_healthy"] is True
+        assert [d["state"] for d in after_add["devices"]] == [
+            "active",
+            "removed",
+            "active",
+        ]
+    finally:
+        adapter.close()
+
+
 def test_dax_hotplug_add_sanitizes_mapping_errors(tmp_path):
     adapter = DaxL2Adapter(
         DaxL2AdapterConfig(

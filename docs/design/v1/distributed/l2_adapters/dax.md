@@ -131,6 +131,19 @@ reclaims slots after active read borrows drain.
 Runtime capacity is the sum of active, draining, migrating, resizing, and
 removing device capacities. Closed, removed, and failed devices are excluded.
 
+## Health After A Controlled Remove
+
+A remove (`evict` or `migrate`) closes the source core and keeps its entry as
+a `state="removed"` tombstone so device indexes stay stable and the history
+is visible in status. The tombstone's own `is_healthy` is `False` (its core is
+closed), but the adapter-level `is_healthy` in `report_status()` aggregates
+only devices that still serve I/O: `closed` and `removed` entries are skipped.
+Without that exclusion one successful remove would leave the adapter, the
+storage manager, and the engine `/status` unhealthy forever. A `failed` device
+is a real fault and still makes the adapter unhealthy. External controllers
+(e.g. the MP Memory Coordinator) must likewise treat a `removed` entry as a
+tombstone, never as an owned or attachable device.
+
 ## Current Limits
 
 - Runtime hotplug does not perform kernel-level CXL or DAX reconfiguration.

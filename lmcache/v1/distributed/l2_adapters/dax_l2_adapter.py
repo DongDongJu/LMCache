@@ -74,6 +74,11 @@ _CAPACITY_STATES: set[DaxDeviceState] = {
     "resizing",
     "removing",
 }
+# Tombstones a controlled remove leaves behind. They hold no capacity, serve
+# no I/O, and report ``is_healthy=False`` because their core is closed, so
+# they must not poison the adapter-level health aggregate. ``failed`` is
+# deliberately not here: a device that failed is a real fault.
+_TERMINAL_STATES: set[DaxDeviceState] = {"closed", "removed"}
 
 
 class _EventNotifier(Protocol):
@@ -641,6 +646,13 @@ class DaxL2Adapter(L2AdapterInterface):
     def report_status(self) -> dict:
         """Return a health and capacity snapshot for this adapter.
 
+        ``is_healthy`` aggregates only devices that still participate in
+        service: ``closed`` and ``removed`` entries are tombstones left by a
+        controlled hotplug remove and are excluded, so a successful remove
+        does not leave the adapter (and, through it, the engine) reporting
+        unhealthy forever. A ``failed`` device still counts as unhealthy.
+        The per-device entries keep their own ``is_healthy`` untouched.
+
         Returns:
             Dictionary containing health, DAX capacity, slot occupancy,
             lock/borrow counts, in-flight task counts, and restart-recovery
@@ -651,8 +663,9 @@ class DaxL2Adapter(L2AdapterInterface):
             closing = self._closing or self._closed
 
         devices = hotplug["devices"]
+        serving = [d for d in devices if d["state"] not in _TERMINAL_STATES]
         return {
-            "is_healthy": all(d["is_healthy"] for d in devices) and not self._closed,
+            "is_healthy": all(d["is_healthy"] for d in serving) and not self._closed,
             "type": "dax",
             "device_path": self._config.device_path,
             "max_dax_size_bytes": hotplug["total_capacity_bytes"],
