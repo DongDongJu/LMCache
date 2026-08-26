@@ -205,6 +205,20 @@ func buildDaemonSetCore(
 			},
 		})
 	}
+	// Inject the node's host IP as registration metadata (metadata.worker_ip)
+	// whenever the server registers with a coordinator. Capacity management
+	// (the MP Memory Coordinator) addresses the worker by this value; it is
+	// never the direct MP address, which stays the pod IP above.
+	if spec.Coordinator != nil && derefString(spec.Coordinator.URL, "") != "" {
+		envVars = append(envVars, corev1.EnvVar{
+			Name: "LMCACHE_WORKER_NODE_IP",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "status.hostIP",
+				},
+			},
+		})
+	}
 	envVars = append(envVars, spec.Env...)
 
 	// Cross-pod CUDA IPC needs the engine and vLLM pods to share the host's

@@ -217,6 +217,13 @@ class CoordinatorConfig:
     """IP the coordinator should reach this server at. Empty defers to the
     server's outbound IP (resolved by the registrar)."""
 
+    worker_node_ip: str = ""
+    """Host IP of the worker node this server runs on, registered as
+    ``metadata.worker_ip``. Empty omits the metadata entry. This is the
+    node's address for capacity management (an outside allocator's
+    ``target_node``), never the direct MP HTTP address, which stays
+    :attr:`advertise_ip`."""
+
     heartbeat_interval: float = 5.0
     """Seconds between heartbeats. Must be strictly positive and kept well below
     the coordinator's ``INSTANCE_TIMEOUT``."""
@@ -606,6 +613,15 @@ def add_coordinator_args(
         "LMCACHE_COORDINATOR_ADVERTISE_IP, then the server's outbound IP.",
     )
     group.add_argument(
+        "--coordinator-worker-node-ip",
+        type=str,
+        default=None,
+        help="Host IP of the worker node this server runs on, registered as "
+        "metadata.worker_ip (capacity management uses it as the node "
+        "address; it is never the direct MP address). Defaults to "
+        "LMCACHE_WORKER_NODE_IP; unset omits the metadata entry.",
+    )
+    group.add_argument(
         "--coordinator-heartbeat-interval",
         type=float,
         default=None,
@@ -701,6 +717,11 @@ def parse_args_to_coordinator_config(
         if args.coordinator_advertise_ip is not None
         else os.getenv("LMCACHE_COORDINATOR_ADVERTISE_IP", "")
     )
+    worker_node_ip = (
+        args.coordinator_worker_node_ip
+        if args.coordinator_worker_node_ip is not None
+        else os.getenv("LMCACHE_WORKER_NODE_IP", "")
+    ).strip()
     if args.coordinator_heartbeat_interval is not None:
         heartbeat_interval = args.coordinator_heartbeat_interval
     else:
@@ -779,6 +800,7 @@ def parse_args_to_coordinator_config(
     return CoordinatorConfig(
         url=url,
         advertise_ip=advertise_ip,
+        worker_node_ip=worker_node_ip,
         heartbeat_interval=heartbeat_interval,
         event_reporting=event_reporting,
         event_flush_interval=event_flush_interval,

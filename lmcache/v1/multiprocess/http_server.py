@@ -138,6 +138,15 @@ async def lifespan(app: FastAPI):
                 heartbeat_interval=coordinator_config.heartbeat_interval,
                 p2p_advertised_url=mp_config.p2p_config.advertise_url,
                 mq_port=mp_config.port if mp_config.p2p_config.enabled else 0,
+                # The worker's host IP (LMCACHE_WORKER_NODE_IP, injected from
+                # status.hostIP on Kubernetes) rides registration metadata so
+                # capacity management can address the node. It is never used
+                # as the direct MP address: that stays advertise_ip.
+                metadata=(
+                    {"worker_ip": coordinator_config.worker_node_ip}
+                    if coordinator_config.worker_node_ip
+                    else None
+                ),
                 on_registered=engine.storage_manager.publish_capacity,
             )
         )

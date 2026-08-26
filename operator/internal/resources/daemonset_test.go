@@ -16,7 +16,67 @@ limitations under the License.
 
 package resources
 
-import "testing"
+import (
+	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+
+	lmcachev1alpha1 "github.com/LMCache/LMCache/api/v1alpha1"
+)
+
+// findEnv returns the env var named name from the engine container, or nil.
+func findEnv(envs []corev1.EnvVar, name string) *corev1.EnvVar {
+	for i := range envs {
+		if envs[i].Name == name {
+			return &envs[i]
+		}
+	}
+	return nil
+}
+
+func TestBuildDaemonSet_WorkerNodeIPInjectedOnlyWithCoordinator(t *testing.T) {
+	// Without a coordinator the server registers nowhere, so no node identity
+	// env is injected and the env count contract of other tests holds.
+	engine := minimalEngine()
+	ds := BuildDaemonSet(engine)
+	c := ds.Spec.Template.Spec.Containers[0]
+	if e := findEnv(c.Env, "LMCACHE_WORKER_NODE_IP"); e != nil {
+		t.Fatalf("unexpected LMCACHE_WORKER_NODE_IP without coordinator: %+v", e)
+	}
+
+	url := "http://coordinator:9300"
+	engine.Spec.Coordinator = &lmcachev1alpha1.CoordinatorConnectionSpec{URL: &url}
+	ds = BuildDaemonSet(engine)
+	c = ds.Spec.Template.Spec.Containers[0]
+
+	worker := findEnv(c.Env, "LMCACHE_WORKER_NODE_IP")
+	if worker == nil || worker.ValueFrom == nil || worker.ValueFrom.FieldRef == nil {
+		t.Fatalf("expected LMCACHE_WORKER_NODE_IP from the downward API, got %+v", worker)
+	}
+	if worker.ValueFrom.FieldRef.FieldPath != "status.hostIP" {
+		t.Fatalf("expected status.hostIP, got %s", worker.ValueFrom.FieldRef.FieldPath)
+	}
+	advertise := findEnv(c.Env, "LMCACHE_COORDINATOR_ADVERTISE_IP")
+	if advertise == nil || advertise.ValueFrom == nil || advertise.ValueFrom.FieldRef == nil {
+		t.Fatalf("expected LMCACHE_COORDINATOR_ADVERTISE_IP from the downward API, got %+v", advertise)
+	}
+	// The direct MP address stays the pod IP; the worker IP is metadata only.
+	if advertise.ValueFrom.FieldRef.FieldPath != "status.podIP" {
+		t.Fatalf("expected status.podIP, got %s", advertise.ValueFrom.FieldRef.FieldPath)
+	}
+
+	// An explicit advertiseIP suppresses the pod-IP injection but never the
+	// worker-node identity.
+	explicit := "203.0.113.7"
+	engine.Spec.Coordinator.AdvertiseIP = &explicit
+	c = BuildDaemonSet(engine).Spec.Template.Spec.Containers[0]
+	if findEnv(c.Env, "LMCACHE_COORDINATOR_ADVERTISE_IP") != nil {
+		t.Fatal("explicit advertiseIP must suppress the pod-IP env injection")
+	}
+	if findEnv(c.Env, "LMCACHE_WORKER_NODE_IP") == nil {
+		t.Fatal("explicit advertiseIP must not suppress LMCACHE_WORKER_NODE_IP")
+	}
+}
 
 func TestStartupProbeFailureThreshold(t *testing.T) {
 	cases := []struct {

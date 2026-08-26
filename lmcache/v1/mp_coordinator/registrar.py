@@ -13,7 +13,7 @@ logged and retried, and it never takes the MP server down.
 """
 
 # Standard
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import asyncio
 import contextlib
 
@@ -41,6 +41,7 @@ async def register(
     instance_id: str = "",
     p2p_advertised_url: str = "",
     mq_port: int = 0,
+    metadata: Mapping[str, str] | None = None,
 ) -> str:
     """Register an MP server with the coordinator and return its id.
 
@@ -54,6 +55,10 @@ async def register(
             when P2P is disabled.
         mq_port: Port of this server's ZMQ message-queue server for P2P lookup
             RPCs. 0 when P2P is disabled.
+        metadata: Free-form registration hints forwarded as the request's
+            ``metadata`` field (e.g. ``{"worker_ip": ...}``). ``None`` or
+            empty sends the schema default (an empty mapping), so callers
+            that pass nothing produce the same request as before.
 
     Returns:
         The registered instance id (coordinator-assigned if ``instance_id`` was
@@ -66,6 +71,7 @@ async def register(
         instance_id=instance_id,
         ip=advertise_ip,
         http_port=http_port,
+        metadata=dict(metadata) if metadata else {},
         p2p_advertised_url=p2p_advertised_url,
         mq_port=mq_port,
     )
@@ -86,6 +92,7 @@ async def keep_registered(
     heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
     p2p_advertised_url: str = "",
     mq_port: int = 0,
+    metadata: Mapping[str, str] | None = None,
     on_registered: Callable[[], None],
 ) -> None:
     """Register, heartbeat on a timer, and deregister on cancellation.
@@ -110,6 +117,9 @@ async def keep_registered(
             when P2P is disabled.
         mq_port: Port of this server's ZMQ message-queue server for P2P lookup
             RPCs. 0 when P2P is disabled.
+        metadata: Registration hints sent with every registration and
+            re-registration (see :func:`register`), so a re-registration
+            after a coordinator restart preserves them.
         on_registered: Called after every successful registration, including
             a re-registration. Required, not defaulted: the coordinator keeps
             some state only in memory -- capacity declarations above all --
@@ -131,6 +141,7 @@ async def keep_registered(
                         instance_id=instance_id,
                         p2p_advertised_url=p2p_advertised_url,
                         mq_port=mq_port,
+                        metadata=metadata,
                     )
                     logger.info("Registered with coordinator as %s", assigned_id)
                     on_registered()

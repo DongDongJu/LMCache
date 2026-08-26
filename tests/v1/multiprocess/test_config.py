@@ -30,6 +30,7 @@ _COORD_ENV = (
     "LMCACHE_COORDINATOR_HEARTBEAT_INTERVAL",
     "LMCACHE_COORDINATOR_EVENT_REPORTING",
     "LMCACHE_COORDINATOR_EVENT_FLUSH_INTERVAL",
+    "LMCACHE_WORKER_NODE_IP",
 )
 
 
@@ -119,6 +120,20 @@ def test_flag_beats_env(monkeypatch):
     monkeypatch.setenv("LMCACHE_COORDINATOR_URL", "http://env-coord:9300")
     config = _parse(["--coordinator-url", "http://flag-coord:9300"])
     assert config.url == "http://flag-coord:9300"
+
+
+def test_worker_node_ip_defaults_to_empty():
+    """No env, no flag: the metadata entry is omitted (backward compatible)."""
+    assert _parse([]).worker_node_ip == ""
+
+
+def test_worker_node_ip_env_fallback_and_flag(monkeypatch):
+    monkeypatch.setenv("LMCACHE_WORKER_NODE_IP", " 192.0.2.40 ")
+    assert _parse([]).worker_node_ip == "192.0.2.40"
+    config = _parse(["--coordinator-worker-node-ip", "192.0.2.41"])
+    assert config.worker_node_ip == "192.0.2.41"
+    # The worker IP never doubles as the advertised direct address.
+    assert config.advertise_ip == ""
 
 
 @pytest.mark.parametrize("interval", ["0", "-1", "nan", "inf"])

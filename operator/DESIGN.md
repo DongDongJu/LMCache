@@ -587,6 +587,11 @@ The global-CacheBlend knobs (`blendChunkSize`, `blendProbeStride`) render into t
   what you are doing (e.g. the coordinator runs outside the cluster and must
   reach the server through a specific externally-routable address); an incorrect
   value silently breaks coordinator-to-server connectivity.
+- Whenever a coordinator is configured the DaemonSet also injects
+  `LMCACHE_WORKER_NODE_IP` from `status.hostIP`. The server registers it as
+  `metadata.worker_ip`, the node identity capacity management (the standalone
+  MP Memory Coordinator) uses as an outside allocator's `target_node`. It is
+  metadata only and is never advertised as the direct MP HTTP address.
 - `heartbeatInterval`, `l2EventReporting`, `l2EventFlushInterval`.
 
 When `coordinator` is unset, the server emits no `--coordinator-url` and does not

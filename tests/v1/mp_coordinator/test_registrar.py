@@ -273,3 +273,69 @@ def test_on_registered_is_required():
     parameter = inspect.signature(keep_registered).parameters["on_registered"]
     assert parameter.default is inspect.Parameter.empty
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def _capture_register_bodies(bodies: list[dict]):
+    """Handler that records every registration body and accepts it."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Standard
+        import json
+
+        if request.method == "POST":
+            bodies.append(json.loads(request.content))
+            return httpx.Response(
+                200, json={"instance_id": "i1", "re_registered": False}
+            )
+        if request.method == "PUT":
+            # Coordinator forgot us: forces a re-registration next tick.
+            return httpx.Response(404, json={"error": "unknown"})
+        return httpx.Response(204)
+
+    return handler
+
+
+def test_register_omits_metadata_by_default():
+    """Backward compatibility: no worker IP means the schema-default
+    empty metadata, exactly as before the field was plumbed."""
+    bodies: list[dict] = []
+
+    async def run():
+        async with _client(_capture_register_bodies(bodies)) as client:
+            await register(client, _BASE, http_port=8080, advertise_ip="10.0.0.1")
+
+    asyncio.run(run())
+    assert bodies[0]["metadata"] == {}
+
+
+def test_register_forwards_exactly_the_worker_ip_metadata():
+    bodies: list[dict] = []
+
+    async def run():
+        async with _client(_capture_register_bodies(bodies)) as client:
+            await register(
+                client,
+                _BASE,
+                http_port=8080,
+                advertise_ip="10.0.0.1",
+                metadata={"worker_ip": "192.0.2.40"},
+            )
+
+    asyncio.run(run())
+    assert bodies[0]["metadata"] == {"worker_ip": "192.0.2.40"}
+    # The worker IP is metadata only; the direct address stays advertise_ip.
+    assert bodies[0]["ip"] == "10.0.0.1"
+
+
+def test_keep_registered_preserves_metadata_on_reregistration():
+    bodies: list[dict] = []
+
+    async def run():
+        async with _client(_capture_register_bodies(bodies)) as client:
+            await _run_loop_briefly(
+                client, instance_id="i1", metadata={"worker_ip": "192.0.2.40"}
+            )
+
+    asyncio.run(run())
+    assert len(bodies) >= 2, "expected a re-registration after the 404"
+    assert all(b["metadata"] == {"worker_ip": "192.0.2.40"} for b in bodies)

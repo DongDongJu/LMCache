@@ -693,3 +693,42 @@ class TestCheckpointWiring:
         restored = ServerConfigRegistry()
         restored.restore(registry.capture())
         assert restored.get("mp-1") == registry.get("mp-1")
+
+
+# -- ``/instances`` exposes registration metadata --------------------------
+
+
+def _metadata_client() -> TestClient:
+    return TestClient(
+        create_app(
+            MPCoordinatorConfig(health_check_interval=0.0, eviction_check_interval=0.0)
+        )
+    )
+
+
+def test_instances_exposes_worker_ip_metadata() -> None:
+    with _metadata_client() as client:
+        response = client.post(
+            "/instances",
+            json={
+                "instance_id": "mp-1",
+                "ip": "10.0.0.11",
+                "http_port": 8080,
+                "metadata": {"worker_ip": "192.0.2.40"},
+            },
+        )
+        assert response.status_code == 200, response.text
+        listed = client.get("/instances").json()["instances"]
+    assert listed[0]["instance_id"] == "mp-1"
+    assert listed[0]["ip"] == "10.0.0.11"
+    assert listed[0]["metadata"] == {"worker_ip": "192.0.2.40"}
+
+
+def test_instances_metadata_defaults_to_empty_mapping() -> None:
+    with _metadata_client() as client:
+        client.post(
+            "/instances",
+            json={"instance_id": "mp-1", "ip": "10.0.0.11", "http_port": 8080},
+        )
+        listed = client.get("/instances").json()["instances"]
+    assert listed[0]["metadata"] == {}
