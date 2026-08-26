@@ -10,6 +10,8 @@ crash-safe saga:
 
 Code: `lmcache/v1/mp_memory_coordinator/`. CLI: `lmcache mp-memory-coordinator
 --config FILE`. Manifests and E2E: `tests/e2e/mp_memory_coordinator/`.
+Testing against a real outside service and real MP servers:
+[testing.md](testing.md).
 
 Under the development topology this changes which pre-existing server-local
 Device-DAX device is active; it does not move a physical device or migrate
