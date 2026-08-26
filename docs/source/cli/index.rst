@@ -53,6 +53,9 @@ Available Commands
      - Launch the LMCache MP server (ZMQ + HTTP). Requires the full install.
    * - :doc:`coordinator`
      - Launch the LMCache MP coordinator (HTTP instance registry).
+   * - :doc:`mp_memory_coordinator`
+     - Run the standalone MP Memory Coordinator (Device-DAX capacity
+       rebalancing between MP servers). Requires the full install.
    * - :doc:`describe`
      - Show detailed status of a running LMCache service.
    * - :doc:`ping`
@@ -99,6 +102,7 @@ See :doc:`/developer_guide/cli` for details.
 
    server
    coordinator
+   mp_memory_coordinator
    describe
    ping
    query

@@ -1,0 +1,66 @@
+{
+  "enabled": true,
+  "backend": "dax",
+  "num_adapters": 1,
+  "adapters": [
+    {
+      "backend": "dax",
+      "supported_operations": [
+        "status",
+        "add",
+        "remove",
+        "resize"
+      ],
+      "status": {
+        "hotplug_enabled": true,
+        "slot_bytes": 128,
+        "total_capacity_bytes": 512,
+        "total_used_bytes": 0,
+        "devices": [
+          {
+            "is_healthy": true,
+            "device_path": "/dev/dax-cxl/lmcache-e2e--mp-196/dax0.0",
+            "max_dax_size_bytes": 512,
+            "slot_bytes": 128,
+            "max_slots": 4,
+            "live_slot_count": 0,
+            "locked_key_count": 0,
+            "borrowed_slot_count": 0,
+            "active_read_count": 0,
+            "active_write_count": 0,
+            "closing": false,
+            "supports_restart_recovery": false,
+            "index": 0,
+            "device_id": 0,
+            "state": "active",
+            "inflight_store_tasks": 0,
+            "inflight_lookup_tasks": 0,
+            "inflight_load_tasks": 0
+          },
+          {
+            "is_healthy": false,
+            "device_path": "/dev/dax-cxl/lmcache-e2e--mp-196/dax0.1",
+            "max_dax_size_bytes": 512,
+            "slot_bytes": 128,
+            "max_slots": 4,
+            "live_slot_count": 0,
+            "locked_key_count": 0,
+            "borrowed_slot_count": 0,
+            "active_read_count": 0,
+            "active_write_count": 0,
+            "closing": true,
+            "supports_restart_recovery": false,
+            "index": 1,
+            "device_id": 1,
+            "state": "removed",
+            "inflight_store_tasks": 0,
+            "inflight_lookup_tasks": 0,
+            "inflight_load_tasks": 0
+          }
+        ]
+      },
+      "adapter_index": 0,
+      "l2_adapter_index": 0
+    }
+  ]
+}

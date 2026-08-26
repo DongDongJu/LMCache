@@ -1,0 +1,12 @@
+{
+  "status": "ok",
+  "operation": "remove",
+  "adapter_index": 0,
+  "device_path": "/dev/dax-cxl/lmcache-e2e--mp-196/dax0.1",
+  "index": 1,
+  "moved_keys": 0,
+  "moved_bytes": 0,
+  "deleted_keys": 0,
+  "source_slots_freed": 0,
+  "state": "removed"
+}

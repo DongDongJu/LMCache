@@ -1,0 +1,8 @@
+{
+  "status": "ok",
+  "operation": "drain",
+  "adapter_index": 0,
+  "device_path": "/dev/dax-cxl/lmcache-e2e--mp-196/dax0.1",
+  "index": 1,
+  "state": "draining"
+}

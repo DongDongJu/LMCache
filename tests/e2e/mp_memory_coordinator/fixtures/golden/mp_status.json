@@ -1,0 +1,123 @@
+{
+  "is_healthy": true,
+  "engine_type": "MPCacheServer",
+  "chunk_size": 256,
+  "hash_algorithm": "blake3",
+  "active_sessions": 0,
+  "storage_manager": {
+    "is_healthy": true,
+    "l1_manager": {
+      "is_healthy": true,
+      "total_object_count": 0,
+      "write_locked_count": 0,
+      "read_locked_count": 0,
+      "temporary_count": 0,
+      "memory_used_bytes": 0,
+      "memory_total_bytes": 1048576,
+      "memory_configured_bytes": 1048576,
+      "memory_usage_ratio": 0.0,
+      "write_ttl_seconds": 60,
+      "read_ttl_seconds": 60
+    },
+    "store_controller": {
+      "is_healthy": true,
+      "thread_alive": true,
+      "pending_keys_count": 0,
+      "in_flight_task_count": 0,
+      "num_l2_adapters": 1,
+      "num_active_adapters": 1,
+      "num_draining_adapters": 0
+    },
+    "prefetch_controller": {
+      "is_healthy": true,
+      "thread_alive": true,
+      "max_in_flight": 8,
+      "submission_queue_size": 0,
+      "pending_queue_size": 0,
+      "in_flight_request_count": 0,
+      "lookup_phase_count": 0,
+      "load_phase_count": 0,
+      "completed_results_count": 0,
+      "num_l2_adapters": 1,
+      "num_active_adapters": 1,
+      "num_draining_adapters": 0
+    },
+    "l1_eviction_controller": {
+      "is_healthy": true,
+      "thread_alive": true,
+      "eviction_policy": "noop",
+      "trigger_watermark": 0.8,
+      "eviction_ratio": 0.2
+    },
+    "l2_eviction_controller": {
+      "is_healthy": true,
+      "thread_alive": true,
+      "adapters": []
+    },
+    "l2_adapters": [
+      {
+        "is_healthy": true,
+        "type": "dax",
+        "device_path": "/dev/dax-cxl/lmcache-e2e--mp-196/dax0.0",
+        "max_dax_size_bytes": 1024,
+        "slot_bytes": 128,
+        "live_slot_count": 0,
+        "locked_key_count": 0,
+        "borrowed_slot_count": 0,
+        "inflight_store_tasks": 0,
+        "inflight_lookup_tasks": 0,
+        "inflight_load_tasks": 0,
+        "closing": false,
+        "supports_restart_recovery": false,
+        "hotplug_enabled": true,
+        "devices": [
+          {
+            "is_healthy": true,
+            "device_path": "/dev/dax-cxl/lmcache-e2e--mp-196/dax0.0",
+            "max_dax_size_bytes": 512,
+            "slot_bytes": 128,
+            "max_slots": 4,
+            "live_slot_count": 0,
+            "locked_key_count": 0,
+            "borrowed_slot_count": 0,
+            "active_read_count": 0,
+            "active_write_count": 0,
+            "closing": false,
+            "supports_restart_recovery": false,
+            "index": 0,
+            "device_id": 0,
+            "state": "active",
+            "inflight_store_tasks": 0,
+            "inflight_lookup_tasks": 0,
+            "inflight_load_tasks": 0
+          },
+          {
+            "is_healthy": true,
+            "device_path": "/dev/dax-cxl/lmcache-e2e--mp-196/dax0.1",
+            "max_dax_size_bytes": 512,
+            "slot_bytes": 128,
+            "max_slots": 4,
+            "live_slot_count": 0,
+            "locked_key_count": 0,
+            "borrowed_slot_count": 0,
+            "active_read_count": 0,
+            "active_write_count": 0,
+            "closing": false,
+            "supports_restart_recovery": false,
+            "index": 1,
+            "device_id": 1,
+            "state": "active",
+            "inflight_store_tasks": 0,
+            "inflight_lookup_tasks": 0,
+            "inflight_load_tasks": 0
+          }
+        ],
+        "num_devices": 2
+      }
+    ],
+    "num_l2_adapters": 1
+  },
+  "active_prefetch_jobs": 0,
+  "registered_gpu_ids": [],
+  "cache_context_meta": {}
+}

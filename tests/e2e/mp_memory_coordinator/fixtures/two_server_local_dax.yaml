@@ -1,0 +1,32 @@
+schema_version: 1
+nodes:
+  "192.0.2.40":
+    name: worker-196
+    devices:
+      - path: /dev/dax-cxl/lmcache-e2e--mp-196/dax0.0
+        size_gib: 64
+        role: bootstrap
+        state: assigned
+      - path: /dev/dax-cxl/lmcache-e2e--mp-196/dax0.1
+        size_gib: 64
+        role: runtime
+        state: assigned
+      - path: /dev/dax-cxl/lmcache-e2e--mp-196/dax0.2
+        size_gib: 64
+        role: runtime
+        state: free
+  "192.0.2.41":
+    name: worker-197
+    devices:
+      - path: /dev/dax-cxl/lmcache-e2e--mp-197/dax0.0
+        size_gib: 64
+        role: bootstrap
+        state: assigned
+      - path: /dev/dax-cxl/lmcache-e2e--mp-197/dax0.1
+        size_gib: 64
+        role: runtime
+        state: free
+      - path: /dev/dax-cxl/lmcache-e2e--mp-197/dax0.2
+        size_gib: 64
+        role: runtime
+        state: free

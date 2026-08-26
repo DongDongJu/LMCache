@@ -1,0 +1,51 @@
+{
+  "instances": [
+    {
+      "instance_id": "mp-donor",
+      "registered": true,
+      "declared_capacity": true,
+      "modules": [
+        {
+          "tier": "l1",
+          "backend": "dram",
+          "shared": false,
+          "used_bytes": 0,
+          "capacity_bytes": 4294967296,
+          "usage_ratio": 0.0
+        },
+        {
+          "tier": "l2",
+          "backend": "dax",
+          "shared": false,
+          "used_bytes": 8589934592,
+          "capacity_bytes": 137438953472,
+          "usage_ratio": 0.0625
+        }
+      ]
+    },
+    {
+      "instance_id": "mp-receiver",
+      "registered": true,
+      "declared_capacity": true,
+      "modules": [
+        {
+          "tier": "l1",
+          "backend": "dram",
+          "shared": false,
+          "used_bytes": 0,
+          "capacity_bytes": 4294967296,
+          "usage_ratio": 0.0
+        },
+        {
+          "tier": "l2",
+          "backend": "dax",
+          "shared": false,
+          "used_bytes": 60129542144,
+          "capacity_bytes": 68719476736,
+          "usage_ratio": 0.875
+        }
+      ]
+    }
+  ],
+  "shared_modules": []
+}
