@@ -70,7 +70,7 @@ e2e-mp-memory-coordinator-kind-collect:
 	-kubectl --context $(KIND_CONTEXT) -n $(E2E_NAMESPACE) exec deploy/lmcache-mp-memory-coordinator -- cat /var/lib/lmcache-memory-coordinator/journal.json > $(ARTIFACTS)/kind/journal.json
 	-kubectl --context $(KIND_CONTEXT) -n $(E2E_NAMESPACE) exec deploy/scenario-server -- python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:9091/__test/audit').read().decode())" > $(ARTIFACTS)/kind/scenario-audit.json
 	-kubectl --context $(KIND_CONTEXT) -n $(E2E_NAMESPACE) exec deploy/mock-memory-allocation-service -- python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:9090/__test/audit').read().decode())" > $(ARTIFACTS)/kind/allocator-audit.json
-	-kubectl --context $(KIND_CONTEXT) -n $(E2E_NAMESPACE) exec deploy/mock-memory-allocation-service -- python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8080/v2/apps/lmcache').read().decode())" > $(ARTIFACTS)/kind/outside-status.json
+	-kubectl --context $(KIND_CONTEXT) -n $(E2E_NAMESPACE) exec deploy/mock-memory-allocation-service -- python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8080/api/v2/lmcache').read().decode())" > $(ARTIFACTS)/kind/outside-status.json
 	-kubectl --context $(KIND_CONTEXT) -n $(E2E_NAMESPACE) exec deploy/scenario-server -- python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8081/reconfigure/dax/status').read().decode());print(urllib.request.urlopen('http://127.0.0.1:8082/reconfigure/dax/status').read().decode());print(urllib.request.urlopen('http://127.0.0.1:9300/instances/usage').read().decode())" > $(ARTIFACTS)/kind/dax-and-usage.json
 
 # Manual / nightly gate on real Device-DAX hardware (PLAN.md section 9).

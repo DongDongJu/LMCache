@@ -2,7 +2,7 @@
 #
 # Usage (from anywhere):
 #   docker compose -f tests/e2e/mp_memory_coordinator/dev/docker-compose.yaml up --build
-#   curl -s http://127.0.0.1:18080/v2/apps/lmcache | jq
+#   curl -s http://127.0.0.1:18080/api/v2/lmcache | jq
 #   curl -s http://127.0.0.1:19090/__test/health | jq
 #
 # The public listener (container port 8080) exposes only the three frozen outside

@@ -23,9 +23,9 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 GIB = 1024**3
 """Bytes per GiB; DAX map sizes must be whole GiB to be movable."""
 
-OUTSIDE_STATUS_PATH = "/v2/apps/lmcache"
-OUTSIDE_DEALLOCATIONS_PATH = "/v2/apps/lmcache/deallocations"
-OUTSIDE_ALLOCATIONS_PATH = "/v2/apps/lmcache/allocations"
+OUTSIDE_STATUS_PATH = "/api/v2/lmcache"
+OUTSIDE_DEALLOCATIONS_PATH = "/api/v2/lmcache/deallocations"
+OUTSIDE_ALLOCATIONS_PATH = "/api/v2/lmcache/allocations"
 OUTSIDE_STATUS_DONE: Final = "DONE"
 OUTSIDE_MODE: Final = "devdax"
 OUTSIDE_PURPOSE: Final = "lmcache-dax"
@@ -311,7 +311,7 @@ class DaxAddResponse(BaseModel):
 
 
 class DeallocationRequest(BaseModel):
-    """Exact body of ``POST /v2/apps/lmcache/deallocations``."""
+    """Exact body of ``POST /api/v2/lmcache/deallocations``."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -333,7 +333,7 @@ class DeallocationResponse(BaseModel):
 
 
 class AllocationRequest(BaseModel):
-    """Exact body of ``POST /v2/apps/lmcache/allocations``.
+    """Exact body of ``POST /api/v2/lmcache/allocations``.
 
     The request field is ``request_size_gib``; the response echoes it as
     ``requested_size_gib``. The names differ on purpose.
@@ -363,7 +363,7 @@ class AllocationResponse(BaseModel):
 
 
 OutsideStatus = dict[str, list[str]]
-"""``GET /v2/apps/lmcache``: bare ``target_node -> device_path[]``."""
+"""``GET /api/v2/lmcache``: bare ``target_node -> device_path[]``."""
 
 
 def parse_outside_status(raw: object) -> OutsideStatus:

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Client of the frozen outside Memory Allocation API.
 
-    GET  /v2/apps/lmcache
-    POST /v2/apps/lmcache/deallocations
-    POST /v2/apps/lmcache/allocations
+    GET  /api/v2/lmcache
+    POST /api/v2/lmcache/deallocations
+    POST /api/v2/lmcache/allocations
 
 The request bodies are exactly the documented fields; every documented
 response field is required and echo fields are validated against the sent
@@ -123,7 +123,7 @@ class MemoryAllocationClient:
         return self._base_url
 
     async def get_status(self) -> OutsideStatus:
-        """``GET /v2/apps/lmcache``.
+        """``GET /api/v2/lmcache``.
 
         Returns:
             The bare ``target_node -> device_path[]`` mapping.
@@ -145,7 +145,7 @@ class MemoryAllocationClient:
             raise OutsideContractError(str(exc)) from exc
 
     async def deallocate(self, request: DeallocationRequest) -> DeallocationResponse:
-        """``POST /v2/apps/lmcache/deallocations``, once.
+        """``POST /api/v2/lmcache/deallocations``, once.
 
         Args:
             request: The exact request body.
@@ -187,7 +187,7 @@ class MemoryAllocationClient:
         return response
 
     async def allocate(self, request: AllocationRequest) -> AllocationResponse:
-        """``POST /v2/apps/lmcache/allocations``, once.
+        """``POST /api/v2/lmcache/allocations``, once.
 
         Args:
             request: The exact request body.

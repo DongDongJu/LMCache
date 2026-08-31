@@ -491,7 +491,7 @@ def test_outside_status_is_bare_mapping() -> None:
     status = _run(_alloc_client(handler).get_status())
     assert status == {DONOR_IP: [DONOR_PATH], RECEIVER_IP: []}
     assert rec.requests[0].method == "GET"
-    assert str(rec.requests[0].url) == "http://alloc:8080/v2/apps/lmcache"
+    assert str(rec.requests[0].url) == "http://alloc:8080/api/v2/lmcache"
 
 
 @pytest.mark.parametrize(
@@ -526,7 +526,7 @@ def test_deallocation_request_is_exact_and_response_fully_validated() -> None:
 
     sent = rec.requests[0]
     assert sent.method == "POST"
-    assert str(sent.url) == "http://alloc:8080/v2/apps/lmcache/deallocations"
+    assert str(sent.url) == "http://alloc:8080/api/v2/lmcache/deallocations"
     assert sent.headers["content-type"] == "application/json"
     body = json.loads(sent.content)
     assert set(body) == DEALLOCATION_REQUEST_KEYS
@@ -557,7 +557,7 @@ def test_allocation_request_is_exact_with_literal_values() -> None:
 
     sent = rec.requests[0]
     assert sent.method == "POST"
-    assert str(sent.url) == "http://alloc:8080/v2/apps/lmcache/allocations"
+    assert str(sent.url) == "http://alloc:8080/api/v2/lmcache/allocations"
     body = json.loads(sent.content)
     assert set(body) == ALLOCATION_REQUEST_KEYS
     assert body == {

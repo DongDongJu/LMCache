@@ -172,7 +172,7 @@ def test_static_inventory_gate(gate: dict) -> None:
     """Every allowlisted path has one fixed worker, role, size, and state that
     agrees with the live MP DAX state and the outside status."""
     inventory = gate["inventory"]
-    outside = requests.get(f"{gate['outside_url']}/v2/apps/lmcache", timeout=10).json()
+    outside = requests.get(f"{gate['outside_url']}/api/v2/lmcache", timeout=10).json()
     assert isinstance(outside, dict) and all(
         isinstance(v, list) for v in outside.values()
     ), "outside status is not the bare target_node -> device_path[] object"
@@ -226,7 +226,7 @@ def test_happy_move_on_real_dax(gate: dict) -> None:
     baseline = run_dir / "baseline"
     baseline.mkdir(exist_ok=True)
     (baseline / "outside-status.json").write_text(
-        requests.get(f"{gate['outside_url']}/v2/apps/lmcache", timeout=10).text
+        requests.get(f"{gate['outside_url']}/api/v2/lmcache", timeout=10).text
     )
     (baseline / "instances.json").write_text(
         requests.get(f"{gate['coordinator_url']}/instances", timeout=10).text
@@ -264,7 +264,7 @@ def test_happy_move_on_real_dax(gate: dict) -> None:
     assert proposal["receiver_worker_ip"] == gate["topology"]["receiver"]["target_node"]
     assert proposal["allocation_size_gib"] == gate["move_size_gib"]
     before_outside = requests.get(
-        f"{gate['outside_url']}/v2/apps/lmcache", timeout=10
+        f"{gate['outside_url']}/api/v2/lmcache", timeout=10
     ).json()
 
     # Enable actuation through the ConfigMap and a rollout; the journal on
@@ -362,7 +362,7 @@ def test_happy_move_on_real_dax(gate: dict) -> None:
     donor_ip = gate["topology"]["donor"]["target_node"]
     receiver_ip = gate["topology"]["receiver"]["target_node"]
     after_outside = requests.get(
-        f"{gate['outside_url']}/v2/apps/lmcache", timeout=10
+        f"{gate['outside_url']}/api/v2/lmcache", timeout=10
     ).json()
     assert move["old_path"] not in after_outside.get(donor_ip, [])
     assert move["new_path"] in after_outside.get(receiver_ip, [])
