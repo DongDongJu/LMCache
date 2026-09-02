@@ -4,6 +4,8 @@ Tests for the DAX MP L2 adapter.
 """
 
 # Standard
+from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 import select
@@ -40,6 +42,10 @@ from lmcache.v1.distributed.l2_adapters.dax_l2_adapter import (
     DaxL2Adapter,
     DaxL2AdapterConfig,
 )
+from lmcache.v1.distributed.l2_adapters.dax_physical import (
+    DaxPhysicalMode,
+    DaxPhysicalState,
+)
 from lmcache.v1.distributed.l2_adapters.reconfiguration import (
     L2ReconfigurableAdapter,
     L2ReconfigureError,
@@ -54,6 +60,7 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.mp_observability.event import Event
 from lmcache.v1.mp_observability.event_bus import EventBus
 from lmcache.v1.platform import consume_fd
+import lmcache.v1.distributed.l2_adapters.dax_l2_adapter as dax_l2_adapter_module
 
 _EMPTY_LAYOUT = MemoryLayoutDesc(shapes=[], dtypes=[])
 
@@ -1134,3 +1141,404 @@ def _dax_capacity(event: Event) -> int:
     ]
     assert len(modules) == 1, snapshot.modules
     return int(modules[0].capacity_bytes)
+
+
+# ---------------------------------------------------------------------------
+# Presence watcher, read-only physical probe, and the hotplug add gate.
+# ---------------------------------------------------------------------------
+
+
+def _watch_threads() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name.startswith("dax-l2-watch")]
+
+
+def _fake_probe(
+    mode: DaxPhysicalMode, *, size_bytes: int = 0, probed_at: float = 1.0
+) -> Callable[..., DaxPhysicalState]:
+    """Return a ``probe_device`` stand-in reporting ``mode`` for any path."""
+
+    def _probe(path: str, **kwargs: object) -> DaxPhysicalState:
+        return DaxPhysicalState(
+            device_path=path,
+            mode=mode,
+            present=mode is not DaxPhysicalMode.ABSENT,
+            major=249,
+            minor=2,
+            kernel_name="dax2.1",
+            driver="device_dax" if mode is DaxPhysicalMode.DEVDAX else "",
+            size_bytes=size_bytes,
+            align_bytes=2097152,
+            probed_at=probed_at,
+            detail="",
+        )
+
+    return _probe
+
+
+def make_watching_adapter(
+    tmp_path: Path, *, interval_seconds: float = 0.02
+) -> tuple[DaxL2Adapter, Path]:
+    """Create a hotplug-only adapter watching ``tmp_path / "devs"``."""
+    directory = tmp_path / "devs"
+    directory.mkdir()
+    config = DaxL2AdapterConfig.from_dict(
+        {
+            "slot_bytes": 2048,
+            "hotplug_enabled": True,
+            "devices": [],
+            "watch_directory": str(directory),
+            "watch_interval_seconds": interval_seconds,
+        }
+    )
+    return DaxL2Adapter(config), directory
+
+
+def test_dax_config_from_dict_parses_watch_fields():
+    config = DaxL2AdapterConfig.from_dict(
+        {
+            "slot_bytes": 2048,
+            "hotplug_enabled": True,
+            "devices": [],
+            "watch_directory": " /dev/dax-cxl/ns_pod ",
+            "watch_interval_seconds": 2,
+        }
+    )
+    assert config.watch_directory == "/dev/dax-cxl/ns_pod"
+    assert config.watch_interval_seconds == 2.0
+    assert "watch_directory" in DaxL2AdapterConfig.help()
+    assert "watch_interval_seconds" in DaxL2AdapterConfig.help()
+
+
+def test_dax_config_watch_defaults_to_disabled():
+    config = DaxL2AdapterConfig.from_dict(
+        {"slot_bytes": 2048, "hotplug_enabled": True, "devices": []}
+    )
+    assert config.watch_directory == ""
+    assert config.watch_interval_seconds == 1.0
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"watch_directory": 5}, "watch_directory must be a string"),
+        ({"watch_directory": "relative/dir"}, "absolute"),
+        ({"watch_interval_seconds": 0}, "watch_interval_seconds"),
+        ({"watch_interval_seconds": -0.5}, "watch_interval_seconds"),
+        ({"watch_interval_seconds": "1"}, "watch_interval_seconds"),
+        ({"watch_interval_seconds": float("nan")}, "positive finite"),
+        ({"watch_interval_seconds": float("inf")}, "positive finite"),
+    ],
+)
+def test_dax_config_from_dict_rejects_invalid_watch_fields(overrides, match):
+    payload = {"slot_bytes": 2048, "hotplug_enabled": True, "devices": []}
+    payload.update(overrides)
+    with pytest.raises(ValueError, match=match):
+        DaxL2AdapterConfig.from_dict(payload)
+
+
+def test_dax_config_constructor_validates_watch_fields():
+    with pytest.raises(ValueError, match="absolute"):
+        DaxL2AdapterConfig(
+            devices=[], hotplug_enabled=True, slot_bytes=2048, watch_directory="x"
+        )
+    with pytest.raises(ValueError, match="watch_interval_seconds"):
+        DaxL2AdapterConfig(
+            devices=[],
+            hotplug_enabled=True,
+            slot_bytes=2048,
+            watch_directory="/dev/dax-cxl/ns_pod",
+            watch_interval_seconds=0.0,
+        )
+    for non_finite in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="positive finite"):
+            DaxL2AdapterConfig(
+                devices=[],
+                hotplug_enabled=True,
+                slot_bytes=2048,
+                watch_directory="/dev/dax-cxl/ns_pod",
+                watch_interval_seconds=non_finite,
+            )
+
+
+def test_dax_watcher_disabled_reports_enabled_false_and_no_thread(tmp_path):
+    adapter = make_hotplug_adapter(tmp_path)
+    try:
+        assert adapter.hotplug_status()["watcher"] == {"enabled": False}
+        assert adapter.reconfigure("status", {})["status"]["watcher"] == {
+            "enabled": False
+        }
+        assert _watch_threads() == []
+    finally:
+        adapter.close()
+
+
+def test_dax_watcher_status_lists_directory_and_tracks_new_files(tmp_path):
+    directory = tmp_path / "devs"
+    directory.mkdir()
+    first = directory / "a.bin"
+    first.write_bytes(b"\0" * 4096)
+    adapter = DaxL2Adapter(
+        DaxL2AdapterConfig.from_dict(
+            {
+                "slot_bytes": 2048,
+                "hotplug_enabled": True,
+                "devices": [],
+                "watch_directory": str(directory),
+                "watch_interval_seconds": 0.02,
+            }
+        )
+    )
+    try:
+
+        def _present_paths() -> list[str]:
+            watcher = adapter.hotplug_status()["watcher"]
+            return [d["device_path"] for d in watcher["present_devices"]]
+
+        assert wait_for_condition(lambda: _present_paths() == [str(first)])
+        watcher = adapter.hotplug_status()["watcher"]
+        assert watcher["enabled"] is True
+        assert watcher["directory"] == str(directory)
+        assert watcher["interval_seconds"] == 0.02
+        assert watcher["last_scan_at"] > 0
+        present = watcher["present_devices"][0]
+        assert present["mode"] == "not-a-device"
+        assert present["present"] is True
+        assert present["size_bytes"] == 4096
+
+        second = directory / "b.bin"
+        second.write_bytes(b"\0" * 2048)
+        assert wait_for_condition(lambda: _present_paths() == [str(first), str(second)])
+        # Presence is reported only: nothing was attached.
+        assert adapter.hotplug_status()["devices"] == []
+        assert adapter.report_status()["num_devices"] == 0
+    finally:
+        adapter.close()
+
+
+def test_dax_watcher_thread_stops_on_close(tmp_path):
+    adapter, _ = make_watching_adapter(tmp_path)
+    try:
+        assert wait_for_condition(lambda: len(_watch_threads()) == 1)
+    finally:
+        adapter.close()
+    assert wait_for_condition(lambda: _watch_threads() == [])
+    assert adapter.hotplug_status()["watcher"]["enabled"] is True
+
+
+def test_dax_status_and_add_response_carry_physical(tmp_path):
+    adapter = make_hotplug_adapter(tmp_path, slot_bytes=2048)
+    try:
+        devices = adapter.hotplug_status()["devices"]
+        assert len(devices) == 2
+        for device in devices:
+            physical = device["physical"]
+            assert physical["device_path"] == device["device_path"]
+            assert physical["mode"] == "not-a-device"
+            assert physical["present"] is True
+            assert physical["size_bytes"] == 2048 * 2
+            assert physical["probed_at"] > 0
+
+        reported = adapter.report_status()["devices"]
+        assert [d["physical"]["mode"] for d in reported] == ["not-a-device"] * 2
+
+        new_path = tmp_path / "late.bin"
+        with open(new_path, "wb") as fout:
+            fout.truncate(2048 * 2)
+        added = adapter.hotplug_add_device(str(new_path), 2048 * 2)
+        assert added["device"]["physical"]["mode"] == "not-a-device"
+        assert added["device"]["physical"]["device_path"] == str(new_path)
+        assert added["device"]["physical"]["size_bytes"] == 2048 * 2
+    finally:
+        adapter.close()
+
+
+def test_dax_watcher_refreshes_attached_device_physical_from_snapshot(tmp_path):
+    adapter, directory = make_watching_adapter(tmp_path)
+    node = directory / "dax0.1"
+    with open(node, "wb") as fout:
+        fout.truncate(4096)
+    try:
+        added = adapter.hotplug_add_device(str(node), 4096)
+        assert added["device"]["physical"]["size_bytes"] == 4096
+        first_probe = added["device"]["physical"]["probed_at"]
+
+        with open(node, "r+b") as fout:
+            fout.truncate(8192)
+
+        def _status_size() -> int:
+            return adapter.hotplug_status()["devices"][0]["physical"]["size_bytes"]
+
+        assert wait_for_condition(lambda: _status_size() == 8192)
+        physical = adapter.hotplug_status()["devices"][0]["physical"]
+        assert physical["probed_at"] >= first_probe
+        assert physical["device_path"] == str(node)
+        # The mapping itself is unchanged; only the probe block moved.
+        assert adapter.hotplug_status()["devices"][0]["max_dax_size_bytes"] == 4096
+    finally:
+        adapter.close()
+
+
+def test_dax_status_keeps_newer_attach_probe_over_older_scan(tmp_path, monkeypatch):
+    """A watcher scan older than the attach-time probe never overwrites it."""
+    adapter, directory = make_watching_adapter(tmp_path)
+    node = directory / "dax0.1"
+    with open(node, "wb") as fout:
+        fout.truncate(4096)
+    # Far newer than any real scan the watcher can take during this test.
+    attach_probed_at = time.time() + 3600.0
+    try:
+        monkeypatch.setattr(
+            dax_l2_adapter_module,
+            "probe_device",
+            _fake_probe(
+                DaxPhysicalMode.NOT_A_DEVICE,
+                size_bytes=12345,
+                probed_at=attach_probed_at,
+            ),
+        )
+        added = adapter.hotplug_add_device(str(node), 4096)
+        assert added["device"]["physical"]["probed_at"] == attach_probed_at
+        assert added["device"]["physical"]["size_bytes"] == 12345
+        added_at = time.time()
+
+        # Wait for a scan that started after the add so the snapshot lists
+        # the node with a real (older) probe; it must not win.
+        assert wait_for_condition(
+            lambda: adapter.hotplug_status()["watcher"]["last_scan_at"] >= added_at
+        )
+        watched = adapter.hotplug_status()["watcher"]["present_devices"]
+        assert [d["device_path"] for d in watched] == [str(node)]
+        assert 0 < watched[0]["probed_at"] < attach_probed_at
+        physical = adapter.hotplug_status()["devices"][0]["physical"]
+        assert physical["probed_at"] == attach_probed_at
+        assert physical["size_bytes"] == 12345
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "size_bytes", "message"),
+    [
+        (DaxPhysicalMode.SYSTEM_RAM, 0, "DAX device is bound to kmem (system-ram)"),
+        (DaxPhysicalMode.UNBOUND, 0, "DAX device has no device_dax driver bound"),
+        (DaxPhysicalMode.DEVDAX, 2048, "DAX device size 2048 < requested 4096"),
+    ],
+)
+def test_dax_hotplug_add_gate_rejects_bad_physical_signal(
+    tmp_path, monkeypatch, mode, size_bytes, message
+):
+    adapter = make_hotplug_adapter(tmp_path, slot_bytes=2048)
+    new_path = tmp_path / "gated.bin"
+    with open(new_path, "wb") as fout:
+        fout.truncate(4096)
+    try:
+        before = adapter.hotplug_status()
+        monkeypatch.setattr(
+            dax_l2_adapter_module,
+            "probe_device",
+            _fake_probe(mode, size_bytes=size_bytes),
+        )
+
+        with pytest.raises(L2ReconfigureError) as exc_info:
+            adapter.hotplug_add_device(str(new_path), 4096)
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.payload == {"error": message}
+        assert str(new_path) not in str(exc_info.value.payload)
+        after = adapter.hotplug_status()
+        assert len(after["devices"]) == len(before["devices"]) == 2
+        assert after["total_capacity_bytes"] == before["total_capacity_bytes"]
+        assert str(new_path) not in [d["device_path"] for d in after["devices"]]
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "size_bytes"),
+    [
+        (DaxPhysicalMode.NOT_A_DEVICE, 0),
+        (DaxPhysicalMode.ABSENT, 0),
+        (DaxPhysicalMode.UNKNOWN, 0),
+        (DaxPhysicalMode.DEVDAX, 0),
+        (DaxPhysicalMode.DEVDAX, 4096),
+        (DaxPhysicalMode.DEVDAX, 1 << 40),
+    ],
+)
+def test_dax_hotplug_add_proceeds_on_inconclusive_probe(
+    tmp_path, monkeypatch, mode, size_bytes
+):
+    adapter = make_hotplug_adapter(tmp_path, slot_bytes=2048)
+    new_path = tmp_path / "open.bin"
+    with open(new_path, "wb") as fout:
+        fout.truncate(4096)
+    try:
+        monkeypatch.setattr(
+            dax_l2_adapter_module,
+            "probe_device",
+            _fake_probe(mode, size_bytes=size_bytes),
+        )
+
+        added = adapter.hotplug_add_device(str(new_path), 4096)
+
+        assert added["status"] == "ok"
+        assert added["device"]["state"] == "active"
+        assert added["device"]["physical"]["mode"] == mode.value
+        assert added["device"]["physical"]["size_bytes"] == size_bytes
+        assert len(adapter.hotplug_status()["devices"]) == 3
+    finally:
+        adapter.close()
+
+
+def test_dax_hotplug_add_gate_applies_to_active_path_re_add(tmp_path, monkeypatch):
+    """The gate runs before the already-active check.
+
+    A healthy same-size re-add stays idempotent (``200`` with the existing
+    entry); one whose probe now reports kmem is rejected with ``400`` and the
+    existing entry is left untouched.
+    """
+    adapter = make_hotplug_adapter(tmp_path, slot_bytes=2048)
+    try:
+        before = adapter.hotplug_status()
+        device = before["devices"][0]
+        path = device["device_path"]
+        size = device["max_dax_size_bytes"]
+
+        re_added = adapter.hotplug_add_device(path, size)
+        assert re_added["status"] == "ok"
+        assert re_added["device"]["device_id"] == device["device_id"]
+        assert len(adapter.hotplug_status()["devices"]) == 2
+
+        monkeypatch.setattr(
+            dax_l2_adapter_module,
+            "probe_device",
+            _fake_probe(DaxPhysicalMode.SYSTEM_RAM),
+        )
+        with pytest.raises(L2ReconfigureError) as exc_info:
+            adapter.hotplug_add_device(path, size)
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.payload == {
+            "error": "DAX device is bound to kmem (system-ram)"
+        }
+        after = adapter.hotplug_status()
+        assert [(d["device_id"], d["state"]) for d in after["devices"]] == [
+            (d["device_id"], d["state"]) for d in before["devices"]
+        ]
+        assert after["total_capacity_bytes"] == before["total_capacity_bytes"]
+        assert after["devices"][0]["physical"]["mode"] == "not-a-device"
+    finally:
+        adapter.close()
+
+
+def test_dax_hotplug_add_missing_path_still_fails_in_mapping(tmp_path):
+    """ABSENT is inconclusive for the gate; the add fails in mmap as before."""
+    adapter = make_hotplug_adapter(tmp_path, slot_bytes=2048)
+    missing = tmp_path / "missing.bin"
+    try:
+        with pytest.raises(L2ReconfigureError) as exc_info:
+            adapter.hotplug_add_device(str(missing), 4096)
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.payload == {"error": "failed to map DAX device"}
+        assert len(adapter.hotplug_status()["devices"]) == 2
+    finally:
+        adapter.close()

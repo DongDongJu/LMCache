@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, Optional, Protocol, cast
+import math
 import os
 import threading
 
@@ -27,6 +28,12 @@ from lmcache.v1.distributed.l2_adapters.base import (
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
     register_l2_adapter_type,
+)
+from lmcache.v1.distributed.l2_adapters.dax_physical import (
+    DaxDeviceWatcher,
+    DaxPhysicalMode,
+    DaxPhysicalState,
+    probe_device,
 )
 from lmcache.v1.distributed.l2_adapters.factory import (
     register_l2_adapter_factory,
@@ -104,7 +111,15 @@ class DaxDeviceConfig:
 
 @dataclass
 class DaxDeviceEntry:
-    """Runtime state for one mapped DAX device."""
+    """Runtime state for one mapped DAX device.
+
+    ``physical`` is the read-only ``probe_device`` result taken outside the
+    device lock when the device was attached. When the adapter's presence
+    watcher is enabled it is refreshed from the latest watcher snapshot each
+    time the device's status is reported, but only when that snapshot's
+    probe is at least as fresh (``probed_at``) as the state already held,
+    so an older scan never overwrites a newer attach-time probe.
+    """
 
     device_id: int
     device_path: str
@@ -112,6 +127,7 @@ class DaxDeviceEntry:
     max_dax_size_bytes: int
     slot_bytes: int
     state: DaxDeviceState
+    physical: DaxPhysicalState
 
 
 def _parse_positive_int(value: object, field_name: str) -> int:
@@ -121,8 +137,8 @@ def _parse_positive_int(value: object, field_name: str) -> int:
 
 
 def _parse_positive_float(value: object, field_name: str) -> float:
-    if not isinstance(value, (int, float)) or value <= 0:
-        raise ValueError(f"{field_name} must be a positive number")
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{field_name} must be a positive finite number")
     return float(value)
 
 
@@ -149,6 +165,50 @@ def _reconfigure_size_bytes(payload: dict[str, object]) -> int:
         raise L2ReconfigureError(400, str(exc)) from exc
 
 
+def _ensure_physically_mappable(
+    device_path: str,
+    physical: DaxPhysicalState,
+    size_bytes: int,
+) -> None:
+    """Reject a hotplug add that a read-only probe proves cannot work.
+
+    Only positive bad signals fail the add: a dax device bound to ``kmem``
+    (System RAM), a dax device with no driver bound, or a ``device_dax``
+    device whose sysfs size is known and smaller than the requested mapping
+    (the kernel accepts such an mmap and raises ``SIGBUS`` on first touch).
+    Inconclusive probes (``NOT_A_DEVICE``, ``ABSENT``, ``UNKNOWN``) let the
+    add proceed exactly as before, so regular-file arenas keep working and an
+    absent path still fails in ``mmap`` as it always did.
+
+    Args:
+        device_path: Path being added; used only in the server log line.
+        physical: Result of ``probe_device(device_path)``.
+        size_bytes: Requested mapping size in bytes.
+
+    Raises:
+        L2ReconfigureError: ``400`` with a sanitised message (no path) when
+            the probe proves the device cannot be mapped as requested.
+    """
+    message = ""
+    if physical.mode is DaxPhysicalMode.SYSTEM_RAM:
+        message = "DAX device is bound to kmem (system-ram)"
+    elif physical.mode is DaxPhysicalMode.UNBOUND:
+        message = "DAX device has no device_dax driver bound"
+    elif (
+        physical.mode is DaxPhysicalMode.DEVDAX and 0 < physical.size_bytes < size_bytes
+    ):
+        message = f"DAX device size {physical.size_bytes} < requested {size_bytes}"
+    if not message:
+        return
+    logger.warning(
+        "Rejecting DAX hotplug add of %s (%s): %s",
+        device_path,
+        physical.kernel_name or physical.mode.value,
+        message,
+    )
+    raise L2ReconfigureError(400, message)
+
+
 class DaxL2AdapterConfig(L2AdapterConfigBase):
     """Configuration for the built-in MP Device-DAX L2 adapter."""
 
@@ -161,6 +221,8 @@ class DaxL2AdapterConfig(L2AdapterConfigBase):
         num_store_workers: int = 1,
         num_lookup_workers: int = 1,
         num_load_workers: int = min(4, os.cpu_count() or 1),
+        watch_directory: str = "",
+        watch_interval_seconds: float = 1.0,
     ) -> None:
         """Initialize a validated DAX L2 adapter config.
 
@@ -172,9 +234,24 @@ class DaxL2AdapterConfig(L2AdapterConfigBase):
             num_store_workers: Number of worker threads for store tasks.
             num_lookup_workers: Number of worker threads for lookup tasks.
             num_load_workers: Number of worker threads for load tasks.
+            watch_directory: Absolute directory to scan for present DAX
+                device nodes, or ``""`` (default) to disable the presence
+                watcher. The watcher only reports; it never attaches.
+            watch_interval_seconds: Seconds between watcher scans; must be a
+                positive finite number. Ignored when ``watch_directory`` is
+                empty.
+
+        Raises:
+            ValueError: If ``devices`` is empty without hotplug, if
+                ``watch_directory`` is neither empty nor absolute, or if
+                ``watch_interval_seconds`` is not a positive finite number.
         """
         if not devices and not hotplug_enabled:
             raise ValueError("devices may be empty only when hotplug_enabled is true")
+        if watch_directory and not os.path.isabs(watch_directory):
+            raise ValueError("watch_directory must be an absolute path or empty")
+        if not math.isfinite(watch_interval_seconds) or watch_interval_seconds <= 0:
+            raise ValueError("watch_interval_seconds must be a positive finite number")
 
         self.devices = list(devices)
         self.device_path = self.devices[0].device_path if self.devices else ""
@@ -184,6 +261,8 @@ class DaxL2AdapterConfig(L2AdapterConfigBase):
         self.num_store_workers = num_store_workers
         self.num_lookup_workers = num_lookup_workers
         self.num_load_workers = num_load_workers
+        self.watch_directory = watch_directory
+        self.watch_interval_seconds = float(watch_interval_seconds)
 
     @classmethod
     def from_dict(cls, d: dict) -> "DaxL2AdapterConfig":
@@ -196,8 +275,9 @@ class DaxL2AdapterConfig(L2AdapterConfigBase):
             A validated ``DaxL2AdapterConfig`` instance.
 
         Raises:
-            ValueError: If a required field is missing or any numeric field
-                is not positive.
+            ValueError: If a required field is missing, any numeric field
+                is not positive, or ``watch_directory`` is not an absolute
+                path (or empty string).
         """
         slot_bytes = d.get("slot_bytes")
         if not isinstance(slot_bytes, int) or slot_bytes <= 0:
@@ -261,6 +341,14 @@ class DaxL2AdapterConfig(L2AdapterConfigBase):
             d.get("num_load_workers", min(4, os.cpu_count() or 1)),
             "num_load_workers",
         )
+        watch_directory = d.get("watch_directory", "")
+        if not isinstance(watch_directory, str):
+            raise ValueError("watch_directory must be a string")
+        watch_directory = watch_directory.strip()
+        watch_interval_seconds = _parse_positive_float(
+            d.get("watch_interval_seconds", 1.0),
+            "watch_interval_seconds",
+        )
 
         return cls(
             devices=devices,
@@ -269,6 +357,8 @@ class DaxL2AdapterConfig(L2AdapterConfigBase):
             num_store_workers=num_store_workers,
             num_lookup_workers=num_lookup_workers,
             num_load_workers=num_load_workers,
+            watch_directory=watch_directory,
+            watch_interval_seconds=watch_interval_seconds,
         )
 
     @classmethod
@@ -290,7 +380,12 @@ class DaxL2AdapterConfig(L2AdapterConfigBase):
             "- num_store_workers (int): store worker threads (optional, default 1)\n"
             "- num_lookup_workers (int): lookup worker threads (optional, default 1)\n"
             "- num_load_workers (int): load worker threads "
-            "(optional, default min(4, cpu_count))"
+            "(optional, default min(4, cpu_count))\n"
+            "- watch_directory (str): absolute directory to scan for present "
+            "DAX device nodes; reported in /reconfigure/dax/status, never "
+            'auto-attached (optional, default "" = disabled)\n'
+            "- watch_interval_seconds (float): seconds between watcher scans "
+            "(optional, default 1.0, must be > 0)"
         )
 
 
@@ -299,6 +394,11 @@ class DaxL2Adapter(L2AdapterInterface):
 
     def __init__(self, config: DaxL2AdapterConfig) -> None:
         """Initialize the DAX adapter and its stable worker pools.
+
+        Configured devices are probed read-only (``probe_device``) before the
+        device lock is taken and then mapped. When ``config.watch_directory``
+        is set, a ``DaxDeviceWatcher`` thread is started after the worker
+        pools; with an empty directory no thread is created.
 
         Args:
             config: Validated DAX adapter configuration.
@@ -342,12 +442,25 @@ class DaxL2Adapter(L2AdapterInterface):
         self._inflight_lookup_tasks = 0
         self._inflight_load_tasks = 0
 
+        # Presence watcher. Disabled (no thread) when watch_directory is "".
+        self._watcher = DaxDeviceWatcher(
+            config.watch_directory,
+            config.watch_interval_seconds,
+        )
+
         try:
+            # Probe before taking the device lock: probing reads sysfs and
+            # must never run under _device_lock.
+            probed = [
+                (device_config, probe_device(device_config.device_path))
+                for device_config in config.devices
+            ]
             with self._device_lock:
-                for device_config in config.devices:
+                for device_config, physical in probed:
                     self._add_device_entry_locked(
                         device_path=device_config.device_path,
                         size_bytes=device_config.max_dax_size_bytes,
+                        physical=physical,
                     )
             self._store_executor = ThreadPoolExecutor(
                 max_workers=config.num_store_workers,
@@ -365,6 +478,7 @@ class DaxL2Adapter(L2AdapterInterface):
                 max_workers=8,
                 thread_name_prefix="dax-l2-copy",
             )
+            self._watcher.start()
         except Exception:
             self.close()
             raise
@@ -598,7 +712,7 @@ class DaxL2Adapter(L2AdapterInterface):
         )
 
     def close(self) -> None:
-        """Stop worker pools and release DAX resources.
+        """Stop the watcher and worker pools, then release DAX resources.
 
         The call waits for already submitted worker tasks to finish before
         closing mapped DAX cores and event notifiers.
@@ -619,6 +733,8 @@ class DaxL2Adapter(L2AdapterInterface):
             self._lookup_executor = None
             self._load_executor = None
             self._copy_executor = None
+
+        self._watcher.stop()
 
         if store_executor is not None:
             store_executor.shutdown(wait=True)
@@ -655,8 +771,9 @@ class DaxL2Adapter(L2AdapterInterface):
 
         Returns:
             Dictionary containing health, DAX capacity, slot occupancy,
-            lock/borrow counts, in-flight task counts, and restart-recovery
-            capability.
+            lock/borrow counts, in-flight task counts, restart-recovery
+            capability, and ``devices`` as reported by ``hotplug_status``
+            (each device carries its ``physical`` probe block).
         """
         hotplug = self.hotplug_status()
         with self._lock:
@@ -687,8 +804,11 @@ class DaxL2Adapter(L2AdapterInterface):
         """Return runtime status for this DAX adapter.
 
         Returns:
-            JSON-serializable status for the stable adapter facade and every
-            mapped DAX device.
+            JSON-serializable status with ``hotplug_enabled``, ``slot_bytes``,
+            ``total_capacity_bytes``, ``total_used_bytes``, ``devices`` (one
+            entry per mapped device, each carrying a ``physical`` block from
+            the read-only probe) and ``watcher`` (``{"enabled": False}`` or
+            the presence watcher's ``DaxWatcherSnapshot.as_dict()``).
         """
         with self._device_lock:
             devices = [
@@ -711,6 +831,7 @@ class DaxL2Adapter(L2AdapterInterface):
                 "total_capacity_bytes": total_capacity_bytes,
                 "total_used_bytes": total_used_bytes,
                 "devices": devices,
+                "watcher": self._watcher.status(),
             }
 
     def reconfigure_status(self) -> L2ReconfigureStatus:
@@ -790,15 +911,28 @@ class DaxL2Adapter(L2AdapterInterface):
     def hotplug_add_device(self, device_path: str, size_bytes: int) -> dict:
         """Map and activate one additional DAX device.
 
+        Before the device lock is taken the path is probed read-only with
+        ``probe_device``; a positive bad signal (bound to ``kmem``, no driver
+        bound, or a ``device_dax`` size smaller than ``size_bytes``) rejects
+        the add with ``400`` and creates no entry. Inconclusive probes
+        proceed as before. The gate is evaluated before the already-active
+        check, so a same-size re-add of an attached path stays idempotent
+        (``200`` with the existing entry) only while the probe is not a
+        positive bad signal; a re-add whose probe now reports ``kmem`` or an
+        unbound device is rejected too, leaving the existing entry untouched.
+
         Args:
             device_path: Path to an existing readable and writable DAX device.
             size_bytes: Number of bytes to map.
 
         Returns:
-            JSON-serializable operation result.
+            JSON-serializable operation result whose ``device`` block includes
+            the probed ``physical`` state.
 
         Raises:
-            L2ReconfigureError: If hotplug is disabled or the request is invalid.
+            L2ReconfigureError: If hotplug is disabled, the request is
+                invalid, the probe proves the device is not mappable as
+                requested, or mapping fails.
         """
         self._ensure_hotplug_enabled()
         device_path = device_path.strip()
@@ -808,6 +942,11 @@ class DaxL2Adapter(L2AdapterInterface):
             raise L2ReconfigureError(400, "size_bytes must be > 0")
         if size_bytes // self._config.slot_bytes <= 0:
             raise L2ReconfigureError(400, "size_bytes does not fit one slot")
+
+        # Read-only probe outside the device lock; sysfs reads must never run
+        # under it. The gate fails closed only on a positive bad signal.
+        physical = probe_device(device_path)
+        _ensure_physically_mappable(device_path, physical, size_bytes)
 
         with self._device_lock:
             for index, entry in enumerate(self._devices):
@@ -833,6 +972,7 @@ class DaxL2Adapter(L2AdapterInterface):
                 entry = self._add_device_entry_locked(
                     device_path=device_path,
                     size_bytes=size_bytes,
+                    physical=physical,
                 )
             except ValueError as exc:
                 logger.exception("Invalid DAX hotplug add request")
@@ -1278,7 +1418,22 @@ class DaxL2Adapter(L2AdapterInterface):
         *,
         device_path: str,
         size_bytes: int,
+        physical: DaxPhysicalState,
     ) -> DaxDeviceEntry:
+        """Map ``device_path`` and append an active entry; caller holds the lock.
+
+        Args:
+            device_path: Path to map.
+            size_bytes: Mapping size in bytes.
+            physical: Probe result taken by the caller outside the lock.
+
+        Returns:
+            The newly appended entry.
+
+        Raises:
+            RuntimeError: If the device cannot be opened or mapped.
+            ValueError: If the mapping cannot hold at least one slot.
+        """
         core = DaxCore[ObjectKey](
             device_path=device_path,
             max_dax_size_bytes=size_bytes,
@@ -1291,6 +1446,7 @@ class DaxL2Adapter(L2AdapterInterface):
             max_dax_size_bytes=size_bytes,
             slot_bytes=self._config.slot_bytes,
             state="active",
+            physical=physical,
         )
         self._next_device_id += 1
         self._devices.append(entry)
@@ -1305,6 +1461,13 @@ class DaxL2Adapter(L2AdapterInterface):
             inflight_store = self._inflight_store_tasks
             inflight_lookup = self._inflight_lookup_tasks
             inflight_load = self._inflight_load_tasks
+        # Refresh only from the in-memory watcher snapshot: no I/O here,
+        # because this runs under _device_lock. Adopt the scan result only
+        # when it is at least as fresh as what the entry holds, so a scan
+        # that started before the attach-time probe cannot overwrite it.
+        watched = self._watcher.snapshot().find(entry.device_path)
+        if watched is not None and watched.probed_at >= entry.physical.probed_at:
+            entry.physical = watched
         return {
             **status,
             "index": index,
@@ -1317,6 +1480,7 @@ class DaxL2Adapter(L2AdapterInterface):
             "inflight_lookup_tasks": inflight_lookup,
             "inflight_load_tasks": inflight_load,
             "supports_restart_recovery": False,
+            "physical": entry.physical.as_dict(),
         }
 
     def _get_device_for_path_locked(

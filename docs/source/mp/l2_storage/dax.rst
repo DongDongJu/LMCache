@@ -36,6 +36,13 @@ the DAX device, but they are unreachable after the LMCache server restarts.
   threads.
 - ``persist_enabled`` (bool): Accepted by common L2 config parsing but has no
   effect for ``dax`` because restart recovery is not implemented.
+- ``watch_directory`` (str, default ``""``): Absolute directory that the
+  adapter scans for present Device-DAX nodes (for example
+  ``/dev/dax-cxl/<NAMESPACE>_<POD_NAME>``). Empty disables the presence
+  watcher. The watcher only *reports* what it sees; it never attaches a
+  device. See :ref:`the presence watcher section <dax-presence-watcher>`.
+- ``watch_interval_seconds`` (float, default ``1.0``): Seconds between two
+  watcher scans. Must be ``> 0``.
 
 **Configuration examples:**
 
@@ -104,6 +111,107 @@ future adapters such as P2P.
     curl -X POST http://127.0.0.1:9000/reconfigure/dax/add \
       -H 'Content-Type: application/json' \
       -d '{"device_path": "/dev/daxX.X", "size": "100GiB"}'
+
+.. _dax-presence-watcher:
+
+**Presence watcher and physical inspection:**
+
+Every mapped device carries a ``physical`` block in
+``/reconfigure/dax/status`` and in ``/status`` (under
+``l2_adapters[].devices[]``). It is the result of a *read-only* probe taken
+when the device was attached: ``stat`` on the path plus plain reads under
+``/sys/dev/char/<major>:<minor>`` (``subsystem``, ``driver``, ``size``,
+``align``). The probe never ``open()``\ s the candidate device, because
+opening an unbound dax node forks ``modprobe`` on the host and can stall.
+
+``physical.mode`` is one of:
+
+- ``devdax``: bound to ``device_dax``; usable by LMCache.
+- ``system-ram``: bound to ``kmem``; the range is System RAM and is never
+  mapped.
+- ``unbound``: a dax device with no driver bound (for example a freshly
+  created, size-0 device).
+- ``not-a-device``: a regular file (test arenas) or a non-dax character
+  device such as ``/dev/null``.
+- ``absent``: the path does not exist.
+- ``unknown``: sysfs could not be read; ``detail`` says why.
+
+When ``watch_directory`` is set, the adapter also runs a daemon thread that
+scans that directory every ``watch_interval_seconds`` and publishes the
+result as ``watcher`` in ``/reconfigure/dax/status``. While the watcher is
+enabled, the ``physical`` block of every attached device whose path lies
+directly under ``watch_directory`` (spelled exactly as
+``<watch_directory>/<name>``) is refreshed from the latest scan, so a
+device that becomes unbound after mapping is visible in status; devices
+attached under other paths keep their attach-time probe. A scan is adopted
+only when it is at least as fresh as the probe already held, so a scan
+that started before an attach never overwrites the attach-time probe. With
+the watcher disabled, ``watcher`` is ``{"enabled": false}``.
+
+.. code-block:: json
+
+    {
+      "hotplug_enabled": true,
+      "slot_bytes": 268435456,
+      "total_capacity_bytes": 274877906944,
+      "total_used_bytes": 0,
+      "devices": [
+        {
+          "index": 0,
+          "device_path": "/dev/dax-cxl/ns_pod/dax0.1",
+          "state": "active",
+          "max_dax_size_bytes": 274877906944,
+          "physical": {
+            "device_path": "/dev/dax-cxl/ns_pod/dax0.1",
+            "mode": "devdax",
+            "present": true,
+            "major": 249,
+            "minor": 2,
+            "kernel_name": "dax2.1",
+            "driver": "device_dax",
+            "size_bytes": 274877906944,
+            "align_bytes": 2097152,
+            "probed_at": 1756800000.0,
+            "detail": ""
+          }
+        }
+      ],
+      "watcher": {
+        "enabled": true,
+        "directory": "/dev/dax-cxl/ns_pod",
+        "interval_seconds": 1.0,
+        "last_scan_at": 1756800001.0,
+        "present_devices": [
+          {"device_path": "/dev/dax-cxl/ns_pod/dax0.1", "mode": "devdax", "present": true, "major": 249, "minor": 2, "kernel_name": "dax2.1", "driver": "device_dax", "size_bytes": 274877906944, "align_bytes": 2097152, "probed_at": 1756800001.0, "detail": ""},
+          {"device_path": "/dev/dax-cxl/ns_pod/dax0.2", "mode": "unbound", "present": true, "major": 249, "minor": 0, "kernel_name": "dax2.0", "driver": "", "size_bytes": 0, "align_bytes": 2097152, "probed_at": 1756800001.0, "detail": ""}
+        ]
+      }
+    }
+
+The MP server never attaches a present device on its own. Presence proves
+that a node is usable, not that this server owns it: the same ``major:minor``
+can be exposed under any number of directories, and a device that the
+outside allocator has already handed to another node still looks identical
+in ``/dev``. Only a caller that can prove allocator assignment should
+consume ``watcher.present_devices`` and issue ``/reconfigure/dax/add``.
+
+**Add gate:** ``POST /reconfigure/dax/add`` probes the path before mapping
+and rejects the request with ``400`` (creating no entry) only on a positive
+bad signal:
+
+- ``physical.mode == "system-ram"``: ``DAX device is bound to kmem (system-ram)``
+- ``physical.mode == "unbound"``: ``DAX device has no device_dax driver bound``
+- ``physical.mode == "devdax"`` with a known sysfs ``size`` smaller than the
+  requested size: ``DAX device size <size> < requested <size>`` (the kernel
+  would accept the ``mmap`` and raise ``SIGBUS`` on first touch).
+
+Inconclusive probes (``not-a-device``, ``absent``, ``unknown``) proceed
+exactly as before, so regular-file test arenas keep working and a missing
+path still fails in ``mmap``. The gate runs before the already-active
+check: a same-size re-add of an attached path stays idempotent (``200``
+with the existing entry) as long as the probe is not a positive bad signal,
+but a re-add of a path that has since been bound to ``kmem`` or unbound is
+rejected too, and the existing entry is left untouched.
 
 **Current limits:**
 
