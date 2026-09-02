@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The control loop: observe, propose, and drive one move at a time.
+"""The control loop: observe, propose, and drive one saga at a time.
 
-Each cycle performs a sandwich read. With no active move it reads each
+Each cycle performs a sandwich read. With no active saga it reads each
 relevant MP server's DAX status once, discovers newly owned devices from
 outside status (see :mod:`lmcache.v1.mp_memory_coordinator.discovery`),
 attaches present devices the outside service assigns to that worker (see
 :mod:`lmcache.v1.mp_memory_coordinator.attachment`), reconciles the
-inventory, updates the pressure history, ranks candidates, preflights the
-best pair, and logs a structured dry-run proposal; with
-``actuation_enabled`` and leadership it persists a ``SELECTED`` record. With
-an active move it gathers :class:`Evidence`, asks :func:`decide` for the one
-next action, executes at most one side effect, and persists the result --
-the persist-before-effect discipline of the design doc.
+inventory, updates the pressure history, ranks candidates, preflights
+receivers for a donor-less GROW first and donor/receiver pairs for a MOVE
+only when no receiver can grow, and logs a structured dry-run proposal;
+with ``actuation_enabled`` and leadership it persists a ``SELECTED``
+record. With an active saga it gathers :class:`Evidence`, asks
+:func:`decide` for the one next action, executes at most one side effect,
+and persists the result -- the persist-before-effect discipline of the
+design doc.
 
 I/O is abstracted behind :class:`Remote` so the controller is tested with
 injected fakes; :class:`HttpRemote` binds it to the real clients.
@@ -61,6 +63,7 @@ from lmcache.v1.mp_memory_coordinator.leader import LeaderElector
 from lmcache.v1.mp_memory_coordinator.models import (
     DAX_ACTIVE_STATE,
     GIB,
+    NO_DONOR,
     AllocationOrigin,
     AllocationRequest,
     AllocationResponse,
@@ -71,11 +74,13 @@ from lmcache.v1.mp_memory_coordinator.models import (
     DaxRemoveMode,
     DeallocationRequest,
     DeallocationResponse,
+    EffectFailure,
     EffectName,
     EffectRecord,
     InstanceIdentity,
     JournalDocument,
     ManagedAllocation,
+    MoveKind,
     MoveOutcome,
     MoveRecord,
     MoveState,
@@ -86,12 +91,16 @@ from lmcache.v1.mp_memory_coordinator.persistence.rebalance_journal import (
     RebalanceJournal,
 )
 from lmcache.v1.mp_memory_coordinator.policy import (
+    Candidates,
+    GrowProposal,
     LivePreflight,
     MembershipSnapshot,
     MoveProposal,
     PressureHistory,
+    Proposal,
     Rejection,
     RejectionReason,
+    evaluate_grow,
     evaluate_pair,
     fetch_preflight,
     rank_candidates,
@@ -247,7 +256,8 @@ class CycleReport:
         coordinator_reachable: Whether the sandwich read succeeded.
         accepted: Accepted instance ids.
         rejections: Structured rejections.
-        proposal: The dry-run proposal, if any.
+        proposal: The dry-run proposal, if any; its ``kind`` is ``"grow"``
+            (receiver, size) or ``"move"`` (donor, receiver, device).
         move_id: Active move id (``""`` if none).
         move_state: Active move state (``""`` if none).
         decision: Decision type and reason for an active move.
@@ -325,6 +335,45 @@ def new_move_record(proposal: MoveProposal, now: float) -> MoveRecord:
         allocation_request_id=f"{move_id}-allocate",
         release_request_id=f"{move_id}-release",
         restore_request_id=f"{move_id}-restore",
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def new_grow_record(proposal: GrowProposal, now: float) -> MoveRecord:
+    """Build a ``SELECTED`` GROW record from a proposal.
+
+    The record has no donor: ``donor`` is :data:`NO_DONOR` and every
+    donor-side field is empty, while ``old_map_size_bytes`` carries the map
+    size to add on the receiver (``request_size_gib * GIB``) so the receiver
+    add and the inventory entry read it unchanged. Request ids are
+    deterministic per saga and audit-only.
+
+    Args:
+        proposal: The checked GROW proposal.
+        now: Wall-clock time.
+
+    Returns:
+        The new record.
+    """
+    move_id = f"grow-{int(now)}-{uuid.uuid4().hex[:8]}"
+    return MoveRecord(
+        move_id=move_id,
+        state=MoveState.SELECTED,
+        kind=MoveKind.GROW,
+        donor=NO_DONOR,
+        receiver=proposal.receiver.identity,
+        donor_capacity_bytes=0,
+        receiver_capacity_bytes=proposal.receiver.capacity_bytes,
+        old_path="",
+        old_device_index=-1,
+        old_map_size_bytes=proposal.request_size_gib * GIB,
+        old_slot_capacity_bytes=0,
+        allocation_size_gib=proposal.request_size_gib,
+        deallocation_request_id="",
+        allocation_request_id=f"{move_id}-allocate",
+        release_request_id=f"{move_id}-release",
+        restore_request_id="",
         created_at=now,
         updated_at=now,
     )
@@ -420,7 +469,8 @@ class RebalanceController:
         """Return ``(ready, reason)`` for ``/readyz``.
 
         Ready means: journal loaded, current leader, MP Coordinator reached
-        on the last cycle, inventory reconciled, and no BLOCKED move.
+        on the last cycle, that cycle did not fail, inventory reconciled,
+        and no BLOCKED move.
         """
         if self._journal_error:
             return False, f"journal: {self._journal_error}"
@@ -428,6 +478,8 @@ class RebalanceController:
             return False, "journal not loaded"
         if not self._leader.is_leader():
             return False, "not leader"
+        if self._last_report.error:
+            return False, f"last cycle failed: {self._last_report.error}"
         if not self._last_report.coordinator_reachable:
             return False, "MP Coordinator unreachable"
         if not self._reconciled:
@@ -441,9 +493,11 @@ class RebalanceController:
         """Return a JSON-serializable status for ``/status``.
 
         ``counters`` carries the persisted journal counters plus
-        ``attached``, the in-memory count of :attr:`attached_devices`.
+        ``attached``, the in-memory count of :attr:`attached_devices`;
+        ``grow_backoffs`` lists only backoffs that are still active.
         """
         move = self._document.active_move
+        now = self._clock()
         return {
             "leader": self._leader.is_leader(),
             "leader_identity": self._leader.identity,
@@ -452,6 +506,11 @@ class RebalanceController:
             "initialized": self._document.initialized,
             "inventory": [a.model_dump(mode="json") for a in self._document.inventory],
             "cooldowns": dict(self._document.cooldowns),
+            "grow_backoffs": {
+                ip: until
+                for ip, until in self._document.grow_backoffs.items()
+                if until > now
+            },
             "history": self._history.snapshot(),
             "active_move": move.model_dump(mode="json") if move is not None else None,
             "counters": {
@@ -523,6 +582,11 @@ class RebalanceController:
     async def run_once(self) -> CycleReport:
         """Run one cycle and return its report.
 
+        Any failure of the cycle body is recorded in ``report.error`` (and
+        logged with its traceback) and the report still replaces the last
+        one, so readiness never reflects a stale successful cycle while the
+        loop keeps failing.
+
         Returns:
             The report (also logged as one JSON line).
         """
@@ -536,6 +600,9 @@ class RebalanceController:
                 except JournalError as exc:
                     self._journal_error = str(exc)
                     report.error = f"journal write failed: {exc}"
+                except Exception as exc:  # noqa: BLE001 -- reported, never hidden
+                    logger.exception("control cycle failed")
+                    report.error = f"cycle failed: {exc}"
             self._last_report = report
             logger.info("memcoord cycle %s", json.dumps(report.as_dict(), default=str))
             return report
@@ -593,8 +660,16 @@ class RebalanceController:
             # never converge. Re-observe before proposing anything.
             report.decision = "attach issued; re-observing next cycle"
             return
+        now = self._clock()
+        # Expired grow backoffs leave the document here, in the idle cycle
+        # that could propose again; /status filters them out at any time.
+        self._document.grow_backoffs = {
+            ip: until
+            for ip, until in self._document.grow_backoffs.items()
+            if until > now
+        }
         candidates = rank_candidates(
-            snapshot, self._history, self._document.cooldowns, self._clock()
+            snapshot, self._history, self._document.cooldowns, now
         )
         report.rejections.extend(r.as_dict() for r in candidates.rejections)
         proposal, rejections = await self._evaluate(candidates)
@@ -621,12 +696,19 @@ class RebalanceController:
             )
             self._save()
             return
-        record = new_move_record(proposal, self._clock())
+        record = (
+            new_grow_record(proposal, self._clock())
+            if isinstance(proposal, GrowProposal)
+            else new_move_record(proposal, self._clock())
+        )
         self._document.active_move = record
         self._save()
         report.move_id = record.move_id
         logger.info(
-            "move %s SELECTED: %s", record.move_id, json.dumps(proposal.as_dict())
+            "%s %s SELECTED: %s",
+            record.kind.value,
+            record.move_id,
+            json.dumps(proposal.as_dict()),
         )
         decision = await self._advance(record, snapshot, True)
         report.decision = _describe(decision)
@@ -634,9 +716,24 @@ class RebalanceController:
         report.move_state = move.state.value if move is not None else "COMPLETE"
 
     async def _evaluate(
-        self, candidates
-    ) -> tuple[MoveProposal | None, list[Rejection]]:
-        """Preflight ranked pairs; return the first proposal or the rejections."""
+        self, candidates: Candidates
+    ) -> tuple[Proposal | None, list[Rejection]]:
+        """Preflight candidates; return the first proposal or the rejections.
+
+        Grow before move: every stable-HIGH receiver, best first, is first
+        evaluated for a donor-less GROW; the first eligible one is proposed.
+        Only when no receiver can grow (each is in grow backoff or fails a
+        receiver-only check) are donor/receiver pairs evaluated for a MOVE.
+        Each instance's live preflight is read at most once per cycle.
+
+        Args:
+            candidates: The ranked, cooldown-free candidates of this cycle.
+
+        Returns:
+            ``(proposal, rejections)``; the proposal is ``None`` when nothing
+            is eligible, and the rejections explain every skipped candidate
+            (each distinct rejection once, even when both passes hit it).
+        """
         rejections: list[Rejection] = []
         preflights: dict[str, LivePreflight | None] = {}
 
@@ -646,6 +743,29 @@ class RebalanceController:
                     identity
                 )
             return preflights[identity.instance_id]
+
+        now = self._clock()
+        for receiver in candidates.receivers:
+            receiver_pf = await _get(receiver.identity)
+            if receiver_pf is None:
+                rejections.append(
+                    Rejection(
+                        receiver.identity.instance_id,
+                        RejectionReason.PREFLIGHT_UNAVAILABLE,
+                    )
+                )
+                continue
+            grow = evaluate_grow(
+                receiver,
+                receiver_pf,
+                self._document.inventory,
+                self._document.grow_backoffs,
+                self._config,
+                now,
+            )
+            if isinstance(grow, GrowProposal):
+                return grow, _unique_rejections(rejections)
+            rejections.extend(grow)
 
         for donor in candidates.donors:
             donor_pf = await _get(donor.identity)
@@ -678,9 +798,9 @@ class RebalanceController:
                     self._config,
                 )
                 if isinstance(result, MoveProposal):
-                    return result, rejections
+                    return result, _unique_rejections(rejections)
                 rejections.extend(result)
-        return None, rejections
+        return None, _unique_rejections(rejections)
 
     async def _collect_dax_statuses(
         self, snapshot: MembershipSnapshot
@@ -937,23 +1057,49 @@ class RebalanceController:
     async def _evidence(
         self, record: MoveRecord, snapshot: MembershipSnapshot, leader: bool
     ) -> Evidence:
-        """Collect the read-only evidence :func:`decide` needs."""
+        """Collect the read-only evidence :func:`decide` needs.
+
+        A GROW has no donor: its donor identity is reported as intact, no
+        donor status is read, and its donor capacity is ``None``.
+        """
         donor_sample = snapshot.samples.get(record.donor.instance_id)
         receiver_sample = snapshot.samples.get(record.receiver.instance_id)
+        on_worker = [
+            s.identity
+            for s in snapshot.samples.values()
+            if s.identity.worker_ip == record.receiver.worker_ip
+        ]
+        replacement = (
+            on_worker[0]
+            if len(on_worker) == 1 and on_worker[0] != record.receiver
+            else None
+        )
         return Evidence(
             now=self._clock(),
             leader=leader,
             coordinator_reachable=snapshot.coordinator_reachable,
-            donor_identity_ok=snapshot.still_matches(record.donor),
+            donor_identity_ok=(
+                not record.has_donor or snapshot.still_matches(record.donor)
+            ),
             receiver_identity_ok=snapshot.still_matches(record.receiver),
-            donor_dax=await self._remote.dax_status(record.donor),
+            donor_dax=(
+                await self._remote.dax_status(record.donor)
+                if record.has_donor
+                else None
+            ),
             receiver_dax=await self._remote.dax_status(record.receiver),
             outside=await self._remote.outside_status(),
             donor_capacity_bytes=(
-                donor_sample.capacity_bytes if donor_sample is not None else None
+                donor_sample.capacity_bytes
+                if record.has_donor and donor_sample is not None
+                else None
             ),
             receiver_capacity_bytes=(
                 receiver_sample.capacity_bytes if receiver_sample is not None else None
+            ),
+            receiver_replacement=replacement,
+            receiver_worker_registered=(
+                record.receiver.worker_ip in snapshot.registered_worker_ips
             ),
         )
 
@@ -984,8 +1130,15 @@ class RebalanceController:
             if ledger is not None:
                 ledger.confirmed = True
                 ledger.confirmed_at = self._clock()
+        if decision.unconfirm_effect is not None:
+            ledger = record.effects.get(decision.unconfirm_effect.value)
+            if ledger is not None:
+                ledger.confirmed = False
+                ledger.confirmed_at = 0.0
         for name, value in decision.fields.items():
             setattr(record, name, value)
+        if decision.receiver is not None:
+            record.receiver = decision.receiver
         record.updated_at = self._clock()
         logger.info(
             "move %s -> %s/%s: %s",
@@ -1006,18 +1159,31 @@ class RebalanceController:
         self._save()
 
     def _finish(self, record: MoveRecord, decision: Finish) -> None:
-        """Enter COMPLETE, update inventory and cooldowns, archive."""
+        """Enter COMPLETE, update inventory, cooldowns and backoffs, archive.
+
+        One save covers everything: a ``SUCCEEDED`` MOVE swaps the old path
+        for the new one in the inventory and a ``SUCCEEDED`` GROW only adds
+        the new one; ``NOT_SERVED`` (GROW) changes no inventory and writes no
+        cooldown, only the receiver worker's grow backoff (see
+        :func:`_grow_backoff_seconds`); every other outcome cools the
+        participants (the receiver alone for a GROW).
+        """
         now = self._clock()
         record.state = MoveState.COMPLETE
         record.outcome = decision.outcome
         record.updated_at = now
         record.last_error = decision.note
+        if decision.warning:
+            logger.warning("move %s: %s", record.move_id, decision.warning)
         deallocated = record.effect(EffectName.DEALLOCATE)
         old_gone = deallocated is not None and deallocated.confirmed
         if decision.outcome is MoveOutcome.SUCCEEDED:
-            self._document.inventory = [
-                a for a in self._document.inventory if a.device_path != record.old_path
-            ]
+            if record.has_donor:
+                self._document.inventory = [
+                    a
+                    for a in self._document.inventory
+                    if a.device_path != record.old_path
+                ]
             self._document.inventory.append(
                 ManagedAllocation(
                     worker_ip=record.receiver.worker_ip,
@@ -1033,6 +1199,13 @@ class RebalanceController:
                 )
             )
             self._document.counters.succeeded += 1
+            if not record.has_donor:
+                self._document.counters.grown += 1
+        elif decision.outcome is MoveOutcome.NOT_SERVED:
+            self._document.counters.not_served += 1
+            self._document.grow_backoffs[record.receiver.worker_ip] = (
+                now + _grow_backoff_seconds(self._config)
+            )
         else:
             if old_gone:
                 self._document.inventory = [
@@ -1056,9 +1229,11 @@ class RebalanceController:
                     )
                 )
             self._document.counters.rolled_back += 1
-        until = now + self._config.cooldown_seconds
-        self._document.cooldowns[record.donor.key] = until
-        self._document.cooldowns[record.receiver.key] = until
+        if decision.outcome is not MoveOutcome.NOT_SERVED:
+            until = now + self._config.cooldown_seconds
+            if record.has_donor:
+                self._document.cooldowns[record.donor.key] = until
+            self._document.cooldowns[record.receiver.key] = until
         self._document.history.append(record)
         del self._document.history[:-_HISTORY_LIMIT]
         self._document.active_move = None
@@ -1071,7 +1246,12 @@ class RebalanceController:
         self._save()
 
     async def _perform(self, record: MoveRecord, effect: DoEffect) -> None:
-        """Persist intent, re-check the gate, issue one POST, persist result."""
+        """Persist intent, re-check the gate, issue one POST, persist result.
+
+        An existing ledger entry (an intent that was never dispatched) is
+        reused as is -- same request id, same ``before_paths`` -- so a
+        re-issued POST is still the single POST of that effect.
+        """
         now = self._clock()
         ledger = record.effects.get(effect.effect.value)
         if ledger is None:
@@ -1094,7 +1274,9 @@ class RebalanceController:
         record.updated_at = now
         self._save()  # intent durable before any POST
 
-        # Immediately before the POST: leadership and identity again.
+        # Before the POST: renew, prove the participant identities are still
+        # current, then renew once more so a slow sandwich cannot leave us
+        # dispatching under an expired or lost Lease.
         if not await self._leader.ensure_leader():
             record.last_error = f"{effect.effect.value}: lost leadership before POST"
             self._save()
@@ -1111,12 +1293,25 @@ class RebalanceController:
                 and effect.deallocation.target_node == record.receiver.worker_ip
             )
         )
-        if not fresh.coordinator_reachable or not fresh.still_matches(record.donor):
+        if not fresh.coordinator_reachable:
+            record.last_error = (
+                f"{effect.effect.value}: MP Coordinator unreachable before POST"
+            )
+            self._save()
+            return
+        if record.has_donor and not fresh.still_matches(record.donor):
             record.last_error = f"{effect.effect.value}: donor identity check failed"
             self._save()
             return
         if needs_receiver and not fresh.still_matches(record.receiver):
             record.last_error = f"{effect.effect.value}: receiver identity check failed"
+            self._save()
+            return
+        if not await self._leader.ensure_leader():
+            record.last_error = (
+                f"{effect.effect.value}: lost leadership after identity check "
+                "before POST"
+            )
             self._save()
             return
 
@@ -1128,10 +1323,18 @@ class RebalanceController:
     async def _perform_outside(
         self, record: MoveRecord, effect: DoEffect, ledger: EffectRecord
     ) -> None:
-        """Issue one outside POST; record response, failure, or ambiguity."""
+        """Issue one outside POST; record response, failure, or ambiguity.
+
+        A connect failure delivered nothing: ``dispatched`` is reset so the
+        same ledger (request id, ``before_paths``) is re-issued by a later
+        cycle, up to ``get_retry_attempts`` attempts, after which the saga
+        blocks. Any other outcome leaves ``dispatched`` set and is never
+        followed by another POST for that ledger.
+        """
         ledger.attempts += 1
         ledger.dispatched = True
         ledger.error = ""
+        ledger.failure = EffectFailure.NONE
         self._save()  # dispatched durable before the POST
         try:
             if effect.deallocation is not None:
@@ -1146,9 +1349,11 @@ class RebalanceController:
                     record.restored_path = allocation.device_path
         except OutsideExplicitFailure as exc:
             ledger.error = f"explicit failure {exc.status_code}"
+            ledger.failure = EffectFailure.EXPLICIT
             record.last_error = str(exc)
         except OutsideContractError as exc:
             ledger.error = f"contract violation: {exc}"
+            ledger.failure = EffectFailure.CONTRACT
             record.last_error = str(exc)
             if effect.effect is EffectName.ALLOCATE and "device_path" in exc.fields:
                 record.new_path = str(exc.fields["device_path"])
@@ -1217,6 +1422,39 @@ class RebalanceController:
             self._journal.save(self._document)
         except OSError as exc:
             raise JournalError(f"cannot write journal: {exc}") from exc
+
+
+def _grow_backoff_seconds(config: MPMemoryCoordinatorConfig) -> float:
+    """Duration of the grow backoff written by a ``NOT_SERVED`` finish.
+
+    ``cooldown_seconds``, but never less than two idle polls: the backoff
+    must still be active in the idle cycle that follows the finish (one
+    ``poll_interval_seconds`` of sleep plus that cycle's own reads), or that
+    cycle would propose the same refused GROW again instead of running the
+    donor search, forever.
+
+    Args:
+        config: For ``cooldown_seconds`` and ``poll_interval_seconds``.
+
+    Returns:
+        Seconds from the finish until the worker may be proposed a GROW.
+    """
+    return max(config.cooldown_seconds, 2 * config.poll_interval_seconds)
+
+
+def _unique_rejections(rejections: list[Rejection]) -> list[Rejection]:
+    """Return ``rejections`` without repeats, first occurrence order kept.
+
+    The GROW pass and the MOVE pass can reject the same receiver for the
+    same reason (once per donor in the MOVE pass); the report lists it once.
+    """
+    seen: set[Rejection] = set()
+    unique: list[Rejection] = []
+    for rejection in rejections:
+        if rejection not in seen:
+            seen.add(rejection)
+            unique.append(rejection)
+    return unique
 
 
 def _documented(dump: dict[str, object]) -> dict[str, str | int | float | bool]:

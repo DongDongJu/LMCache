@@ -85,7 +85,10 @@ def test_probes_status_journal_and_metrics(tmp_path: Path) -> None:
         assert metrics.status_code == 200
         assert "lmcache_memcoord_moves_proposed_total" in metrics.text
         assert "lmcache_memcoord_devices_attached_total 0.0" in metrics.text
+        assert "lmcache_memcoord_grows_succeeded_total 0.0" in metrics.text
+        assert "lmcache_memcoord_grows_not_served_total 0.0" in metrics.text
         assert "lmcache_memcoord_leader 1.0" in metrics.text
+        assert status["grow_backoffs"] == {}
 
         assert client.get("/docs").status_code == 404
         assert client.get("/").status_code == 404

@@ -9,17 +9,21 @@ accepted only when its ``registration_time``, ``ip``, ``http_port`` and
 has declared capacity, and carries a non-null private ``l2/dax`` ratio.
 Everything else is a typed :class:`Rejection` that the dry-run log reports.
 
-Policy: pressure history, candidate ranking, live preflight rules, and
-donor device selection. Everything after the I/O helpers is pure: it takes
-samples, live status documents, the managed inventory and cooldowns, and
-returns either a :class:`MoveProposal` or typed rejections. Selection is
-deterministic: receivers rank by descending ratio then ``instance_id``,
-donors by ascending ratio then ``instance_id``; the first pair that passes
-every check is proposed.
+Policy: pressure history, candidate ranking, live preflight rules, GROW
+size derivation, and donor device selection. Everything after the I/O
+helpers is pure: it takes samples, live status documents, the managed
+inventory, cooldowns and grow backoffs, and returns either a proposal or
+typed rejections. Selection is deterministic: receivers rank by descending
+ratio then ``instance_id``, donors by ascending ratio then ``instance_id``.
+The controller first asks :func:`evaluate_grow` for each receiver, best
+first (grow before move); only when no receiver can grow does it run
+:func:`evaluate_pair` over donor/receiver pairs, and the first pair that
+passes every check is proposed.
 """
 
 # Standard
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -34,6 +38,7 @@ from lmcache.v1.mp_memory_coordinator.config import MPMemoryCoordinatorConfig
 from lmcache.v1.mp_memory_coordinator.models import (
     DAX_ACTIVE_STATE,
     DAX_BACKEND,
+    GIB,
     CoordinatorInstance,
     DaxDeviceStatus,
     DaxHotplugStatus,
@@ -42,6 +47,7 @@ from lmcache.v1.mp_memory_coordinator.models import (
     InstanceSample,
     InstanceUsage,
     ManagedAllocation,
+    MoveKind,
     MPStatus,
 )
 
@@ -71,6 +77,8 @@ class RejectionReason(str, Enum):
     MIN_DEVICES = "min_devices_per_instance"
     PROJECTED_DONOR_RATIO = "projected_donor_ratio"
     INSUFFICIENT_GAP = "insufficient_ratio_gap"
+    GROW_BACKOFF = "grow_backoff"
+    GROW_SIZE_UNDETERMINABLE = "grow_size_undeterminable"
     ACTUATION_DISABLED = "actuation_disabled"
     NOT_LEADER = "not_leader"
 
@@ -108,12 +116,17 @@ class MembershipSnapshot:
         samples: Accepted samples keyed by ``instance_id``.
         rejections: Every instance that was seen but not accepted.
         sampled_at: Wall-clock time of the read.
+        registered_worker_ips: ``worker_ip`` of every instance seen in
+            either ``/instances`` read, accepted or rejected (instances
+            without a ``worker_ip`` cannot be attributed and are absent).
+            Raw membership: "is anything registered on that worker?"
     """
 
     coordinator_reachable: bool
     samples: dict[str, InstanceSample] = field(default_factory=dict)
     rejections: list[Rejection] = field(default_factory=list)
     sampled_at: float = 0.0
+    registered_worker_ips: frozenset[str] = frozenset()
 
     def identity_of(self, instance_id: str) -> InstanceIdentity | None:
         """Return the accepted identity of ``instance_id``, if any."""
@@ -258,6 +271,9 @@ def join_sandwich(
         samples=samples,
         rejections=rejections,
         sampled_at=sampled_at,
+        registered_worker_ips=frozenset(
+            instance.worker_ip for instance in (*first, *second) if instance.worker_ip
+        ),
     )
 
 
@@ -635,8 +651,9 @@ class MoveProposal:
     projected_donor_ratio: float
 
     def as_dict(self) -> dict[str, str | int | float]:
-        """Return a JSON-friendly form for the dry-run log."""
+        """Return a JSON-friendly form for the dry-run log (``kind: move``)."""
         return {
+            "kind": MoveKind.MOVE.value,
             "donor": self.donor.identity.instance_id,
             "donor_worker_ip": self.donor.identity.worker_ip,
             "receiver": self.receiver.identity.instance_id,
@@ -747,4 +764,174 @@ def evaluate_pair(
         donor_live_capacity_bytes=donor_dax.total_capacity_bytes,
         receiver_live_capacity_bytes=receiver_dax.total_capacity_bytes,
         projected_donor_ratio=projected,
+    )
+
+
+# -- GROW: receiver-only proposal ----------------------------------------------------
+
+
+class GrowSizeSource(str, Enum):
+    """Where a GROW request size came from (logged with the proposal)."""
+
+    RECEIVER_INVENTORY = "receiver_inventory"
+    FLEET_INVENTORY = "fleet_inventory"
+    BOOTSTRAP_DEVICE = "bootstrap_device"
+
+
+@dataclass(frozen=True)
+class GrowSize:
+    """The derived GROW request size.
+
+    Attributes:
+        size_gib: Whole GiB to request from the outside service.
+        source: Which derivation tier produced it.
+    """
+
+    size_gib: int
+    source: GrowSizeSource
+
+
+def _most_common_size(allocations: list[ManagedAllocation]) -> int:
+    """Return the most common consistent allocation size (ties: largest, 0 if none)."""
+    sizes = Counter(
+        a.allocation_size_gib for a in allocations if a.is_size_consistent()
+    )
+    if not sizes:
+        return 0
+    return max(sizes, key=lambda size: (sizes[size], size))
+
+
+def derive_grow_size(
+    receiver: InstanceIdentity,
+    dax: DaxHotplugStatus,
+    inventory: list[ManagedAllocation],
+) -> GrowSize | Rejection:
+    """Derive the size a GROW should request for ``receiver``.
+
+    The frozen outside API exposes neither device sizes nor free capacity
+    and serves exact-size matches only, so the size is taken from what the
+    allocator has demonstrably served before, in order: (a) the most common
+    size among size-consistent managed allocations on the receiver's worker,
+    (b) the most common size across the whole managed inventory, (c) the
+    receiver's live index-0 (bootstrap) device map size rounded down to whole
+    GiB. Ties prefer the larger size. No configuration key is involved.
+
+    Args:
+        receiver: The receiver identity (its ``worker_ip`` and id).
+        dax: The receiver's live hotplug status.
+        inventory: The full managed inventory.
+
+    Returns:
+        The size and its source, or a ``GROW_SIZE_UNDETERMINABLE`` rejection
+        when no tier yields a positive whole GiB.
+    """
+    local = _most_common_size(
+        [a for a in inventory if a.worker_ip == receiver.worker_ip]
+    )
+    if local > 0:
+        return GrowSize(local, GrowSizeSource.RECEIVER_INVENTORY)
+    fleet = _most_common_size(inventory)
+    if fleet > 0:
+        return GrowSize(fleet, GrowSizeSource.FLEET_INVENTORY)
+    bootstrap = [d for d in dax.live_devices() if d.index == 0]
+    if bootstrap and bootstrap[0].max_dax_size_bytes // GIB > 0:
+        return GrowSize(
+            bootstrap[0].max_dax_size_bytes // GIB, GrowSizeSource.BOOTSTRAP_DEVICE
+        )
+    return Rejection(
+        receiver.instance_id,
+        RejectionReason.GROW_SIZE_UNDETERMINABLE,
+        "no managed allocation size and no whole-GiB bootstrap device",
+    )
+
+
+@dataclass(frozen=True)
+class GrowProposal:
+    """A fully checked GROW the controller may start: allocate, then add.
+
+    Attributes:
+        receiver: The receiver sample.
+        request_size_gib: Outside allocation size to request.
+        size_source: Which tier derived ``request_size_gib``.
+        receiver_live_capacity_bytes: Receiver DAX ``total_capacity_bytes``.
+        receiver_live_ratio: Receiver live ``used/capacity``.
+    """
+
+    receiver: InstanceSample
+    request_size_gib: int
+    size_source: GrowSizeSource
+    receiver_live_capacity_bytes: int
+    receiver_live_ratio: float
+
+    def as_dict(self) -> dict[str, str | int | float]:
+        """Return a JSON-friendly form for the dry-run log (``kind: grow``)."""
+        return {
+            "kind": MoveKind.GROW.value,
+            "receiver": self.receiver.identity.instance_id,
+            "receiver_worker_ip": self.receiver.identity.worker_ip,
+            "request_size_gib": self.request_size_gib,
+            "size_source": self.size_source.value,
+            "receiver_live_capacity_bytes": self.receiver_live_capacity_bytes,
+            "receiver_live_ratio": round(self.receiver_live_ratio, 4),
+        }
+
+
+Proposal = MoveProposal | GrowProposal
+"""What one cycle may start: a donor-less GROW or a donor/receiver MOVE."""
+
+
+def evaluate_grow(
+    receiver: InstanceSample,
+    receiver_preflight: LivePreflight,
+    inventory: list[ManagedAllocation],
+    grow_backoffs: Mapping[str, float],
+    config: MPMemoryCoordinatorConfig,
+    now: float,
+) -> GrowProposal | list[Rejection]:
+    """Apply every receiver-only check for a GROW to one stable-HIGH sample.
+
+    In order: no active grow backoff for the receiver's worker, a clean live
+    preflight, a live ratio that still classifies HIGH, and a derivable
+    request size. No donor, gap, or projection rule applies: a GROW touches
+    nothing but the receiver and the outside pool.
+
+    Args:
+        receiver: Stable-HIGH sample (already cooldown-free).
+        receiver_preflight: Receiver's live documents.
+        inventory: The managed inventory (size derivation).
+        grow_backoffs: ``worker_ip`` -> time until which GROW is not proposed.
+        config: Thresholds and the adapter index.
+        now: Current wall-clock time.
+
+    Returns:
+        A proposal, or the rejections that stopped it (never empty).
+    """
+    instance_id = receiver.identity.instance_id
+    until = grow_backoffs.get(receiver.identity.worker_ip, 0.0)
+    if until > now:
+        return [
+            Rejection(instance_id, RejectionReason.GROW_BACKOFF, f"until={until:.0f}")
+        ]
+    problems = preflight_problems(receiver_preflight, config)
+    if problems:
+        return [
+            Rejection(
+                instance_id, RejectionReason.PREFLIGHT_FAILED, "; ".join(problems)
+            )
+        ]
+    receiver_dax = receiver_preflight.dax.adapters[0].status
+    live = live_ratio(receiver_dax)
+    if live is None or classify(live, config) is not PressureLevel.HIGH:
+        return [
+            Rejection(instance_id, RejectionReason.LIVE_RATIO_MISMATCH, f"live={live}")
+        ]
+    size = derive_grow_size(receiver.identity, receiver_dax, inventory)
+    if isinstance(size, Rejection):
+        return [size]
+    return GrowProposal(
+        receiver=receiver,
+        request_size_gib=size.size_gib,
+        size_source=size.source,
+        receiver_live_capacity_bytes=receiver_dax.total_capacity_bytes,
+        receiver_live_ratio=live,
     )

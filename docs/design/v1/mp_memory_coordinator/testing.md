@@ -81,8 +81,10 @@ Contract reminders that implementations most often get wrong:
 - Allocation must pick an already-free device **on `target_node`** whose
   size equals `request_size_gib` exactly, never another node or size.
 - A repeated `request_id` must not be silently replayed; the coordinator
-  never retries a POST, so idempotency is not required, but replay would
-  hide a double effect.
+  never re-issues a POST that may have reached the service (only one whose
+  connection failed, with the same `request_id`, so the service sees each
+  id at most once), so idempotency is not required, but replay would hide a
+  double effect.
 - `mode`, `purpose`, `access` are the literals `devdax`, `lmcache-dax`,
   `exclusive`.
 
@@ -200,8 +202,6 @@ curl -s localhost:9400/readyz; curl -s localhost:9400/status | jq '{inventory, l
 With both instances LOW/NORMAL you will see `history_not_stable` and then
 no proposal; that is the expected idle state.
 
----
-
 ### 3.1 Watching attach orchestration
 
 If the MP servers run the DAX presence watcher (add `"watch_directory":
@@ -263,13 +263,19 @@ lmcache query coordinator --url $COORD_URL --api usage
 curl -s localhost:9400/status | jq '{history, proposal: .last_cycle.proposal, rejections: .last_cycle.rejections}'
 ```
 
-After three consecutive accepted samples with receiver `>= 0.75` and donor
-`<= 0.40`, `/status.last_cycle.proposal` names `mp-donor -> mp-receiver`,
-`device_path .../dax0.1`, `allocation_size_gib 64`, and the rejection list
-contains only `actuation_disabled`. Confirm the outside targets are the
-**worker IPs** (`donor_worker_ip`, `receiver_worker_ip`), not Pod/MP
-addresses. Zero mutating calls have been made: check your service's logs
-and both `/reconfigure/dax/status` outputs are unchanged.
+After three consecutive accepted samples with receiver `>= 0.75`,
+`/status.last_cycle.proposal` is the receiver's **grow** proposal --
+`kind: "grow"`, `receiver: mp-receiver`, `receiver_worker_ip: W2_IP`,
+`request_size_gib: 64` (derived from the managed inventory, else the
+receiver's bootstrap device; `size_source` says which) -- and the rejection
+list contains only `actuation_disabled`. The coordinator grows before it
+moves: a dry run never probes the pool, so the donor move (`kind: "move"`,
+`mp-donor -> mp-receiver`, `device_path .../dax0.1`, `allocation_size_gib
+64`) is proposed only after a real, explicit refusal of the grow. Confirm
+the outside target is the **worker IP** (`receiver_worker_ip`, and
+`donor_worker_ip` for a move), not a Pod/MP address. Zero mutating calls
+have been made: check your service's logs and both `/reconfigure/dax/status`
+outputs are unchanged.
 
 ---
 
@@ -281,14 +287,41 @@ kill %1; lmcache mp-memory-coordinator --config memcoord.yaml &        # journal
 watch -n2 'curl -s localhost:9400/journal | jq "{state: .active_move.state, effects: (.active_move.effects // {} | keys), last: (.history[-1] // {} | {state, outcome})}"'
 ```
 
-The effect ledger must appear in exactly this order and end in
-`COMPLETE / SUCCEEDED`:
+The first saga is the **grow**: `/journal.active_move.kind == "grow"` with
+the ledger
+
+```
+allocate -> receiver_add
+```
+
+and exactly one POST in your service's request log:
+
+```json
+{"request_id": "<grow>-allocate", "target_node": "192.168.0.41", "request_size_gib": 64,
+ "mode": "devdax", "purpose": "lmcache-dax", "access": "exclusive"}
+```
+
+If your pool can serve it (a free `W2`-local 64 GiB device), it ends in
+`COMPLETE / SUCCEEDED`: the returned path is added on `W2`, the donor is
+untouched, the inventory gains the path with `origin: allocated`, and the
+total assigned runtime GiB grows by 64. Verify with the same commands as
+below, expecting the donor's `dax0.1` still `active` and both `W1` paths
+still listed.
+
+If your pool refuses it (a non-2xx answer with no new path under `W2`), the
+grow ends in `COMPLETE / NOT_SERVED` with zero side effects and no cooldown,
+`/journal.grow_backoffs[W2_IP]` is set for at least `cooldown_seconds`
+(never less than two `poll_interval_seconds`), and the very
+next cycle proposes the **move**, whose effect ledger must appear in exactly
+this order and end in `COMPLETE / SUCCEEDED`:
 
 ```
 donor_drain -> donor_evict -> deallocate -> allocate -> receiver_add
 ```
 
-Verify each contract point:
+To exercise the move deliberately, make the pool refuse the grow (for the
+strict mock allocator: reset it with `{"pool_budget_gib": <assigned total>}`
+or install an `insufficient_capacity` fault). Verify each contract point:
 
 ```bash
 J=$(curl -s localhost:9400/journal)
@@ -388,10 +421,45 @@ lmcache mp-memory-coordinator --config memcoord.yaml --adopt adopt.yaml
 | `live_ratio_mismatch` | coordinator usage says HIGH/LOW but `/reconfigure/dax/status` totals disagree |
 | `no_managed_runtime_device` | nothing managed on the donor, or only the bootstrap device is active; `/status.last_cycle.discovery.skipped` names the reason per live device |
 | `projected_donor_ratio` | removing the device would push the donor above 0.70 |
-| `cooldown` | a move completed within `cooldown_seconds` |
+| `cooldown` | a saga completed within `cooldown_seconds` (blocks grow and move alike) |
+| `grow_backoff` | the allocator explicitly refused a grow for this worker within the grow backoff (`cooldown_seconds`, at least two `poll_interval_seconds`); a move is still evaluated |
+| `grow_size_undeterminable` | no managed allocation size and no whole-GiB bootstrap device to derive the grow size from; no POST is made |
 | `actuation_disabled` | dry run; the proposal is logged only |
+
+## Outcome reference
+
+| `/journal.history[].outcome` | Meaning |
+|---|---|
+| `SUCCEEDED` | the saga completed; a move swapped the donor path for the receiver path in the inventory, a grow added the receiver path |
+| `ROLLED_BACK` | the saga undid what it could; a move restored the donor, a grow released the receiver path |
+| `NOT_SERVED` | grow only: the allocator explicitly refused and provably assigned nothing; no cooldown, only a grow backoff for the worker |
+| `BLOCKED` (state) | terminal; operator reconciliation required (`block_reason`) |
+
+`/status` shows `grow_backoffs` (active ones only; `/journal` keeps an
+expired entry until the next idle cycle prunes it) beside `cooldowns`,
+`active_move.kind`, and
+the counters `not_served` and `grown` (metrics
+`lmcache_memcoord_grows_not_served_total`,
+`lmcache_memcoord_grows_succeeded_total`). The strict mock allocator's
+`POST /__test/pool_budget` (or the `pool_budget_gib` reset body) models an
+exhausted pool for the fake-based E2E.
 
 Journal `BLOCKED` reasons are always terminal and never retried: drain
 deadline (no undrain API), an outside POST whose outcome could not be
-proven, a returned path that is not the unique new receiver-local path, or
-an outside status that contradicts a DONE response.
+proven, a returned path that is not the unique new receiver-local path, an
+outside status that contradicts a DONE response, or a grow whose receiver
+vanished after the allocation and did not come back: the saga blocks after
+`drain_timeout_seconds` when the path is attached (or its attachment is
+unknown), and after a second `drain_timeout_seconds` when it was provably
+unattached but no instance returned on that worker to release it through
+(the release is never POSTed without a matching, readable receiver). A
+receiver that keeps re-registering on its worker is rebound at most three
+times per grow (`receiver_rebinds` in the record), then the grow blocks
+with `receiver re-registered ... more than 3 times`. After the add is
+confirmed but the usage view has not converged within
+`capacity_convergence_timeout_seconds`, an allocator that no longer lists
+the path under the receiver blocks the grow at once, and one that stays
+unreadable for a further `drain_timeout_seconds` blocks it with
+`allocator unreadable ...`: in both cases the path is still active on the
+receiver and the allocation is to be re-verified by hand before the state
+directory is cleared.

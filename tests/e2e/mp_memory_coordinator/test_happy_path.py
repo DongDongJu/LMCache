@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Happy-path E2E: one exact move through the real coordinator.
+"""Happy-path E2E: one exact grow, and one exact move, through the real
+coordinator.
 
 Every assertion from PLAN.md section 8 "Required happy-path assertions" is
 made from the two services' endpoint-local audits, their admin state, and
 the coordinator's durable journal -- correlated by request id, device path,
 and confirmed phase, never by cross-process wall clocks.
+
+Grow before move: with the harness's default pool budget (the initially
+assigned 64 GiB) the coordinator's first saga is a GROW the allocator
+refuses (``NOT_SERVED``, no mutation), and the move follows unchanged; with
+a raised budget the GROW is served and no donor is touched.
 """
 
 # Third Party
@@ -17,6 +23,7 @@ from .conftest import (
     DONOR_RUNTIME,
     DONOR_SPARE,
     GIB,
+    GROW_KIND,
     RECEIVER_IP,
     RECEIVER_RUNTIME,
     RECEIVER_SPARE,
@@ -51,9 +58,22 @@ def test_happy_path_moves_exactly_one_device(harness: Harness) -> None:
     move = harness.memcoord.client.wait_terminal(timeout=120)
     assert move["state"] == "COMPLETE", move
     assert move["outcome"] == "SUCCEEDED", move
+    assert move["kind"] == "move"
+    # 0. Grow before move: the exhausted pool refused the receiver's GROW
+    #    first (one refused POST, nothing mutated, no cooldown), so the
+    #    move is the second archived saga.
+    probe = harness.grow_probe()
+    journal = harness.memcoord.client.journal()
+    assert [(m["kind"], m["outcome"]) for m in journal["history"]] == [
+        ("grow", "NOT_SERVED"),
+        ("move", "SUCCEEDED"),
+    ]
+    assert move["created_at"] - probe["updated_at"] < 10.0  # no cooldown between
+    assert set(journal["grow_backoffs"]) == {RECEIVER_IP}
 
     scenario_audit = harness.scenario.audit()
     allocator_audit = harness.allocator.audit()
+    move_ids = {r["body"]["request_id"] for r in harness.move_allocator_posts()}
 
     # 1. Two eligible samples cause zero mutation; the third permits one move.
     assert _usage_reads_before_first_post(scenario_audit) >= 3
@@ -76,7 +96,7 @@ def test_happy_path_moves_exactly_one_device(harness: Harness) -> None:
         ("mp-donor", "/reconfigure/dax/remove", "evict"),
         ("mp-receiver", "/reconfigure/dax/add", None),
     ]
-    assert [r["operation"] for r in harness.allocator_posts()] == [
+    assert [r["operation"] for r in harness.move_allocator_posts()] == [
         "deallocate",
         "allocate",
     ]
@@ -100,7 +120,7 @@ def test_happy_path_moves_exactly_one_device(harness: Harness) -> None:
     assert [d["state"] for d in tombstones] == ["removed"]
 
     # 4. Exact frozen bodies, no extra fields; 5. every echo and size validated.
-    posts = harness.allocator_posts()
+    posts = harness.move_allocator_posts()
     deallocation, allocation = posts[0]["body"], posts[1]["body"]
     assert deallocation == {
         "request_id": move["deallocation_request_id"],
@@ -120,7 +140,9 @@ def test_happy_path_moves_exactly_one_device(harness: Harness) -> None:
     responses = [
         r
         for r in allocator_audit
-        if r["kind"] == "response" and r["operation"] != "status"
+        if r["kind"] == "response"
+        and r["operation"] != "status"
+        and r["request_id"] in move_ids
     ]
     assert responses[0]["body"]["request_id"] == move["deallocation_request_id"]
     assert responses[1]["body"]["request_id"] == move["allocation_request_id"]
@@ -190,13 +212,16 @@ def test_happy_path_moves_exactly_one_device(harness: Harness) -> None:
     # 10. Cooldown prevents a second move.
     harness.memcoord.client.wait_cycles(4, timeout=30)
     assert harness.memcoord.client.active_move() is None
-    assert len(harness.allocator_posts()) == 2
+    assert len(harness.move_allocator_posts()) == 2
+    assert len(harness.allocator_posts()) == 3  # plus the refused GROW probe
     rejections = harness.memcoord.client.status()["last_cycle"]["rejections"]
     assert any(r["reason"] == "cooldown" for r in rejections), rejections
 
     # 11. Exactly one deallocation, one allocation, one successful add.
     assert len(harness.scenario_posts()) == 3
-    assert harness.memcoord.client.status()["counters"]["succeeded"] == 1
+    counters = harness.memcoord.client.status()["counters"]
+    assert counters["succeeded"] == 1 and counters["not_served"] == 1
+    assert counters["grown"] == 0
 
     # 12. Conservation and immutable bindings/sizes.
     for node_ip, node in nodes.items():
@@ -221,9 +246,15 @@ def test_dry_run_proposes_but_never_mutates(harness: Harness) -> None:
     harness.memcoord.start(actuation_enabled=False)
     harness.memcoord.client.wait_cycles(6, timeout=60)
     status = harness.memcoord.client.status()
-    assert status["last_cycle"]["proposal"] is not None
-    assert status["last_cycle"]["proposal"]["donor"] == "mp-donor"
-    assert status["last_cycle"]["proposal"]["receiver"] == "mp-receiver"
+    proposal = status["last_cycle"]["proposal"]
+    assert proposal is not None
+    # Grow before move: a dry run proposes the receiver's GROW (nothing is
+    # probed, so the move alternative is never reached).
+    assert proposal["kind"] == "grow"
+    assert proposal["receiver"] == "mp-receiver"
+    assert proposal["receiver_worker_ip"] == RECEIVER_IP
+    assert proposal["request_size_gib"] == 64
+    assert "donor" not in proposal
     assert any(
         r["reason"] == "actuation_disabled" for r in status["last_cycle"]["rejections"]
     )
@@ -248,8 +279,10 @@ def test_discovery_moves_a_device_without_any_allowlist(harness: Harness) -> Non
     assert move["state"] == "COMPLETE", move
     assert move["outcome"] == "SUCCEEDED", move
 
-    # Exactly the one device the outside service confirmed, and nothing else.
-    assert [r["operation"] for r in harness.allocator_posts()] == [
+    # Exactly the one device the outside service confirmed, and nothing else
+    # (after the refused GROW probe of the exhausted pool).
+    harness.grow_probe()
+    assert [r["operation"] for r in harness.move_allocator_posts()] == [
         "deallocate",
         "allocate",
     ]
@@ -273,12 +306,17 @@ def test_discovery_declines_a_path_outside_status_does_not_confirm(
     )
     assert response.status_code < 300, response.text
     assert harness.outside_status() == {DONOR_IP: [], RECEIVER_IP: []}
+    # The deallocation freed pool room; keep the pool exhausted so the
+    # receiver's GROW probe is refused and only discovery is under test.
+    harness.set_pool_budget(0)
     setup_posts = len(harness.allocator_posts())
 
     harness.memcoord.start()
-    harness.memcoord.client.wait_cycles(6, timeout=60)
+    harness.memcoord.client.wait_cycles(8, timeout=60)
     assert harness.scenario_posts() == []
-    assert len(harness.allocator_posts()) == setup_posts
+    # The only further allocator POST is the refused GROW probe.
+    harness.grow_probe()
+    assert len(harness.move_allocator_posts()) == setup_posts
     status = harness.memcoord.client.status()
     assert status["inventory"] == []
     skipped = status["last_cycle"]["discovery"]["skipped"]
@@ -293,6 +331,7 @@ def test_present_assigned_device_is_attached_then_adopted(harness: Harness) -> N
     The coordinator must issue exactly one ``/reconfigure/dax/add`` for it
     (no outside POST), and discovery must adopt it on a later cycle.
     """
+    harness.set_pool_budget(128)  # the setup assignment below needs room
     response = requests.post(
         f"{harness.endpoints.allocator_public_url}/api/v2/apps/lmcache/allocations",
         json={
@@ -408,3 +447,111 @@ def test_explicit_adoption_command_populates_inventory(harness: Harness) -> None
     assert [a["device_path"] for a in journal["inventory"]] == [DONOR_RUNTIME]
     move = harness.memcoord.client.wait_terminal(timeout=120)
     assert move["outcome"] == "SUCCEEDED"
+
+
+def test_grow_adds_memory_without_a_donor(harness: Harness) -> None:
+    """Grow before move: a pool with room serves the receiver directly.
+
+    With the budget raised the coordinator's first saga is a GROW: one
+    allocation POST for the receiver's own worker and one receiver add; no
+    donor device is drained, removed, or deallocated.
+    """
+    harness.reset(pool_budget_gib=128)
+    initial = harness.allocator.state()
+    assert initial["global"]["assigned_runtime_gib"] == 64
+    assert harness.outside_status() == {DONOR_IP: [DONOR_RUNTIME], RECEIVER_IP: []}
+    harness.memcoord.seed_inventory()
+    harness.memcoord.start()
+    move = harness.memcoord.client.wait_terminal(timeout=120, kind=GROW_KIND)
+    assert move["kind"] == "grow"
+    assert move["state"] == "COMPLETE" and move["outcome"] == "SUCCEEDED", move
+    assert move["move_id"].startswith("grow-")
+
+    # Exactly one outside POST (the allocation) and one MP POST (the add).
+    posts = harness.allocator_posts()
+    assert [r["operation"] for r in posts] == ["allocate"]
+    assert posts[0]["body"] == {
+        "request_id": move["allocation_request_id"],
+        "target_node": RECEIVER_IP,
+        "request_size_gib": 64,
+        "mode": "devdax",
+        "purpose": "lmcache-dax",
+        "access": "exclusive",
+    }
+    responses = [
+        r
+        for r in harness.allocator.audit()
+        if r["kind"] == "response" and r["operation"] == "allocate"
+    ]
+    assert responses[0]["body"]["device_path"] == RECEIVER_RUNTIME
+    assert responses[0]["body"]["granted_size_gib"] == 64
+    mp_posts = harness.scenario_posts()
+    assert [(r["service"], r["path"]) for r in mp_posts] == [
+        ("mp-receiver", "/reconfigure/dax/add")
+    ]
+    assert mp_posts[0]["body"] == {
+        "adapter_index": 0,
+        "device_path": RECEIVER_RUNTIME,
+        "size": "64GiB",
+    }
+    assert list(move["effects"]) == ["allocate", "receiver_add"]
+    assert all(e["confirmed"] for e in move["effects"].values())
+    assert move["new_path"] == RECEIVER_RUNTIME
+    assert move["granted_size_gib"] == 64
+    assert move["donor"]["instance_id"] == "" and move["old_path"] == ""
+
+    # The donor is untouched; the pool grew by one device.
+    instances = {i["instance_id"]: i for i in harness.scenario.state()["instances"]}
+    donor_devices = {
+        d["device_path"]: d["state"] for d in instances["mp-donor"]["devices"]
+    }
+    assert donor_devices[DONOR_RUNTIME] == "active"
+    assert instances["mp-donor"]["capacity_bytes"] == 128 * GIB
+    assert instances["mp-receiver"]["capacity_bytes"] == 128 * GIB
+    receiver_devices = {
+        d["device_path"]: d["state"] for d in instances["mp-receiver"]["devices"]
+    }
+    assert receiver_devices[RECEIVER_RUNTIME] == "active"
+    final = harness.allocator.state()
+    assert final["global"]["assigned_runtime_gib"] == 128
+    assert harness.outside_status() == {
+        DONOR_IP: [DONOR_RUNTIME],
+        RECEIVER_IP: [RECEIVER_RUNTIME],
+    }
+    mutations = [r for r in harness.allocator.audit() if r["kind"] == "mutation"]
+    assert [(m["operation"], m["device_path"]) for m in mutations] == [
+        ("allocate", RECEIVER_RUNTIME)
+    ]
+    for node_ip, node in final["nodes"].items():
+        assert (
+            node["free_runtime_gib"] + node["assigned_runtime_gib"]
+            == node["fixed_runtime_inventory_gib"]
+        ), node_ip
+
+    # Inventory gained the receiver path; the donor entry stays.
+    journal = harness.memcoord.client.journal()
+    inventory = {a["device_path"]: a for a in journal["inventory"]}
+    assert set(inventory) == {DONOR_RUNTIME, RECEIVER_RUNTIME}
+    grown = inventory[RECEIVER_RUNTIME]
+    assert grown["origin"] == "allocated"
+    assert grown["worker_ip"] == RECEIVER_IP
+    assert grown["instance_id"] == "mp-receiver"
+    assert grown["allocation_size_gib"] == 64
+    assert grown["device_map_size_bytes"] == 64 * GIB
+    assert inventory[DONOR_RUNTIME]["origin"] == "adopted"
+    # Cooldown on the receiver only; no backoff.
+    assert len(journal["cooldowns"]) == 1
+    assert journal["grow_backoffs"] == {}
+    assert journal["history"][-1]["kind"] == "grow"
+    counters = harness.memcoord.client.status()["counters"]
+    assert counters["succeeded"] == 1 and counters["grown"] == 1
+    assert counters["proposed"] == 1 and counters["not_served"] == 0
+
+    # Cooldown prevents a second saga; nothing else is posted.
+    harness.memcoord.client.wait_cycles(4, timeout=30)
+    assert harness.memcoord.client.active_move() is None
+    assert len(harness.allocator_posts()) == 1
+    assert len(harness.scenario_posts()) == 1
+    rejections = harness.memcoord.client.status()["last_cycle"]["rejections"]
+    assert any(r["reason"] == "cooldown" for r in rejections), rejections
+    assert harness.memcoord.client.readyz().status_code == 200

@@ -50,7 +50,11 @@ class MPMemoryCoordinatorConfig:
         cooldown_seconds: Seconds after a completed move during which
             neither participant may be selected again. Also the minimum
             interval before a failed attach of the same device path is
-            retried (see :mod:`lmcache.v1.mp_memory_coordinator.attachment`).
+            retried (see :mod:`lmcache.v1.mp_memory_coordinator.attachment`),
+            and the per-worker backoff during which no GROW is proposed
+            after the allocator explicitly refused one (a MOVE may still be);
+            that backoff lasts at least two ``poll_interval_seconds`` so the
+            idle cycle after the refusal always reaches the donor search.
         adapter_index: Backend-local DAX adapter index. Only ``0`` is
             supported (one adapter per MP instance).
         min_devices_per_instance: Active DAX devices a donor must keep
@@ -58,7 +62,11 @@ class MPMemoryCoordinatorConfig:
         allowed_device_path_prefix: Required prefix of every device path
             the coordinator manages or accepts from the outside service.
         drain_timeout_seconds: Seconds a donor drain may take before the
-            move enters BLOCKED (there is no undrain API).
+            move enters BLOCKED (there is no undrain API). Also the grace a
+            GROW waits for a vanished receiver to re-register after its
+            allocation before releasing the path or blocking, and the
+            further grace it gives an unreadable allocator past
+            ``capacity_convergence_timeout_seconds`` before blocking.
         state_directory: Absolute directory holding the journal.
         actuation_enabled: When ``False`` no new move is started; recovery of
             an already durable move still runs.
@@ -66,14 +74,24 @@ class MPMemoryCoordinatorConfig:
         http_port: Bind port of the health/readiness HTTP server.
         request_timeout_seconds: Per-request HTTP timeout for every remote.
         get_retry_attempts: Bounded attempts for GET requests and status
-            polls. POST requests are never retried.
+            polls, and for an outside POST whose connection was never
+            established (it provably delivered nothing and is re-issued
+            with the same request id). A POST that may have reached the
+            service is never retried.
         dax_poll_interval_seconds: Seconds between DAX status polls while a
             drain or capacity convergence is awaited.
         dax_add_max_attempts: Attempts for a receiver ``add`` before the
             attach is considered persistently failed.
         capacity_convergence_timeout_seconds: Seconds to wait for the MP
-            Coordinator usage view to reflect the moved capacity before the
-            move is logged as delayed (it keeps waiting; nothing is retried).
+            Coordinator usage view to reflect the moved capacity. A MOVE
+            keeps waiting; a GROW whose new path is active on the receiver
+            and listed by the allocator finishes ``SUCCEEDED`` with a
+            warning once this elapses (nothing is retried). The bound needs
+            the allocator to list the path under the receiver: a readable
+            allocator that does not blocks the GROW (the proven allocation
+            is contradicted), and one that stays unreadable for a further
+            ``drain_timeout_seconds`` blocks it too (the allocation cannot
+            be re-verified). A MOVE keeps waiting unconditionally.
         leader_election: See :class:`LeaderElectionMode`.
         lease_name: Name of the pre-created Lease.
         lease_namespace: Namespace of the Lease. Empty means the value of

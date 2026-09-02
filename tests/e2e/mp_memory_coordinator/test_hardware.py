@@ -262,9 +262,15 @@ def test_happy_move_on_real_dax(gate: dict) -> None:
     ]
     (run_dir / "dry-run").mkdir(exist_ok=True)
     (run_dir / "dry-run" / "proposal.json").write_text(json.dumps(proposal, indent=2))
-    assert proposal["donor_worker_ip"] == gate["topology"]["donor"]["target_node"]
+    # Grow before move: a pool with room proposes a GROW for the receiver,
+    # an exhausted one the donor move.
     assert proposal["receiver_worker_ip"] == gate["topology"]["receiver"]["target_node"]
-    assert proposal["allocation_size_gib"] == gate["move_size_gib"]
+    if proposal["kind"] == "grow":
+        assert proposal["request_size_gib"] == gate["move_size_gib"]
+    else:
+        assert proposal["kind"] == "move"
+        assert proposal["donor_worker_ip"] == gate["topology"]["donor"]["target_node"]
+        assert proposal["allocation_size_gib"] == gate["move_size_gib"]
     before_outside = requests.get(
         f"{gate['outside_url']}/api/v2/apps/lmcache", timeout=10
     ).json()
@@ -327,8 +333,10 @@ def test_happy_move_on_real_dax(gate: dict) -> None:
     def _terminal() -> bool:
         journal = requests.get(f"{memcoord_url}/journal", timeout=10).json()
         move = journal.get("active_move")
-        return (move is not None and move["state"] == "BLOCKED") or bool(
-            journal["history"]
+        # A refused GROW (NOT_SERVED) is followed by the move; wait for a
+        # saga that actually changed something or blocked.
+        return (move is not None and move["state"] == "BLOCKED") or any(
+            m["outcome"] != "NOT_SERVED" for m in journal["history"]
         )
 
     wait_until(_terminal, timeout=1800, interval=5, what="terminal move")
@@ -354,6 +362,26 @@ def test_happy_move_on_real_dax(gate: dict) -> None:
             f"move BLOCKED; journal and device state preserved: {move['block_reason']}"
         )
     assert move["outcome"] == "SUCCEEDED", move
+    donor_ip = gate["topology"]["donor"]["target_node"]
+    receiver_ip = gate["topology"]["receiver"]["target_node"]
+    after_outside = requests.get(
+        f"{gate['outside_url']}/api/v2/apps/lmcache", timeout=10
+    ).json()
+    if move.get("kind", "move") == "grow":
+        # The pool had room: the receiver grew and no donor device moved.
+        assert list(move["effects"]) == ["allocate", "receiver_add"]
+        assert move["new_path"] in after_outside.get(receiver_ip, [])
+        assert set(before_outside.get(donor_ip, [])) <= set(
+            after_outside.get(donor_ip, [])
+        )
+        assert move["granted_size_gib"] == gate["move_size_gib"]
+        assert move["new_path"] in _active_paths(
+            _mp_dax_status(gate["topology"]["receiver"]["mp_http_endpoint"])
+        )
+        final = run_dir / "final"
+        final.mkdir(exist_ok=True)
+        (final / "outside-status.json").write_text(json.dumps(after_outside, indent=2))
+        return
     assert list(move["effects"]) == [
         "donor_drain",
         "donor_evict",
@@ -361,11 +389,6 @@ def test_happy_move_on_real_dax(gate: dict) -> None:
         "allocate",
         "receiver_add",
     ]
-    donor_ip = gate["topology"]["donor"]["target_node"]
-    receiver_ip = gate["topology"]["receiver"]["target_node"]
-    after_outside = requests.get(
-        f"{gate['outside_url']}/api/v2/apps/lmcache", timeout=10
-    ).json()
     assert move["old_path"] not in after_outside.get(donor_ip, [])
     assert move["new_path"] in after_outside.get(receiver_ip, [])
     assert move["new_path"] != move["old_path"]

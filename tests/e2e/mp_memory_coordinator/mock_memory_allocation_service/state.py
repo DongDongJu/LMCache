@@ -11,6 +11,13 @@ One ``asyncio.Lock`` guards every mutation and every audit append.  After each
 mutation the state re-checks the conservation invariant (per node and globally,
 ``free + assigned == fixed runtime inventory``) and raises if it is violated:
 that is a self-check of the mock, surfaced as a 500 on the public port.
+
+An optional **pool budget** (``pool_budget_gib``, admin-settable, unlimited by
+default) models a shared pool's admission: an allocation that would push the
+global assigned runtime GiB above the budget is refused with 409 and no
+mutation, even when the node has a matching free device.  A deallocation frees
+budget.  The E2E harness sets it to the fixture's initially assigned total so
+the coordinator's grow-before-move probe is refused until a donor frees room.
 """
 
 # Standard
@@ -282,6 +289,8 @@ class MockAllocatorState:
         self._fixture_path = fixture_path
         self._state_file = state_file
         self._lock = asyncio.Lock()
+        # ``None`` means unlimited: only per-node device availability decides.
+        self._pool_budget_gib: int | None = None
         self._nodes: dict[str, Node] = {}
         self._fixed_runtime_gib: dict[str, int] = {}
         self._seen_request_ids: list[str] = []
@@ -302,6 +311,35 @@ class MockAllocatorState:
         """Return the sequence number of the last appended audit record."""
         async with self._lock:
             return self._next_seq - 1
+
+    async def set_pool_budget(self, pool_budget_gib: int | None) -> None:
+        """Set the global pool budget.
+
+        Args:
+            pool_budget_gib: Maximum global assigned runtime GiB an allocation
+                may reach, or ``None`` for unlimited.  Existing assignments
+                are never revoked; a budget below the assigned total only
+                refuses further allocations.
+
+        Raises:
+            ValueError: If the budget is negative.
+        """
+        if pool_budget_gib is not None and pool_budget_gib < 0:
+            raise ValueError("pool_budget_gib must be >= 0 or null")
+        async with self._lock:
+            self._pool_budget_gib = pool_budget_gib
+
+    async def pool_admits(self, request_size_gib: int) -> bool:
+        """Whether the pool budget admits an allocation of ``request_size_gib``."""
+        async with self._lock:
+            return self._admits(request_size_gib)
+
+    def _admits(self, request_size_gib: int) -> bool:
+        """Budget check. Caller holds the lock."""
+        if self._pool_budget_gib is None:
+            return True
+        assigned = self._global_runtime_gib(DeviceState.ASSIGNED)
+        return assigned + request_size_gib <= self._pool_budget_gib
 
     async def status_view(self) -> dict[str, list[str]]:
         """Return the public status body.
@@ -383,6 +421,8 @@ class MockAllocatorState:
         Selection is the lexicographically first free runtime device on
         ``target_node`` whose recorded size equals ``request_size_gib``.  The
         request ID is recorded before any other check; see :meth:`deallocate`.
+        The pool budget (see :meth:`set_pool_budget`) is checked before any
+        device is selected.
 
         Args:
             request_id: Caller-chosen request identifier.
@@ -393,13 +433,22 @@ class MockAllocatorState:
             The selected device's pre-existing path and sizes.
 
         Raises:
-            MockServiceError: 409 for a repeated request ID or when no free
-                runtime device of that size exists on the node; 404 for an
-                unknown node.
+            MockServiceError: 409 for a repeated request ID, when the pool
+                budget does not admit the request, or when no free runtime
+                device of that size exists on the node; 404 for an unknown
+                node.
         """
         async with self._lock:
             self._record_request_id(request_id)
             node = self._node_or_raise(target_node)
+            if not self._admits(request_size_gib):
+                raise MockServiceError(
+                    409,
+                    f"insufficient capacity: pool budget "
+                    f"{self._pool_budget_gib} GiB exhausted "
+                    f"({self._global_runtime_gib(DeviceState.ASSIGNED)} GiB "
+                    f"assigned, {request_size_gib} GiB requested)",
+                )
             for device in node.devices.values():
                 if (
                     device.role is DeviceRole.RUNTIME
@@ -492,17 +541,25 @@ class MockAllocatorState:
                 record.to_dict() for record in self._audit if record.seq > after_seq
             ]
 
-    async def reset(self) -> None:
+    async def reset(self, pool_budget_gib: int | None = None) -> None:
         """Reload the fixture, clear the request-ID ledger and audit, and persist.
 
+        Args:
+            pool_budget_gib: The pool budget to apply after the reload, or
+                ``None`` for unlimited (the default).
+
         Raises:
-            ValueError: If the fixture fails validation.
+            ValueError: If the fixture fails validation or the budget is
+                negative.
             OSError: If the fixture or state file cannot be accessed.
         """
+        if pool_budget_gib is not None and pool_budget_gib < 0:
+            raise ValueError("pool_budget_gib must be >= 0 or null")
         async with self._lock:
             self._load_document(load_inventory_document(self._fixture_path))
             self._audit.clear()
             self._next_seq = 1
+            self._pool_budget_gib = pool_budget_gib
             self._persist()
 
     async def snapshot(self) -> dict[str, object]:
@@ -513,7 +570,7 @@ class MockAllocatorState:
             state}], "free_runtime_gib", "assigned_runtime_gib",
             "fixed_runtime_inventory_gib"}}, "global": {"free_runtime_gib",
             "assigned_runtime_gib", "fixed_runtime_inventory_gib"},
-            "seen_request_ids": [...]}``.
+            "pool_budget_gib": <int or null>, "seen_request_ids": [...]}``.
         """
         async with self._lock:
             nodes: dict[str, object] = {}
@@ -544,6 +601,7 @@ class MockAllocatorState:
                         self._fixed_runtime_gib.values()
                     ),
                 },
+                "pool_budget_gib": self._pool_budget_gib,
                 "seen_request_ids": list(self._seen_request_ids),
             }
 

@@ -32,6 +32,9 @@ from lmcache.v1.mp_memory_coordinator.models import (
 )
 from lmcache.v1.mp_memory_coordinator.policy import (
     DeviceChoice,
+    GrowProposal,
+    GrowSize,
+    GrowSizeSource,
     LivePreflight,
     MembershipSnapshot,
     MoveProposal,
@@ -41,6 +44,8 @@ from lmcache.v1.mp_memory_coordinator.policy import (
     RejectionReason,
     choose_donor_device,
     classify,
+    derive_grow_size,
+    evaluate_grow,
     evaluate_pair,
     join_sandwich,
     preflight_problems,
@@ -172,6 +177,7 @@ def test_join_accepts_golden_fleet() -> None:
     assert donor.capacity_bytes == 128 * GIB
     assert snapshot.rejections == []
     assert snapshot.still_matches(donor.identity)
+    assert snapshot.registered_worker_ips == frozenset({DONOR_IP, RECEIVER_IP})
 
 
 @pytest.mark.parametrize(
@@ -198,6 +204,32 @@ def test_join_rejects_instance_missing_from_second_read() -> None:
     snapshot = join_sandwich(_instances(), _usage(), _instances()[1:], 0.0)
     assert set(snapshot.samples) == {"mp-receiver"}
     assert snapshot.rejections[0].reason is RejectionReason.NOT_IN_BOTH_READS
+
+
+def test_join_records_raw_membership_by_worker() -> None:
+    """``registered_worker_ips`` covers every instance seen in either read,
+    accepted or rejected; only an instance without a ``worker_ip`` is
+    unattributable and absent."""
+    first = _instances()
+    second = _instances()
+    first[0].metadata.clear()  # donor: no worker_ip in the first read
+    second[0].metadata.clear()  # ... nor in the second: missing_worker_ip
+    del second[1]  # receiver seen in the first read only
+    extra = first[1].model_copy(
+        update={"instance_id": "mp-extra", "metadata": {"worker_ip": "192.0.2.77"}}
+    )
+    second.append(extra)  # seen in the second read only
+    snapshot = join_sandwich(first, _usage(), second, 0.0)
+    assert snapshot.samples == {}
+    assert {r.reason for r in snapshot.rejections} == {
+        RejectionReason.MISSING_WORKER_IP,
+        RejectionReason.NOT_IN_BOTH_READS,
+    }
+    assert snapshot.registered_worker_ips == frozenset({RECEIVER_IP, "192.0.2.77"})
+    # An unreachable coordinator registers nothing.
+    assert MembershipSnapshot(coordinator_reachable=False).registered_worker_ips == (
+        frozenset()
+    )
 
 
 def test_join_rejects_missing_and_duplicate_worker_ip() -> None:
@@ -554,6 +586,7 @@ def test_evaluate_pair_proposes_the_golden_move() -> None:
     assert result.donor_live_capacity_bytes == 128 * GIB
     assert result.receiver_live_capacity_bytes == 64 * GIB
     assert result.as_dict()["allocation_size_gib"] == 64
+    assert result.as_dict()["kind"] == "move"
 
 
 def test_evaluate_pair_rejects_live_ratio_mismatch() -> None:
@@ -615,3 +648,167 @@ def test_evaluate_pair_reports_preflight_failure_before_anything_else() -> None:
     assert isinstance(result, list)
     assert result[0].reason is RejectionReason.PREFLIGHT_FAILED
     assert result[0].instance_id == "mp-donor"
+
+
+# -- GROW: size derivation and the receiver-only proposal ------------------------
+
+
+def _sized(size_gib: int, path: str, worker_ip: str = DONOR_IP) -> ManagedAllocation:
+    return _allocation(path, worker_ip).model_copy(
+        update={
+            "allocation_size_gib": size_gib,
+            "device_map_size_bytes": size_gib * GIB,
+        }
+    )
+
+
+def _receiver_dax(
+    bootstrap_bytes: int = 64 * GIB, used_gib: int = 56
+) -> DaxReconfigureStatus:
+    """A receiver with only its bootstrap device at index 0."""
+    body = _dax({0: used_gib}).model_dump()
+    devices = body["adapters"][0]["status"]["devices"][:1]
+    devices[0]["max_dax_size_bytes"] = bootstrap_bytes
+    body["adapters"][0]["status"]["devices"] = devices
+    body["adapters"][0]["status"]["total_capacity_bytes"] = bootstrap_bytes
+    body["adapters"][0]["status"]["total_used_bytes"] = used_gib * GIB
+    return DaxReconfigureStatus.model_validate(body)
+
+
+def test_derive_grow_size_prefers_receiver_inventory_then_fleet_then_bootstrap() -> (
+    None
+):
+    receiver = _identity("mp-receiver", RECEIVER_IP)
+    dax = _receiver_dax().adapters[0].status
+    # (a) receiver-local sizes win, most common first, ties to the largest.
+    local = [
+        _sized(64, "/dev/dax-cxl/r/dax0.1", RECEIVER_IP),
+        _sized(64, "/dev/dax-cxl/r/dax0.2", RECEIVER_IP),
+        _sized(32, "/dev/dax-cxl/r/dax0.3", RECEIVER_IP),
+        _sized(128, DONOR_PATH),
+    ]
+    assert derive_grow_size(receiver, dax, local) == GrowSize(
+        64, GrowSizeSource.RECEIVER_INVENTORY
+    )
+    tie = [
+        _sized(32, "/dev/dax-cxl/r/dax0.1", RECEIVER_IP),
+        _sized(128, "/dev/dax-cxl/r/dax0.2", RECEIVER_IP),
+    ]
+    assert derive_grow_size(receiver, dax, tie) == GrowSize(
+        128, GrowSizeSource.RECEIVER_INVENTORY
+    )
+    # (b) only other workers' sizes: the fleet's most common.
+    assert derive_grow_size(receiver, dax, [_sized(32, DONOR_PATH)]) == GrowSize(
+        32, GrowSizeSource.FLEET_INVENTORY
+    )
+    # (c) empty inventory: the receiver's bootstrap device, whole GiB down.
+    assert derive_grow_size(receiver, dax, []) == GrowSize(
+        64, GrowSizeSource.BOOTSTRAP_DEVICE
+    )
+    odd = _receiver_dax(bootstrap_bytes=64 * GIB + 1).adapters[0].status
+    assert derive_grow_size(receiver, odd, []) == GrowSize(
+        64, GrowSizeSource.BOOTSTRAP_DEVICE
+    )
+
+
+def test_derive_grow_size_rejects_without_a_whole_gib_source() -> None:
+    receiver = _identity("mp-receiver", RECEIVER_IP)
+    small = _receiver_dax(bootstrap_bytes=GIB - 1).adapters[0].status
+    rejection = derive_grow_size(receiver, small, [])
+    assert isinstance(rejection, Rejection)
+    assert rejection.reason is RejectionReason.GROW_SIZE_UNDETERMINABLE
+    assert rejection.instance_id == "mp-receiver"
+    # Size-inconsistent inventory entries are ignored, not requested.
+    inconsistent = _allocation().model_copy(update={"allocation_size_gib": 32})
+    rejection = derive_grow_size(receiver, small, [inconsistent])
+    assert isinstance(rejection, Rejection)
+    # No live index-0 device at all.
+    body = _receiver_dax().model_dump()
+    body["adapters"][0]["status"]["devices"][0]["state"] = "removed"
+    gone = DaxReconfigureStatus.model_validate(body).adapters[0].status
+    assert isinstance(derive_grow_size(receiver, gone, []), Rejection)
+
+
+def test_evaluate_grow_proposes_for_stable_high_receiver() -> None:
+    _, receiver, receiver_dax = _pair()
+    result = evaluate_grow(
+        receiver, _preflight(dax=receiver_dax), [_allocation()], {}, CONFIG, now=0.0
+    )
+    assert isinstance(result, GrowProposal)
+    assert result.receiver is receiver
+    assert result.request_size_gib == 64
+    assert result.size_source is GrowSizeSource.FLEET_INVENTORY
+    assert result.receiver_live_capacity_bytes == 64 * GIB
+    assert result.receiver_live_ratio == pytest.approx(56 / 64)
+    assert result.as_dict() == {
+        "kind": "grow",
+        "receiver": "mp-receiver",
+        "receiver_worker_ip": RECEIVER_IP,
+        "request_size_gib": 64,
+        "size_source": "fleet_inventory",
+        "receiver_live_capacity_bytes": 64 * GIB,
+        "receiver_live_ratio": round(56 / 64, 4),
+    }
+
+
+def test_evaluate_grow_rejects_active_backoff_then_allows_after_expiry() -> None:
+    _, receiver, receiver_dax = _pair()
+    backoffs = {RECEIVER_IP: 100.0}
+    result = evaluate_grow(
+        receiver, _preflight(dax=receiver_dax), [_allocation()], backoffs, CONFIG, 50.0
+    )
+    assert isinstance(result, list)
+    assert [r.reason for r in result] == [RejectionReason.GROW_BACKOFF]
+    assert result[0].instance_id == "mp-receiver" and "until=100" in result[0].detail
+    result = evaluate_grow(
+        receiver, _preflight(dax=receiver_dax), [_allocation()], backoffs, CONFIG, 150.0
+    )
+    assert isinstance(result, GrowProposal)
+    # A backoff on another worker never matters.
+    result = evaluate_grow(
+        receiver,
+        _preflight(dax=receiver_dax),
+        [_allocation()],
+        {DONOR_IP: 1e9},
+        CONFIG,
+        0.0,
+    )
+    assert isinstance(result, GrowProposal)
+
+
+def test_evaluate_grow_rejects_preflight_failure_before_anything_else() -> None:
+    _, receiver, receiver_dax = _pair()
+    result = evaluate_grow(
+        receiver,
+        _preflight(dax=receiver_dax, status=_status(is_healthy=False)),
+        [],
+        {},
+        CONFIG,
+        0.0,
+    )
+    assert isinstance(result, list)
+    assert [r.reason for r in result] == [RejectionReason.PREFLIGHT_FAILED]
+    # Live ratio no longer HIGH (8 of 64 GiB used).
+    cool = _receiver_dax(used_gib=8)
+    result = evaluate_grow(receiver, _preflight(dax=cool), [], {}, CONFIG, 0.0)
+    assert isinstance(result, list)
+    assert [r.reason for r in result] == [RejectionReason.LIVE_RATIO_MISMATCH]
+    # Undeterminable size is the last check.
+    tiny = _receiver_dax(bootstrap_bytes=GIB - 1, used_gib=0)
+    body = tiny.model_dump()
+    body["adapters"][0]["status"]["total_used_bytes"] = GIB - 2
+    tiny = DaxReconfigureStatus.model_validate(body)
+    result = evaluate_grow(receiver, _preflight(dax=tiny), [], {}, CONFIG, 0.0)
+    assert isinstance(result, list)
+    assert [r.reason for r in result] == [RejectionReason.GROW_SIZE_UNDETERMINABLE]
+
+
+def test_rank_candidates_ignores_grow_backoffs() -> None:
+    """A grow backoff lives apart from cooldowns: the receiver stays ranked
+    (and therefore stays a MOVE candidate)."""
+    donor = _sample("mp-donor", 0.1)
+    receiver = _sample("mp-receiver", 0.9, worker_ip=RECEIVER_IP)
+    history = _stable_history(donor, receiver)
+    candidates = rank_candidates(_snapshot(donor, receiver), history, {}, now=0.0)
+    assert [s.identity.instance_id for s in candidates.receivers] == ["mp-receiver"]
+    assert candidates.rejections == []

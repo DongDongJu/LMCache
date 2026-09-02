@@ -79,10 +79,18 @@ def test_disabled_watcher_block_parses_with_defaults() -> None:
 
 def test_attach_count_is_not_part_of_the_persisted_journal_counters() -> None:
     # The attach success count lives in memory: it is never a persisted
-    # counter.
+    # counter. The GROW counters are persisted but defaulted, so a journal
+    # written before they existed still loads.
     persisted = JournalDocument().model_dump(mode="json")["counters"]
     assert "attached" not in persisted
-    assert set(persisted) == {"proposed", "succeeded", "rolled_back", "blocked"}
+    assert set(persisted) == {
+        "proposed",
+        "succeeded",
+        "rolled_back",
+        "blocked",
+        "not_served",
+        "grown",
+    }
     assert JournalDocument.model_validate(
         {"counters": {"proposed": 2, "succeeded": 1, "rolled_back": 0, "blocked": 0}}
     ).counters == MoveCounters(proposed=2, succeeded=1, rolled_back=0, blocked=0)

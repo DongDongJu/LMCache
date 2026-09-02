@@ -15,6 +15,16 @@ Two modes:
 
 The coordinator receives ordinary HTTP URLs only; it cannot tell that its
 dependencies are fakes. Test controls never touch production code.
+
+Grow before move: the coordinator first asks the allocator for new receiver
+capacity (a GROW saga) and only moves a donor device when that is refused.
+Every reset gives the mock allocator a pool budget equal to the fixture's
+initially assigned total (``INITIAL_ASSIGNED_GIB``), so in every move
+scenario the GROW probe is refused (``NOT_SERVED``, no mutation) and the
+MOVE follows with its exact drain/evict/deallocate/allocate sequence;
+``Harness.move_allocator_posts`` and the ``kind``-aware waits of
+:class:`MemcoordClient` let move assertions ignore that probe. Grow
+scenarios raise the budget with ``Harness.set_pool_budget``.
 """
 
 # Standard
@@ -48,6 +58,10 @@ RECEIVER_BOOT = "/dev/dax-cxl/lmcache-e2e--mp-197/dax0.0"
 RECEIVER_RUNTIME = "/dev/dax-cxl/lmcache-e2e--mp-197/dax0.1"
 RECEIVER_SPARE = "/dev/dax-cxl/lmcache-e2e--mp-197/dax0.2"
 GIB = 1 << 30
+INITIAL_ASSIGNED_GIB = 64
+"""Runtime GiB the fixture assigns initially (the donor's runtime device)."""
+MOVE_KIND = "move"
+GROW_KIND = "grow"
 
 E2E_NAMESPACE = "lmcache-memcoord-e2e"
 CLUSTER_ADOPTION_FILE = "/etc/lmcache/adoption.yaml"
@@ -161,8 +175,9 @@ class AdminClient:
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
 
-    def reset(self) -> dict:
-        response = requests.post(self._url("/__test/reset"), timeout=5)
+    def reset(self, spec: dict | None = None) -> dict:
+        """``POST /__test/reset`` with an optional JSON body."""
+        response = requests.post(self._url("/__test/reset"), json=spec, timeout=5)
         response.raise_for_status()
         return response.json()
 
@@ -236,8 +251,13 @@ class MemcoordClient:
     def active_move(self) -> dict | None:
         return self.journal().get("active_move")
 
-    def last_move(self) -> dict | None:
-        history = self.journal().get("history", [])
+    def history(self, kind: str) -> list[dict]:
+        """Terminal sagas of ``kind`` (``"move"`` or ``"grow"``), oldest first."""
+        return [m for m in self.journal().get("history", []) if _kind_of(m) == kind]
+
+    def last_move(self, kind: str = MOVE_KIND) -> dict | None:
+        """The newest terminal saga of ``kind``, if any."""
+        history = self.history(kind)
         return history[-1] if history else None
 
     def cycles(self) -> float:
@@ -257,40 +277,82 @@ class MemcoordClient:
 
         wait_until(_tick, timeout, what=f"{count} cycles")
 
-    def wait_terminal(self, timeout: float = 120.0) -> dict:
-        """Wait until the active move is COMPLETE or BLOCKED; return it."""
+    def wait_terminal(self, timeout: float = 120.0, kind: str = MOVE_KIND) -> dict:
+        """Wait until a saga of ``kind`` is COMPLETE or BLOCKED; return it.
+
+        A refused GROW (``NOT_SERVED``) that precedes a move is a terminal
+        grow, not a terminal move, so waiting for ``"move"`` skips it.
+        """
 
         def _done() -> bool:
             try:
                 move = self.active_move()
             except requests.RequestException:
                 return False
-            if move is None:
-                return self.last_move() is not None
-            return move["state"] == "BLOCKED"
+            if move is not None and _kind_of(move) == kind:
+                return move["state"] == "BLOCKED"
+            return self.last_move(kind) is not None
 
-        wait_until(_done, timeout, what="terminal move")
+        wait_until(_done, timeout, what=f"terminal {kind}")
         move = self.active_move()
-        if move is not None:
+        if move is not None and _kind_of(move) == kind and move["state"] == "BLOCKED":
             return move
-        last = self.last_move()
+        last = self.last_move(kind)
         assert last is not None
         return last
 
-    def wait_state(self, states: set[str], timeout: float = 60.0) -> dict:
-        """Wait until the active move is in one of ``states``."""
+    def wait_history(self, count: int, timeout: float = 120.0) -> list[dict]:
+        """Wait until ``count`` sagas are archived and none is in flight."""
+
+        def _done() -> bool:
+            try:
+                journal = self.journal()
+            except requests.RequestException:
+                return False
+            active = journal.get("active_move")
+            settled = active is None or active["state"] == "BLOCKED"
+            return settled and len(journal.get("history", [])) >= count
+
+        wait_until(_done, timeout, what=f"{count} archived sagas")
+        return list(self.journal().get("history", []))
+
+    def wait_state(
+        self, states: set[str], timeout: float = 60.0, kind: str = MOVE_KIND
+    ) -> dict:
+        """Wait until the active saga of ``kind`` is in one of ``states``."""
 
         def _in() -> bool:
             try:
                 move = self.active_move()
             except requests.RequestException:
                 return False
-            return move is not None and move["state"] in states
+            return (
+                move is not None and _kind_of(move) == kind and move["state"] in states
+            )
 
-        wait_until(_in, timeout, what=f"move in {states}")
+        wait_until(_in, timeout, what=f"{kind} in {states}")
         move = self.active_move()
         assert move is not None
         return move
+
+
+def _kind_of(record: dict) -> str:
+    """The saga kind of a journal record (a pre-GROW journal means move)."""
+    return str(record.get("kind", MOVE_KIND))
+
+
+def grow_request_ids(journal: dict) -> set[str]:
+    """Outside request ids that belong to GROW sagas (archived or active)."""
+    records = list(journal.get("history", []))
+    active = journal.get("active_move")
+    if active is not None:
+        records.append(active)
+    ids: set[str] = set()
+    for record in records:
+        if _kind_of(record) == GROW_KIND:
+            ids.add(record["allocation_request_id"])
+            ids.add(record["release_request_id"])
+    return ids
 
 
 @dataclass
@@ -713,12 +775,67 @@ class Harness:
     artifacts: Path
     cleanup: list[Callable[[], None]] = field(default_factory=list)
 
-    def reset(self) -> None:
-        """Reset both test services and verify their health."""
+    def reset(self, pool_budget_gib: int = INITIAL_ASSIGNED_GIB) -> None:
+        """Reset both test services and verify their health.
+
+        Args:
+            pool_budget_gib: The allocator's pool budget after the reset. The
+                default equals the fixture's initially assigned total, so the
+                pool is exhausted until a deallocation frees room and the
+                coordinator's GROW probe is refused; raise it to let a GROW
+                be served.
+        """
         self.scenario.reset()
-        self.allocator.reset()
+        self.allocator.reset({"pool_budget_gib": pool_budget_gib})
         assert self.scenario.health()["status"] == "ok"
         assert self.allocator.health()["status"] == "ok"
+        assert self.allocator.state()["pool_budget_gib"] == pool_budget_gib
+
+    def set_pool_budget(self, pool_budget_gib: int) -> None:
+        """Change the allocator's pool budget without resetting anything."""
+        self.allocator.post("/__test/pool_budget", {"pool_budget_gib": pool_budget_gib})
+
+    def move_allocator_posts(self, journal: dict | None = None) -> list[dict]:
+        """Outside POSTs that are not a GROW's: the MOVE saga's own requests.
+
+        In an exhausted pool every move is preceded by one refused GROW
+        allocation for the receiver; that probe (and any GROW release) is
+        identified by its request id in the journal and excluded here.
+
+        Args:
+            journal: The journal to take GROW request ids from; defaults to
+                this harness's coordinator (pass another replica's journal
+                when that coordinator was killed).
+        """
+        grow_ids = grow_request_ids(
+            self.memcoord.client.journal() if journal is None else journal
+        )
+        return [
+            r
+            for r in self.allocator_posts()
+            if (r.get("body") or {}).get("request_id") not in grow_ids
+        ]
+
+    def grow_probe(self) -> dict:
+        """The refused GROW that precedes a move: asserts it and returns it."""
+        grows = self.memcoord.client.history(GROW_KIND)
+        assert grows, "no GROW was archived"
+        probe = grows[0]
+        assert probe["state"] == "COMPLETE" and probe["outcome"] == "NOT_SERVED", probe
+        assert list(probe["effects"]) == ["allocate"]
+        allocate = probe["effects"]["allocate"]
+        assert allocate["dispatched"] is True and allocate["confirmed"] is False
+        assert allocate["failure"] == "explicit" and allocate["error"], allocate
+        assert probe["new_path"] == ""
+        posts = [
+            r
+            for r in self.allocator_posts()
+            if r["body"]["request_id"] == probe["allocation_request_id"]
+        ]
+        assert len(posts) == 1, posts
+        assert posts[0]["operation"] == "allocate"
+        assert posts[0]["body"]["target_node"] == RECEIVER_IP
+        return probe
 
     def outside_status(self) -> dict:
         response = requests.get(

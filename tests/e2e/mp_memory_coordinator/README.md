@@ -110,6 +110,10 @@ lifecycle it models.
 ```
 GET    /__test/health                      -> {"status":"ok","seq":N}
 POST   /__test/reset                       -> reload fixture, clear faults/barriers/audit; returns state
+                                              (allocator: optional {"pool_budget_gib": N}; the harness passes the
+                                              fixture's initially assigned 64 GiB so the coordinator's grow-before-move
+                                              probe is refused and every move scenario keeps its exact sequence)
+POST   /__test/pool_budget                 -> allocator only: {"pool_budget_gib": N|null}; grow scenarios raise it
 GET    /__test/state                       -> instances (identity, ports, usage, capacities, devices), faults, barriers
 GET    /__test/audit?after_seq=N           -> {"records":[{seq,kind,service,method,path,body,status_code,response,mutation,timestamp}]}
 POST   /__test/faults                      -> FaultSpec patch (only given keys change); returns active faults

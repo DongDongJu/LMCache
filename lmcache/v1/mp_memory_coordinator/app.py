@@ -10,7 +10,8 @@ Endpoints:
   and the last cycle report.
 * ``GET /journal`` -- the durable journal document (read-only).
 * ``GET /metrics`` -- Prometheus counters for proposed / succeeded /
-  rolled-back / blocked moves, and attached devices.
+  rolled-back / blocked sagas, succeeded / not-served grows, and attached
+  devices.
 
 :func:`run_memory_coordinator` wires the clients, journal, leader elector,
 and controller, serves the app with uvicorn, and stops gracefully: on
@@ -101,6 +102,16 @@ class Metrics:
             "Present, outside-assigned devices attached by attach orchestration",
             registry=self.registry,
         )
+        self.grown = Gauge(
+            "lmcache_memcoord_grows_succeeded_total",
+            "GROW sagas (allocate for the receiver, no donor) that SUCCEEDED",
+            registry=self.registry,
+        )
+        self.not_served = Gauge(
+            "lmcache_memcoord_grows_not_served_total",
+            "GROW sagas the allocator explicitly refused (NOT_SERVED)",
+            registry=self.registry,
+        )
         self.leader = Gauge(
             "lmcache_memcoord_leader",
             "1 when this process holds leadership",
@@ -114,6 +125,8 @@ class Metrics:
         self.succeeded.set(counters.succeeded)
         self.rolled_back.set(counters.rolled_back)
         self.blocked.set(counters.blocked)
+        self.grown.set(counters.grown)
+        self.not_served.set(counters.not_served)
         self.attached.set(controller.attached_devices)
         self.leader.set(1 if controller.readiness()[0] else 0)
 

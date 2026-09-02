@@ -3,10 +3,12 @@ lmcache mp-memory-coordinator
 
 The ``lmcache mp-memory-coordinator`` command runs the standalone **MP Memory
 Coordinator**, a process that rebalances Device-DAX capacity between MP
-servers: it reads the fleet's occupancy from the MP Coordinator, picks one LOW
-donor and one HIGH receiver after three stable samples, and moves one managed
-allocation (donor drain -> donor remove -> outside deallocate -> outside
-allocate -> receiver add) through a crash-safe journal.
+servers: it reads the fleet's occupancy from the MP Coordinator, and for a
+receiver that stayed HIGH for three stable samples first asks the outside
+allocation service for new capacity on that worker (outside allocate ->
+receiver add); only when the allocator refuses does it pick one LOW donor and
+move one managed allocation (donor drain -> donor remove -> outside deallocate
+-> outside allocate -> receiver add). Both run through a crash-safe journal.
 
 .. code-block:: bash
 
@@ -22,18 +24,32 @@ instance only when its identity (registration epoch, address, and
 ``l2/dax`` compartment has a declared capacity. An instance whose
 ``used/capacity`` ratio stays **HIGH** (``>= high_ratio``) for
 ``stable_samples`` consecutive samples is a receiver candidate; one that stays
-**LOW** (``<= low_ratio``) is a donor candidate. After a live preflight of both
-servers (``/status`` and ``/reconfigure/dax/status``), the least-used managed
-runtime device of the donor is moved:
+**LOW** (``<= low_ratio``) is a donor candidate. Grow comes before move: after
+a live preflight of the receiver (``/status`` and ``/reconfigure/dax/status``)
+the coordinator requests one allocation for the receiver's own worker and
+attaches the returned path:
 
 .. code-block:: text
 
-   donor drain -> donor evict -> outside deallocate -> outside allocate -> receiver add
+   outside allocate -> receiver add                          (grow)
+
+The size is derived, not configured: the managed allocation size already
+served on that worker, else the fleet's, else the receiver's bootstrap device
+size in whole GiB. If the allocator explicitly refuses (nothing was assigned),
+the grow ends ``NOT_SERVED`` with zero side effects, the worker gets a grow
+backoff of at least ``cooldown_seconds`` (no cooldown), and the next cycle
+looks for a donor: after a live preflight of both servers, the least-used
+managed runtime
+device of the donor is moved:
+
+.. code-block:: text
+
+   donor drain -> donor evict -> outside deallocate -> outside allocate -> receiver add   (move)
 
 Only devices the coordinator manages take part: the bootstrap device at DAX
 index 0, shared pools, and unlisted paths are never touched. With the default
-``actuation_enabled: false`` the process observes, logs its proposals and
-rejection reasons, and mutates nothing.
+``actuation_enabled: false`` the process observes, logs its proposals
+(``kind: grow`` or ``kind: move``) and rejection reasons, and mutates nothing.
 
 Node identity
 -------------
@@ -50,14 +66,20 @@ Safety
 * Every side effect is journaled before it is issued (intent, then
   ``dispatched``, then result), with fsync and atomic replacement, so a
   restart resumes from durable evidence and current status.
-* An outside POST is issued at most once. If its outcome cannot be proven
-  after a crash, the move enters ``BLOCKED`` and nothing further is mutated
-  until an operator reconciles it.
+* An outside POST reaches the service at most once: a request whose
+  connection was never established is re-issued with the same request id
+  (bounded by ``get_retry_attempts``); one that may have been delivered is
+  never retried. If its outcome cannot be proven after a crash, the move
+  enters ``BLOCKED`` and nothing further is mutated until an operator
+  reconciles it.
 * Before every POST the process re-renews its Lease and re-reads the fleet;
   a lost Lease, an unreachable MP Coordinator, or a changed identity defers
   the effect.
 * Rollbacks restore the donor (re-add the old path, or allocate the same
   size back and attach the returned path) or end safely in ``BLOCKED``.
+* A grow the allocator refuses ends ``NOT_SERVED`` with zero side effects; a
+  grow whose returned path cannot be proven releases it and ends
+  ``ROLLED_BACK``; nothing a grow does ever touches a donor.
 * A corrupt, truncated, or unknown-version journal makes the process unready
   and inert.
 
@@ -164,7 +186,10 @@ pass could not run (outside status unavailable) or leadership was lost.
 Successful attaches are counted in ``counters.attached`` of ``/status``
 (``lmcache_memcoord_devices_attached_total``); the count is in-memory and
 restarts from zero, since attaches are idempotent and deliberately not
-journaled.
+journaled. Note that the journal is forward-compatible only: a journal
+written by this build does not load in a build that predates grow-before-move
+(unknown keys fail closed), so a rollback to such a build requires clearing
+the journal first, with no saga active.
 
 Adoption allowlist
 ------------------
@@ -200,12 +225,13 @@ Endpoints
    * - ``/readyz``
      - Leader, MP Coordinator reachable, inventory reconciled, no BLOCKED move.
    * - ``/status``
-     - Inventory, cooldowns, pressure history, active move, counters, last cycle.
+     - Inventory, cooldowns, grow backoffs, pressure history, active move
+       (with its ``kind``), counters, last cycle.
    * - ``/journal``
      - The durable journal document (read-only).
    * - ``/metrics``
-     - Prometheus counters: proposed, succeeded, rolled back, blocked moves;
-       attached devices.
+     - Prometheus counters: proposed, succeeded, rolled back, blocked sagas;
+       succeeded and not-served grows; attached devices.
 
 Kubernetes deployment example
 -----------------------------

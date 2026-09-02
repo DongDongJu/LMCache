@@ -12,19 +12,28 @@ point simply re-enters the same loop: that *is* the recovery path.
 Safety rules encoded here (see the design doc for the table):
 
 * every side effect requires leadership, a reachable MP Coordinator, and
-  unchanged sandwich identity of both participants;
-* an outside POST is issued at most once: an effect that is ``dispatched``
-  without a recorded response or explicit failure has an unknown outcome
-  and the move enters ``BLOCKED``;
+  unchanged sandwich identity of both participants (a GROW has no donor and
+  gates on the receiver only);
+* an outside POST reaches the service at most once: an effect that is
+  ``dispatched`` without a recorded response or explicit failure has an
+  unknown outcome and the move enters ``BLOCKED``; only a connect failure
+  (nothing delivered, ``dispatched`` reset by the controller) lets the same
+  request id be re-issued, within ``get_retry_attempts``;
 * DAX effects are re-driven from status (drain/evict/add are verifiable and
   idempotent-safe), never assumed from a response;
 * whenever an expected effect, size, or path cannot be proven from status,
   the move enters ``BLOCKED`` and nothing further is mutated.
+
+``decide`` branches once on ``record.kind``: a ``MOVE`` follows the donor
+saga below unchanged; a ``GROW`` (allocate for the receiver, add on the
+receiver, no donor) follows ``_decide_grow`` and reuses the receiver add,
+the returned-path proof, and the ``RELEASE_RECEIVER`` rollback.
 """
 
 # Standard
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Final
 import posixpath
 
 # First Party
@@ -32,13 +41,17 @@ from lmcache.v1.mp_memory_coordinator.config import MPMemoryCoordinatorConfig
 from lmcache.v1.mp_memory_coordinator.models import (
     DAX_ACTIVE_STATE,
     DAX_DRAINING_STATE,
+    GIB,
     AllocationRequest,
     DaxDeviceStatus,
     DaxHotplugStatus,
     DaxRemoveMode,
     DeallocationRequest,
+    EffectFailure,
     EffectName,
     EffectRecord,
+    InstanceIdentity,
+    MoveKind,
     MoveOutcome,
     MoveRecord,
     MoveState,
@@ -70,6 +83,14 @@ class Evidence:
         donor_capacity_bytes: Donor ``l2/dax`` capacity from the usage view
             (``None`` when unavailable).
         receiver_capacity_bytes: Receiver capacity from the usage view.
+        receiver_replacement: When the recorded receiver identity is no
+            longer accepted but exactly one accepted instance registers the
+            receiver's ``worker_ip``, that instance's identity (a GROW
+            rebinds to it); ``None`` otherwise.
+        receiver_worker_registered: Whether any instance registered with
+            the MP Coordinator, accepted or rejected by the sandwich, carries
+            the receiver's ``worker_ip`` (GROW only). ``False`` is the proof
+            "no instance on that worker".
     """
 
     now: float
@@ -82,6 +103,8 @@ class Evidence:
     outside: OutsideStatus | None
     donor_capacity_bytes: int | None
     receiver_capacity_bytes: int | None
+    receiver_replacement: InstanceIdentity | None = None
+    receiver_worker_registered: bool = False
 
 
 @dataclass(frozen=True)
@@ -101,6 +124,11 @@ class Persist:
         confirm_effect: Effect to mark ``confirmed``.
         fields: Scalar record fields to set.
         note: Log text.
+        receiver: New receiver identity to bind the record to (a GROW whose
+            receiver re-registered on the same worker); ``None`` keeps it.
+        unconfirm_effect: Effect whose ``confirmed`` mark is dropped so it
+            is re-driven from status (a rebind forgets what was confirmed
+            on the previous identity); its attempt count is kept.
     """
 
     state: MoveState
@@ -108,6 +136,8 @@ class Persist:
     confirm_effect: EffectName | None = None
     fields: dict[str, str | int | float | bool] = field(default_factory=dict)
     note: str = ""
+    receiver: InstanceIdentity | None = None
+    unconfirm_effect: EffectName | None = None
 
 
 @dataclass(frozen=True)
@@ -153,13 +183,37 @@ class Block:
 
 @dataclass(frozen=True)
 class Finish:
-    """Enter ``COMPLETE`` with an outcome."""
+    """Enter ``COMPLETE`` with an outcome.
+
+    Attributes:
+        outcome: The terminal outcome.
+        note: Log text.
+        warning: Operator-facing text the controller logs at WARNING
+            (``""`` when there is nothing to warn about).
+    """
 
     outcome: MoveOutcome
     note: str = ""
+    warning: str = ""
 
 
 Decision = Hold | Persist | DoEffect | Block | Finish
+
+GROW_MAX_RECEIVER_REBINDS: Final = 3
+"""Rebinds a GROW may perform to a receiver that re-registered on its worker.
+
+A rebind resets the vanished-receiver grace (it is a persisted change), so
+without a cap a receiver in a restart loop would keep the saga non-terminal
+forever; the loss after the last permitted rebind blocks instead.
+"""
+
+
+class _Attachment(str, Enum):
+    """What is known about a GROW's ``new_path`` on a vanished receiver."""
+
+    ATTACHED = "is attached"
+    UNATTACHED = "is provably unattached"
+    UNKNOWN = "attachment unknown"
 
 
 def _tombstone(dax: DaxHotplugStatus, device_path: str) -> DaxDeviceStatus | None:
@@ -216,12 +270,15 @@ def validate_returned_path(
 
 
 def _gate(record: MoveRecord, evidence: Evidence, needs_receiver: bool) -> str:
-    """Return why a side effect may not be issued now (``""`` if it may)."""
+    """Return why a side effect may not be issued now (``""`` if it may).
+
+    A GROW has no donor, so its donor identity is never a condition.
+    """
     if not evidence.leader:
         return "not leader"
     if not evidence.coordinator_reachable:
         return "MP Coordinator unreachable"
-    if not evidence.donor_identity_ok:
+    if record.has_donor and not evidence.donor_identity_ok:
         return "donor identity changed or missing"
     if needs_receiver and not evidence.receiver_identity_ok:
         return "receiver identity changed or missing"
@@ -377,6 +434,8 @@ def decide(
         return Hold("blocked: operator action required")
     if record.state is MoveState.COMPLETE:
         return Hold("complete")
+    if record.kind is MoveKind.GROW:
+        return _decide_grow(record, evidence, config)
     if record.state is MoveState.SELECTED:
         return _decide_selected(record, evidence, config)
     if record.state is MoveState.DONOR_DRAINING:
@@ -573,30 +632,8 @@ def _decide_allocating(
     node = record.receiver.worker_ip
     new_paths = sorted(set(_paths(evidence.outside, node)) - set(effect.before_paths))
     if effect.response:
-        path = str(effect.response["device_path"])
-        problem = validate_returned_path(
-            path, node, effect.before_paths, evidence.outside, config
-        )
-        if not problem:
-            return Persist(
-                MoveState.ALLOCATED,
-                confirm_effect=EffectName.ALLOCATE,
-                fields={
-                    "new_path": path,
-                    "granted_size_gib": int(effect.response["granted_size_gib"]),
-                },
-                note="returned path proven under the receiver",
-            )
-        if len(new_paths) == 1:
-            return Persist(
-                MoveState.ROLLING_BACK,
-                RollbackStep.RELEASE_RECEIVER,
-                fields={"new_path": new_paths[0]},
-                note=f"allocation returned an invalid path ({problem}); releasing "
-                f"the proven allocation {new_paths[0]}",
-            )
-        return Block(
-            f"allocation returned an invalid path ({problem}); effect unprovable"
+        return _allocation_response_decision(
+            record, effect, new_paths, evidence.outside, config
         )
     if effect.error:
         if not new_paths:
@@ -622,6 +659,51 @@ def _decide_allocating(
             "unprovable, no retry"
         )
     return _decide_deallocated(record, evidence, config)
+
+
+def _allocation_response_decision(
+    record: MoveRecord,
+    effect: EffectRecord,
+    new_paths: list[str],
+    outside: OutsideStatus,
+    config: MPMemoryCoordinatorConfig,
+) -> Decision:
+    """Classify an answered receiver allocation (shared by MOVE and GROW).
+
+    Args:
+        record: The saga.
+        effect: The ``ALLOCATE`` ledger carrying a response.
+        new_paths: Receiver paths listed now but not in ``before_paths``.
+        outside: The current outside status.
+        config: For the allowed path prefix.
+
+    Returns:
+        ``Persist(ALLOCATED)`` when the returned path is proven; a
+        ``RELEASE_RECEIVER`` rollback when it is invalid but exactly one new
+        path appeared; else ``Block``.
+    """
+    node = record.receiver.worker_ip
+    path = str(effect.response["device_path"])
+    problem = validate_returned_path(path, node, effect.before_paths, outside, config)
+    if not problem:
+        return Persist(
+            MoveState.ALLOCATED,
+            confirm_effect=EffectName.ALLOCATE,
+            fields={
+                "new_path": path,
+                "granted_size_gib": int(effect.response["granted_size_gib"]),
+            },
+            note="returned path proven under the receiver",
+        )
+    if len(new_paths) == 1:
+        return Persist(
+            MoveState.ROLLING_BACK,
+            RollbackStep.RELEASE_RECEIVER,
+            fields={"new_path": new_paths[0]},
+            note=f"allocation returned an invalid path ({problem}); releasing "
+            f"the proven allocation {new_paths[0]}",
+        )
+    return Block(f"allocation returned an invalid path ({problem}); effect unprovable")
 
 
 def _decide_allocated(
@@ -729,7 +811,7 @@ def _decide_rolling_back(
             ),
         )
     if step is RollbackStep.RELEASE_RECEIVER:
-        return _decide_release_receiver(record, evidence)
+        return _decide_release_receiver(record, evidence, config)
     if step is RollbackStep.RESTORE_DONOR_ALLOCATE:
         return _decide_restore_allocate(record, evidence, config)
     if step is RollbackStep.RESTORE_DONOR_ADD:
@@ -751,8 +833,19 @@ def _decide_rolling_back(
     return Block(f"ROLLING_BACK with unknown step {step.value}")
 
 
-def _decide_release_receiver(record: MoveRecord, evidence: Evidence) -> Decision:
-    """Release a proven receiver allocation, then restore the donor."""
+def _decide_release_receiver(
+    record: MoveRecord, evidence: Evidence, config: MPMemoryCoordinatorConfig
+) -> Decision:
+    """Release a proven receiver allocation, then restore the donor (MOVE) or
+    finish ``ROLLED_BACK`` (GROW).
+
+    A GROW additionally never releases while the receiver's DAX status is
+    unreadable (the path could be attached) and rebinds to a re-registered
+    receiver; both are bounded by ``drain_timeout_seconds`` after which the
+    saga blocks. The release POST itself is gated on a matching receiver
+    identity, so a GROW whose receiver vanished can only release once an
+    instance is back on that worker (rebound, or the same identity again).
+    """
     if evidence.outside is None:
         return Hold("outside status unavailable")
     node = record.receiver.worker_ip
@@ -770,6 +863,8 @@ def _decide_release_receiver(record: MoveRecord, evidence: Evidence) -> Decision
             return Block(
                 f"release reported DONE but {record.new_path} still under {owners}"
             )
+        if not record.has_donor:
+            return Finish(MoveOutcome.ROLLED_BACK, "receiver path released")
         return Persist(
             MoveState.ROLLING_BACK,
             RollbackStep.RESTORE_DONOR_ALLOCATE,
@@ -780,6 +875,18 @@ def _decide_release_receiver(record: MoveRecord, evidence: Evidence) -> Decision
         return Block(f"releasing {record.new_path} failed: {effect.error}")
     if effect is not None and _outside_unknown(effect):
         return Block("release of the receiver path has an unknown outcome")
+    if not record.has_donor:
+        lost = _grow_receiver_lost(record, evidence, config)
+        if lost is not None:
+            return lost
+        if evidence.receiver_dax is None:
+            if evidence.now - record.updated_at > config.drain_timeout_seconds:
+                return Block(
+                    f"receiver DAX status unreadable for more than "
+                    f"{config.drain_timeout_seconds}s; cannot prove {record.new_path} "
+                    "is unattached before releasing it"
+                )
+            return Hold("receiver DAX status unavailable; not releasing")
     if owners != [node]:
         return Block(f"{record.new_path} not listed solely under receiver: {owners}")
     return _gated(
@@ -850,4 +957,327 @@ def _decide_restore_allocate(
         ),
         record,
         evidence,
+    )
+
+
+# -- GROW: allocate for the receiver, add on the receiver, no donor -------------
+
+
+def _decide_grow(
+    record: MoveRecord, evidence: Evidence, config: MPMemoryCoordinatorConfig
+) -> Decision:
+    """Dispatch a ``GROW`` record on its state.
+
+    A GROW only ever passes through ``SELECTED -> ALLOCATING -> ALLOCATED
+    -> COMPLETE`` and the ``RELEASE_RECEIVER`` rollback; any other state or
+    rollback step cannot arise from this code and blocks defensively.
+    """
+    if record.state is MoveState.SELECTED:
+        return _decide_grow_selected(record, evidence, config)
+    if record.state is MoveState.ALLOCATING:
+        return _decide_grow_allocating(record, evidence, config)
+    if record.state is MoveState.ALLOCATED:
+        return _decide_grow_allocated(record, evidence, config)
+    if record.state is MoveState.ROLLING_BACK:
+        if record.rollback_step is RollbackStep.RELEASE_RECEIVER:
+            return _decide_release_receiver(record, evidence, config)
+        return Block(f"GROW with unknown rollback step {record.rollback_step.value}")
+    return Block(f"GROW in unexpected state {record.state.value}")
+
+
+def _issue_grow_allocation(
+    record: MoveRecord, evidence: Evidence, config: MPMemoryCoordinatorConfig
+) -> Decision:
+    """Issue the single GROW allocation POST, or explain why not.
+
+    Ledger-agnostic: it is called from ``SELECTED`` (no ledger yet) and from
+    ``ALLOCATING`` when the persisted intent was provably never dispatched;
+    the controller reuses the existing ledger, its request id and its
+    ``before_paths`` on re-issue, which is what the later ``NOT_SERVED``
+    proof ("no new path versus ``before_paths``") depends on.
+    """
+    if _receiver_lost(record, evidence):
+        return Finish(MoveOutcome.ROLLED_BACK, "receiver vanished before any effect")
+    if evidence.outside is None:
+        return Hold("outside status unavailable")
+    if evidence.receiver_dax is None:
+        return Hold("receiver DAX status unavailable")
+    if (
+        record.allocation_size_gib <= 0
+        or record.old_map_size_bytes != record.allocation_size_gib * GIB
+    ):
+        return Block(
+            f"GROW size invalid: allocation_size_gib={record.allocation_size_gib} "
+            f"old_map_size_bytes={record.old_map_size_bytes}"
+        )
+    return _gated(
+        DoEffect(
+            EffectName.ALLOCATE,
+            MoveState.ALLOCATING,
+            participant=Participant.RECEIVER,
+            allocation=AllocationRequest(
+                request_id=record.allocation_request_id,
+                target_node=record.receiver.worker_ip,
+                request_size_gib=record.allocation_size_gib,
+            ),
+            before_paths=_paths(evidence.outside, record.receiver.worker_ip),
+        ),
+        record,
+        evidence,
+    )
+
+
+def _decide_grow_selected(
+    record: MoveRecord, evidence: Evidence, config: MPMemoryCoordinatorConfig
+) -> Decision:
+    """SELECTED (GROW): nothing has happened yet; issue the single POST."""
+    if record.effect(EffectName.ALLOCATE) is not None:
+        # The controller persists ALLOCATING together with the ledger, so a
+        # SELECTED record can never carry one; never reason about it here.
+        return Block("SELECTED with an allocation ledger")
+    return _issue_grow_allocation(record, evidence, config)
+
+
+def _decide_grow_allocating(
+    record: MoveRecord, evidence: Evidence, config: MPMemoryCoordinatorConfig
+) -> Decision:
+    """ALLOCATING (GROW): prove the path, finish NOT_SERVED, release, or block.
+
+    An explicit refusal with no new path under the receiver is the only
+    ``NOT_SERVED`` outcome: nothing was assigned, so nothing is rolled back.
+    A 2xx that violated the contract with no visible path blocks (a 2xx can
+    never be taken as "nothing happened"); a failure or invalid path with
+    exactly one new path releases that path; a dispatched POST with no
+    recorded outcome blocks; an intent that was never dispatched re-issues
+    the single POST through the same issuer as ``SELECTED``.
+    """
+    effect = record.effect(EffectName.ALLOCATE)
+    if effect is None:
+        return Block("ALLOCATING without an allocation intent record")
+    if evidence.outside is None:
+        return Hold("outside status unavailable")
+    node = record.receiver.worker_ip
+    new_paths = sorted(set(_paths(evidence.outside, node)) - set(effect.before_paths))
+    if effect.response:
+        return _allocation_response_decision(
+            record, effect, new_paths, evidence.outside, config
+        )
+    if effect.error:
+        if len(new_paths) == 1:
+            return Persist(
+                MoveState.ROLLING_BACK,
+                RollbackStep.RELEASE_RECEIVER,
+                fields={"new_path": new_paths[0]},
+                note=f"allocation failed ({effect.error}) but {new_paths[0]} appeared; "
+                "releasing it",
+            )
+        if new_paths:
+            return Block(
+                f"allocation failed ({effect.error}); receiver set diff {new_paths}"
+            )
+        if effect.failure is EffectFailure.EXPLICIT:
+            return Finish(
+                MoveOutcome.NOT_SERVED,
+                f"allocator cannot serve {record.allocation_size_gib} GiB on {node} "
+                f"({effect.error}); nothing changed",
+            )
+        return Block(
+            f"allocation answered but violated the contract ({effect.error}) and "
+            f"no path appeared under {node}; effect unprovable"
+        )
+    if _outside_unknown(effect):
+        return Block(
+            "allocation was dispatched but its outcome is unknown; granted size "
+            "unprovable, no retry"
+        )
+    # Intent persisted, never dispatched (crash or lost gate before the
+    # POST): provably unsent, so the single POST may still be issued.
+    return _issue_grow_allocation(record, evidence, config)
+
+
+def _grow_receiver_lost(
+    record: MoveRecord, evidence: Evidence, config: MPMemoryCoordinatorConfig
+) -> Decision | None:
+    """Handle a receiver that vanished after the GROW allocation.
+
+    Returns ``None`` when the receiver identity is intact. Otherwise: rebind
+    to the single accepted instance on the receiver's worker (the allocation
+    is node-level and the add is idempotent, so the add's confirmation is
+    dropped and it is re-driven against the new identity from status) -- at
+    most :data:`GROW_MAX_RECEIVER_REBINDS` times per saga, the next loss
+    with a replacement blocking, because a rebind is a persisted change that
+    resets the grace below and a receiver in a restart loop must not keep
+    the saga alive forever; hold for a grace of ``drain_timeout_seconds``
+    since the last persisted change; after the grace, enter the release step
+    when the path is provably unattached, else block.
+
+    "Provably unattached" is decided from the receiver's endpoint first: a
+    readable status is authoritative (path absent -> unattached, path live
+    -> attached, whatever the sandwich says about the identity); only when
+    the status is unreadable does raw membership decide (no instance at all
+    registered on that worker -> unattached; anything registered there ->
+    attachment unknown). A sandwich-rejected receiver whose path is live is
+    therefore never treated as vanished-and-unattached.
+
+    The release step POSTs only with a matching receiver identity and a
+    readable status, so after a vanish it succeeds only once an instance is
+    back on that worker; otherwise it blocks after a second grace. The bound
+    on the whole vanished-receiver path is therefore ``2 *
+    drain_timeout_seconds`` from the last persisted change, of which there
+    are at most ``GROW_MAX_RECEIVER_REBINDS`` rebinds.
+    """
+    if not _receiver_lost(record, evidence):
+        return None
+    worker = record.receiver.worker_ip
+    if evidence.receiver_replacement is not None:
+        if record.receiver_rebinds >= GROW_MAX_RECEIVER_REBINDS:
+            return Block(
+                f"receiver re-registered on {worker} more than "
+                f"{GROW_MAX_RECEIVER_REBINDS} times after allocation; "
+                f"{record.new_path} assigned to {worker}, "
+                f"{_attachment_of(record, evidence).value}"
+            )
+        return Persist(
+            record.state,
+            record.rollback_step,
+            fields={"receiver_rebinds": record.receiver_rebinds + 1},
+            note=f"receiver re-registered on {worker} as "
+            f"{evidence.receiver_replacement.instance_id}; rebinding and "
+            "re-driving the add from its status",
+            receiver=evidence.receiver_replacement,
+            unconfirm_effect=EffectName.RECEIVER_ADD,
+        )
+    if evidence.now - record.updated_at <= config.drain_timeout_seconds:
+        return Hold(
+            "receiver vanished after allocation; waiting up to "
+            f"{config.drain_timeout_seconds}s for it to re-register"
+        )
+    if record.state is MoveState.ROLLING_BACK:
+        return Block(
+            f"receiver vanished after allocation; {record.new_path} assigned to "
+            f"{worker} cannot be released without a readable receiver of a "
+            "matching identity"
+        )
+    attachment = _attachment_of(record, evidence)
+    if attachment is _Attachment.ATTACHED:
+        return Block(
+            f"receiver vanished after allocation; {record.new_path} is attached "
+            f"on {worker} under an identity the sandwich no longer accepts"
+        )
+    if attachment is _Attachment.UNKNOWN:
+        return Block(
+            f"receiver vanished after allocation; {record.new_path} assigned to "
+            f"{worker}, attachment unknown"
+        )
+    return Persist(
+        MoveState.ROLLING_BACK,
+        RollbackStep.RELEASE_RECEIVER,
+        note=f"receiver vanished after allocation and {record.new_path} is "
+        f"provably unattached; releasing it once an instance is back on {worker} "
+        f"(BLOCKED after {config.drain_timeout_seconds}s otherwise)",
+    )
+
+
+def _attachment_of(record: MoveRecord, evidence: Evidence) -> _Attachment:
+    """Classify ``new_path`` on a vanished receiver's worker.
+
+    A readable receiver status is authoritative; without one, raw membership
+    decides (see :func:`_grow_receiver_lost`).
+    """
+    if evidence.receiver_dax is not None:
+        if evidence.receiver_dax.find_live(record.new_path) is not None:
+            return _Attachment.ATTACHED
+        return _Attachment.UNATTACHED
+    if evidence.receiver_worker_registered:
+        return _Attachment.UNKNOWN
+    return _Attachment.UNATTACHED
+
+
+def _decide_grow_allocated(
+    record: MoveRecord, evidence: Evidence, config: MPMemoryCoordinatorConfig
+) -> Decision:
+    """ALLOCATED (GROW): add on the receiver, then wait for its capacity.
+
+    Convergence is receiver-only and every wait after the add is confirmed
+    is bounded. When the path is confirmed active but the usage view has
+    not converged within ``capacity_convergence_timeout_seconds`` of the
+    confirmation, the allocator's view decides: listing the path under the
+    receiver finishes ``SUCCEEDED`` with a warning (nothing unproven remains,
+    the coordinator only has a stale capacity view); listing it elsewhere or
+    not at all contradicts the proven allocation and blocks; an unreadable
+    allocator is given a further ``drain_timeout_seconds`` (the allocation
+    cannot be re-verified) and then blocks. Convergence itself finishes the
+    saga at any time.
+
+    A rebind (see :func:`_grow_receiver_lost`) drops the add's confirmation,
+    so the add is re-driven from the new identity's status: a restarted MP
+    server that lost the hot-added path receives it again.
+    """
+    lost = _grow_receiver_lost(record, evidence, config)
+    if lost is not None:
+        return lost
+    add = record.effect(EffectName.RECEIVER_ADD)
+    dax = evidence.receiver_dax
+    if add is not None and add.confirmed:
+        if dax is None:
+            return Hold("receiver DAX status unavailable")
+        live = dax.find_live(record.new_path)
+        if live is None or live.state != DAX_ACTIVE_STATE:
+            return Block(f"{record.new_path} no longer active on the receiver")
+        expected_receiver = record.receiver_capacity_bytes + live.slot_capacity_bytes
+        if evidence.receiver_capacity_bytes == expected_receiver:
+            return Finish(MoveOutcome.SUCCEEDED, "capacity converged")
+        pending = (
+            f"waiting for capacity: receiver {evidence.receiver_capacity_bytes} -> "
+            f"{expected_receiver}"
+        )
+        timeout = config.capacity_convergence_timeout_seconds
+        waited = evidence.now - record.updated_at
+        if waited <= timeout:
+            return Hold(pending)
+        if evidence.outside is None:
+            if waited > timeout + config.drain_timeout_seconds:
+                return Block(
+                    f"allocator unreadable for more than "
+                    f"{config.drain_timeout_seconds}s after the capacity view failed "
+                    f"to converge within {timeout}s; {record.new_path} is active on "
+                    "the receiver but its allocation cannot be re-verified"
+                )
+            return Hold(f"{pending}; allocator unreadable, allocation not re-verified")
+        owners = _owners(evidence.outside, record.new_path)
+        if owners != [record.receiver.worker_ip]:
+            return Block(
+                f"{record.new_path} is active on the receiver but the allocator "
+                f"lists it under {owners}; capacity view did not converge within "
+                f"{timeout}s"
+            )
+        warning = (
+            f"capacity view did not converge within {timeout}s (receiver "
+            f"{evidence.receiver_capacity_bytes} -> {expected_receiver}); "
+            f"{record.new_path} is active on the receiver and listed by the "
+            "allocator"
+        )
+        return Finish(MoveOutcome.SUCCEEDED, warning, warning=warning)
+    on_active = Persist(
+        MoveState.ALLOCATED,
+        confirm_effect=EffectName.RECEIVER_ADD,
+        fields=_active_fields(dax, record.new_path),
+        note="new path active on the receiver",
+    )
+    return _drive_add(
+        record,
+        evidence,
+        config,
+        effect=EffectName.RECEIVER_ADD,
+        participant=Participant.RECEIVER,
+        device_path=record.new_path,
+        dax=dax,
+        intent_state=MoveState.ALLOCATED,
+        rollback_step=RollbackStep.NONE,
+        on_active=on_active,
+        on_persistent_failure=Persist(
+            MoveState.ROLLING_BACK,
+            RollbackStep.RELEASE_RECEIVER,
+            note="receiver add failed persistently; releasing the receiver path",
+        ),
     )

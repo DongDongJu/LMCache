@@ -23,6 +23,7 @@ import logging
 # Third Party
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -57,6 +58,19 @@ _SIZE_FIELDS: tuple[str, ...] = (
     "requested_size_gib",
     "granted_size_gib",
 )
+
+
+class PoolBudgetSpec(BaseModel):
+    """Body of ``POST /__test/reset`` and ``POST /__test/pool_budget``.
+
+    Attributes:
+        pool_budget_gib: Maximum global assigned runtime GiB an allocation may
+            reach; ``null`` (the default) means unlimited.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    pool_budget_gib: int | None = Field(default=None, ge=0)
 
 
 class ResponseDropped(Exception):
@@ -150,9 +164,14 @@ def build_public_app(
 
     @app.post(ALLOCATIONS_PATH, response_model=None)
     async def allocate(body: AllocationRequest, request: Request) -> JSONResponse:
-        fault = faults.take("allocate")
+        # Pool admission precedes injected behaviour: a request the budget
+        # refuses consumes no fault and hits no barrier, so faults always
+        # target a request the pool would serve.
+        admitted = await state.pool_admits(body.request_size_gib)
+        fault = faults.take("allocate") if admitted else None
         _raise_if_fault_rejects(fault)
-        await barriers.wait("allocate", "before")
+        if admitted:
+            await barriers.wait("allocate", "before")
         result = await state.allocate(
             body.request_id, body.target_node, body.request_size_gib
         )
@@ -206,10 +225,21 @@ def build_admin_app(
         )
 
     @app.post("/__test/reset", response_model=None)
-    async def reset() -> JSONResponse:
+    async def reset(request: Request) -> JSONResponse:
+        # The body is optional: an empty body resets to an unlimited pool.
+        raw = await request.body()
+        try:
+            spec = PoolBudgetSpec.model_validate_json(raw) if raw else PoolBudgetSpec()
+        except ValidationError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=422)
         barriers.release_all()
         faults.clear()
-        await state.reset()
+        await state.reset(pool_budget_gib=spec.pool_budget_gib)
+        return JSONResponse(await state_view())
+
+    @app.post("/__test/pool_budget", response_model=None)
+    async def set_pool_budget(spec: PoolBudgetSpec) -> JSONResponse:
+        await state.set_pool_budget(spec.pool_budget_gib)
         return JSONResponse(await state_view())
 
     @app.get("/__test/state", response_model=None)

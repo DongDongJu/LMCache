@@ -75,8 +75,9 @@ curl -s -X POST http://127.0.0.1:18080/api/v2/apps/lmcache/allocations \
 | Route | Purpose |
 |-------|---------|
 | `GET /__test/health` | `{"status":"ok","fixture":..., "seq": <last audit seq>}` |
-| `POST /__test/reset` | Reload fixture, clear faults/barriers/audit, rewrite state file; returns state |
-| `GET /__test/state` | Nodes, devices (role/state), per-node and global GiB accounting, seen request IDs, faults, barriers |
+| `POST /__test/reset` | Reload fixture, clear faults/barriers/audit, rewrite state file; returns state. Optional body `{"pool_budget_gib": N}` applies a pool budget (default: unlimited) |
+| `POST /__test/pool_budget` | `{"pool_budget_gib": N}` or `{"pool_budget_gib": null}` (unlimited): the global assigned runtime GiB an allocation may reach; a request that would exceed it is refused 409 before any fault or barrier and mutates nothing. A deallocation frees budget |
+| `GET /__test/state` | Nodes, devices (role/state), per-node and global GiB accounting, `pool_budget_gib`, seen request IDs, faults, barriers |
 | `GET /__test/audit?after_seq=N` | Ordered `request` / `response` / `mutation` records with strictly increasing `seq` |
 | `POST /__test/faults` | Install a `FaultSpec` (replaces one with the same operation+mode) |
 | `DELETE /__test/faults` | Clear all faults |
@@ -102,6 +103,12 @@ operation that pass schema validation.
 | `wrong_size` | Mutate; every size field set to `size_gib_override` |
 | `invalid_path` | Mutate; `device_path` replaced by `path_override` |
 | `insufficient_capacity` | Respond 409; no mutation even if a device is free |
+
+The E2E harness resets the mock with `pool_budget_gib` equal to the fixture's
+initially assigned total (64 GiB): the coordinator tries to *grow* the HIGH
+receiver before moving a donor device, and with an exhausted pool that probe
+is refused (`NOT_SERVED`) so every move scenario keeps its exact
+drain/evict/deallocate/allocate sequence. Grow scenarios raise the budget.
 
 ## What it does not simulate
 

@@ -49,12 +49,23 @@ def _barrier_hit(harness: Harness, name: str) -> bool:
 
 
 def _no_posts(harness: Harness) -> None:
+    """No POST at all: the coordinator never even reached a proposal."""
     assert harness.scenario_posts() == [], harness.scenario_posts()
     assert harness.allocator_posts() == [], harness.allocator_posts()
 
 
+def _no_move_posts(harness: Harness) -> None:
+    """No MOVE POST: at most the receiver's refused GROW probe was issued."""
+    assert harness.scenario_posts() == [], harness.scenario_posts()
+    assert harness.move_allocator_posts() == [], harness.allocator_posts()
+    assert harness.allocator.state()["global"]["assigned_runtime_gib"] == 64
+    for record in harness.memcoord.client.journal()["history"]:
+        assert record["kind"] == "grow" and record["outcome"] == "NOT_SERVED"
+
+
 def _outside_posts(harness: Harness) -> list[str]:
-    return [r["operation"] for r in harness.allocator_posts()]
+    """Outside operations of the MOVE (the refused GROW probe excluded)."""
+    return [r["operation"] for r in harness.move_allocator_posts()]
 
 
 def _mp_posts(harness: Harness) -> list[tuple[str, str]]:
@@ -121,7 +132,9 @@ def test_eligibility_faults_cause_zero_mutation(harness: Harness, fault: dict) -
     harness.scenario.faults(fault)
     harness.memcoord.start()
     harness.memcoord.client.wait_cycles(6, timeout=60)
-    _no_posts(harness)
+    # A donor-side fault leaves the receiver HIGH: its GROW probe is refused
+    # by the exhausted pool and nothing else may follow.
+    _no_move_posts(harness)
     assert harness.memcoord.client.active_move() is None
 
 
@@ -154,7 +167,7 @@ def test_adapter_gate(harness: Harness, adapters: int) -> None:
     harness.scenario.faults({"mp": {"mp-donor": {"adapters": adapters}}})
     harness.memcoord.start()
     harness.memcoord.client.wait_cycles(6, timeout=60)
-    _no_posts(harness)
+    _no_move_posts(harness)
 
 
 def test_ownership_gate_without_approved_runtime_path(harness: Harness) -> None:
@@ -171,12 +184,17 @@ def test_ownership_gate_without_approved_runtime_path(harness: Harness) -> None:
         timeout=5,
     )
     assert response.status_code < 300, response.text
+    # The deallocation freed pool room; keep the pool exhausted so the
+    # receiver's GROW probe is refused and the ownership gate is what is
+    # under test.
+    harness.set_pool_budget(0)
     setup_posts = len(harness.allocator_posts())
 
     harness.memcoord.start()
-    harness.memcoord.client.wait_cycles(6, timeout=60)
+    harness.memcoord.client.wait_cycles(8, timeout=60)
     assert harness.scenario_posts() == []
-    assert len(harness.allocator_posts()) == setup_posts
+    harness.grow_probe()
+    assert len(harness.move_allocator_posts()) == setup_posts
     status = harness.memcoord.client.status()
     assert status["inventory"] == []
     assert DONOR_RUNTIME in status["last_cycle"]["discovery"]["skipped"]
@@ -206,8 +224,8 @@ def test_live_ratio_mismatch(harness: Harness) -> None:
         },
     )
     harness.memcoord.start()
-    harness.memcoord.client.wait_cycles(6, timeout=60)
-    _no_posts(harness)
+    harness.memcoord.client.wait_cycles(8, timeout=60)
+    _no_move_posts(harness)
     rejections = harness.memcoord.client.status()["last_cycle"]["rejections"]
     assert any(r["reason"] == "live_ratio_mismatch" for r in rejections), rejections
 
@@ -307,7 +325,7 @@ def test_delayed_capacity_defers_complete(harness: Harness) -> None:
     harness.memcoord.seed_inventory()
     harness.scenario.faults({"coordinator": {"delayed_capacity_seconds": 6.0}})
     harness.memcoord.start()
-    move = harness.memcoord.client.wait_state({"ALLOCATED"}, timeout=90)
+    move = harness.memcoord.client.wait_state({"ALLOCATED"}, timeout=120)
     receiver_added = move["effects"].get("receiver_add", {}).get("confirmed", False)
     if not receiver_added:
         wait_until(
@@ -341,7 +359,7 @@ def test_allocation_failure_restores_donor(harness: Harness) -> None:
     move = harness.memcoord.client.wait_terminal(timeout=120)
     _assert_donor_restored(harness, move)
     assert _outside_posts(harness) == ["deallocate", "allocate", "allocate"]
-    assert harness.allocator_posts()[2]["body"]["target_node"] == DONOR_IP
+    assert harness.move_allocator_posts()[2]["body"]["target_node"] == DONOR_IP
     assert _mp_posts(harness) == [
         ("mp-donor", "drain"),
         ("mp-donor", "evict"),
@@ -358,7 +376,9 @@ def test_no_receiver_local_match_fails_without_other_size_or_node(
     move = harness.memcoord.client.wait_terminal(timeout=120)
     _assert_donor_restored(harness, move)
     bodies = [
-        r["body"] for r in harness.allocator_posts() if r["operation"] == "allocate"
+        r["body"]
+        for r in harness.move_allocator_posts()
+        if r["operation"] == "allocate"
     ]
     assert (
         bodies[0]["target_node"] == RECEIVER_IP and bodies[0]["request_size_gib"] == 64
@@ -406,7 +426,7 @@ def test_allocation_wrong_echo_releases_and_restores(harness: Harness) -> None:
         "deallocate",
         "allocate",
     ]
-    release = harness.allocator_posts()[2]["body"]
+    release = harness.move_allocator_posts()[2]["body"]
     assert (
         release["target_node"] == RECEIVER_IP
         and release["device_path"] == RECEIVER_RUNTIME
@@ -637,7 +657,7 @@ def test_crash_recovery_at_every_effect(
         # Always let the parked request finish before the next reset.
         admin.release("crash")
     harness.memcoord.start()
-    move = harness.memcoord.client.wait_terminal(timeout=120)
+    move = harness.memcoord.client.wait_terminal(timeout=150)
     outside = _outside_posts(harness)
     assert outside.count("deallocate") <= 1 or move["outcome"] == "ROLLED_BACK", outside
     assert outside.count("allocate") <= 1 or move["outcome"] == "ROLLED_BACK", outside
@@ -691,3 +711,63 @@ def test_scaling_down_and_up_preserves_journal_and_inventory(
     assert _stable(after["inventory"]) == _stable(before["inventory"])
     assert after["initialized"] is True
     _no_posts(harness)
+
+
+# -- grow before move --------------------------------
+
+
+def test_pool_exhausted_falls_back_to_donor_move(harness: Harness) -> None:
+    """The receiver's GROW is refused by the exhausted pool (``NOT_SERVED``,
+    zero side effects, no cooldown); the very next saga is the donor move."""
+    harness.memcoord.seed_inventory()
+    harness.memcoord.start()
+    history = harness.memcoord.client.wait_history(2, timeout=150)
+    grow, move = history
+    assert grow["kind"] == "grow" and grow["state"] == "COMPLETE"
+    assert grow["outcome"] == "NOT_SERVED"
+    assert list(grow["effects"]) == ["allocate"]
+    allocate = grow["effects"]["allocate"]
+    assert allocate["dispatched"] is True and allocate["confirmed"] is False
+    assert allocate["error"] == "explicit failure 409"
+    assert allocate["failure"] == "explicit"
+    assert allocate["before_paths"] == []
+    assert grow["new_path"] == "" and grow["donor"]["instance_id"] == ""
+    assert move["kind"] == "move" and move["outcome"] == "SUCCEEDED"
+    assert move["donor"]["instance_id"] == "mp-donor"
+    assert move["receiver"]["instance_id"] == "mp-receiver"
+
+    # One refused probe, then the move's two outside POSTs; distinct ids.
+    posts = harness.allocator_posts()
+    assert [r["operation"] for r in posts] == ["allocate", "deallocate", "allocate"]
+    probe = posts[0]["body"]
+    assert probe["request_id"] == grow["allocation_request_id"]
+    assert probe["target_node"] == RECEIVER_IP and probe["request_size_gib"] == 64
+    assert posts[2]["body"]["request_id"] == move["allocation_request_id"]
+    assert len({r["body"]["request_id"] for r in posts}) == 3
+    responses = [
+        r
+        for r in harness.allocator.audit()
+        if r["kind"] == "response" and r["request_id"] == probe["request_id"]
+    ]
+    assert [r["status_code"] for r in responses] == [409]
+    # The refused probe mutated nothing at the allocator.
+    mutations = [r for r in harness.allocator.audit() if r["kind"] == "mutation"]
+    assert [(m["operation"], m["device_path"]) for m in mutations] == [
+        ("deallocate", DONOR_RUNTIME),
+        ("allocate", RECEIVER_RUNTIME),
+    ]
+    assert _mp_posts(harness) == [
+        ("mp-donor", "drain"),
+        ("mp-donor", "evict"),
+        ("mp-receiver", "add"),
+    ]
+    journal = harness.memcoord.client.journal()
+    # No cooldown after NOT_SERVED (the move started well within the 10 s
+    # cooldown), only a per-worker grow backoff.
+    assert move["created_at"] - grow["updated_at"] < 10.0
+    assert journal["grow_backoffs"][RECEIVER_IP] > grow["updated_at"]
+    assert len(journal["cooldowns"]) == 2
+    counters = harness.memcoord.client.status()["counters"]
+    assert counters["not_served"] == 1 and counters["succeeded"] == 1
+    assert counters["grown"] == 0 and counters["proposed"] == 2
+    _conserved(harness)

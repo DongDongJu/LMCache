@@ -707,6 +707,75 @@ def test_fault_insufficient_capacity(public: TestClient, admin: TestClient) -> N
     assert node_accounting(admin, NODE_197)["free_runtime_gib"] == 128
 
 
+def test_pool_budget_refuses_without_mutation_and_frees_on_deallocation(
+    public: TestClient, admin: TestClient
+) -> None:
+    assert admin_state(admin)["pool_budget_gib"] is None
+    view = admin.post("/__test/pool_budget", json={"pool_budget_gib": 64}).json()
+    assert view["pool_budget_gib"] == 64
+    # 64 GiB already assigned: another 64 GiB is refused although free
+    # devices exist on the node, and nothing changes.
+    before = admin_state(admin)
+    response = public.post(ALLOCATIONS_PATH, json=allocation_body("budget-1"))
+    assert response.status_code == 409
+    assert "pool budget" in response.json()["error"]
+    after = admin_state(admin)
+    assert after["nodes"] == before["nodes"] and after["global"] == before["global"]
+    assert "budget-1" in seen_request_ids(admin)
+    assert (
+        public.post(ALLOCATIONS_PATH, json=allocation_body("budget-1")).status_code
+        == 409
+    )
+    # Deallocating frees budget: the next allocation is served.
+    assert (
+        public.post(DEALLOCATIONS_PATH, json=deallocation_body("free-1")).status_code
+        == 200
+    )
+    response = public.post(ALLOCATIONS_PATH, json=allocation_body("budget-2"))
+    assert response.status_code == 200
+    assert global_accounting(admin)["assigned_runtime_gib"] == 64
+    # Unlimited again.
+    admin.post("/__test/pool_budget", json={"pool_budget_gib": None})
+    assert (
+        public.post(ALLOCATIONS_PATH, json=allocation_body("budget-3")).status_code
+        == 200
+    )
+    assert (
+        admin.post("/__test/pool_budget", json={"pool_budget_gib": -1}).status_code
+        == 422
+    )
+
+
+def test_pool_budget_refusal_consumes_no_fault_and_reset_applies_a_budget(
+    public: TestClient, admin: TestClient
+) -> None:
+    admin.post("/__test/pool_budget", json={"pool_budget_gib": 64})
+    install_fault(
+        admin, operation="allocate", mode="wrong_echo", echo_field="request_id"
+    )
+    assert (
+        public.post(ALLOCATIONS_PATH, json=allocation_body("refused")).status_code
+        == 409
+    )
+    faults = admin_state(admin)["faults"]
+    assert isinstance(faults, dict)
+    assert len(faults["active"]) == 1, "fault must survive"
+    admin.post("/__test/pool_budget", json={"pool_budget_gib": None})
+    response = public.post(ALLOCATIONS_PATH, json=allocation_body("served"))
+    assert response.status_code == 200
+    assert response.json()["request_id"] == "wrong-served"
+    # Reset clears the budget unless the body sets one.
+    admin.post("/__test/pool_budget", json={"pool_budget_gib": 0})
+    assert admin.post("/__test/reset").json()["pool_budget_gib"] is None
+    view = admin.post("/__test/reset", json={"pool_budget_gib": 64}).json()
+    assert view["pool_budget_gib"] == 64
+    assert view["global"]["assigned_runtime_gib"] == 64
+    assert (
+        public.post(ALLOCATIONS_PATH, json=allocation_body("after-reset")).status_code
+        == 409
+    )
+
+
 def test_fault_count_and_clear(public: TestClient, admin: TestClient) -> None:
     install_fault(admin, operation="allocate", mode="insufficient_capacity", count=2)
     assert public.post(ALLOCATIONS_PATH, json=allocation_body("n1")).status_code == 409

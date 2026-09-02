@@ -578,8 +578,26 @@ class ManagedAllocation(BaseModel):
         )
 
 
+class MoveKind(str, Enum):
+    """Which saga a :class:`MoveRecord` drives.
+
+    ``MOVE`` re-homes one managed device from a donor to a receiver; ``GROW``
+    allocates new capacity for a receiver without any donor (see the design
+    doc, "Grow before move"). A journal written before this field existed
+    loads as ``MOVE``.
+    """
+
+    MOVE = "move"
+    GROW = "grow"
+
+
 class MoveState(str, Enum):
-    """Saga states. ``COMPLETE`` and ``BLOCKED`` are terminal."""
+    """Saga states. ``COMPLETE`` and ``BLOCKED`` are terminal.
+
+    A ``GROW`` saga only ever passes through ``SELECTED -> ALLOCATING ->
+    ALLOCATED -> COMPLETE`` (``ROLLING_BACK`` with ``RELEASE_RECEIVER`` |
+    ``BLOCKED``).
+    """
 
     SELECTED = "SELECTED"
     DONOR_DRAINING = "DONOR_DRAINING"
@@ -597,11 +615,17 @@ TERMINAL_MOVE_STATES = frozenset({MoveState.COMPLETE, MoveState.BLOCKED})
 
 
 class MoveOutcome(str, Enum):
-    """Terminal outcome; ``PENDING`` until ``state == COMPLETE``."""
+    """Terminal outcome; ``PENDING`` until ``state == COMPLETE``.
+
+    ``NOT_SERVED`` is ``GROW`` only: the allocator explicitly refused the
+    allocation and provably assigned nothing, so nothing changed, no
+    cooldown applies, and only a per-worker grow backoff is recorded.
+    """
 
     PENDING = "PENDING"
     SUCCEEDED = "SUCCEEDED"
     ROLLED_BACK = "ROLLED_BACK"
+    NOT_SERVED = "NOT_SERVED"
 
 
 class RollbackStep(str, Enum):
@@ -633,6 +657,22 @@ ScalarJSON = str | int | float | bool
 """Scalar JSON values a confirmed response is reduced to."""
 
 
+class EffectFailure(str, Enum):
+    """Typed class of an outside effect's ``error``.
+
+    ``NONE`` while no explicit outcome is recorded (including the ambiguous
+    dispatched-unknown case); ``EXPLICIT`` when the service answered with a
+    non-2xx status (``OutsideExplicitFailure``); ``CONTRACT`` when a 2xx body
+    violated the frozen contract (``OutsideContractError``), in which case
+    the effect may have been applied. ``MOVE`` decisions never consult it;
+    ``GROW`` uses it to tell ``NOT_SERVED`` from ``BLOCKED``.
+    """
+
+    NONE = "none"
+    EXPLICIT = "explicit"
+    CONTRACT = "contract"
+
+
 class EffectRecord(BaseModel):
     """Durable intent/confirmation of one side effect.
 
@@ -647,11 +687,18 @@ class EffectRecord(BaseModel):
             ``response`` nor an ``error`` after a restart has an unknown
             outcome and blocks the move; one that is not dispatched was
             provably never sent.
-        attempts: POSTs issued for DAX effects (outside effects: at most 1).
+        attempts: POSTs issued. Adds are bounded by ``dax_add_max_attempts``.
+            An outside effect issues at most ``get_retry_attempts`` POSTs, of
+            which at most one may have reached the service: a re-issue
+            happens only after a connect failure, which delivered nothing
+            and leaves ``dispatched`` false.
         confirmed: Whether the effect was confirmed against status.
         confirmed_at: When confirmation was persisted.
         response: Documented response fields, once received.
         error: Last error text.
+        failure: Typed class of ``error`` for outside effects; see
+            :class:`EffectFailure`. A ledger written before this field
+            existed loads with ``NONE``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -666,25 +713,50 @@ class EffectRecord(BaseModel):
     confirmed_at: float = 0.0
     response: dict[str, ScalarJSON] = Field(default_factory=dict)
     error: str = ""
+    failure: EffectFailure = EffectFailure.NONE
+
+
+NO_DONOR: Final = InstanceIdentity(
+    instance_id="", registration_time=0.0, endpoint="", worker_ip=""
+)
+"""Sentinel donor identity of a ``GROW`` record: a saga with no donor.
+
+Every donor-specific field of such a record is empty (``old_path=""``,
+``old_device_index=-1``, ``donor_capacity_bytes=0`` ...); consumers ask
+:attr:`MoveRecord.has_donor` instead of comparing against this value.
+"""
 
 
 class MoveRecord(BaseModel):
-    """The durable record of one move (see the design doc for the saga).
+    """The durable record of one saga (see the design doc for the states).
+
+    A ``MOVE`` record (the default ``kind``) describes one device moving from
+    a donor to a receiver. A ``GROW`` record has no donor: ``donor`` is
+    :data:`NO_DONOR`, ``donor_capacity_bytes`` is ``0``, ``old_path`` is
+    ``""``, ``old_device_index`` is ``-1``, ``old_slot_capacity_bytes`` is
+    ``0``, ``deallocation_request_id`` and ``restore_request_id`` are ``""``,
+    and ``old_map_size_bytes`` / ``allocation_size_gib`` carry the requested
+    size so the receiver add and the inventory entry read them unchanged.
 
     Attributes:
         move_id: Unique id.
         state: Current :class:`MoveState`.
+        kind: Which saga this record drives; see :class:`MoveKind`.
         outcome: :class:`MoveOutcome`; set when ``state == COMPLETE``.
         rollback_step: Sub-state while ``ROLLING_BACK``.
-        donor: Donor identity snapshot at selection.
-        receiver: Receiver identity snapshot at selection.
+        donor: Donor identity snapshot at selection (``NO_DONOR`` for GROW).
+        receiver: Receiver identity snapshot at selection. A GROW rebinds it
+            when the receiver re-registers on the same worker after the
+            allocation (see the design doc).
         donor_capacity_bytes: Donor ``l2/dax`` capacity at selection.
         receiver_capacity_bytes: Receiver ``l2/dax`` capacity at selection.
-        old_path: Donor device path being moved.
+        old_path: Donor device path being moved (``""`` for GROW).
         old_device_index: Donor DAX index of ``old_path`` at selection.
-        old_map_size_bytes: DAX map size of ``old_path``.
+        old_map_size_bytes: DAX map size of ``old_path`` (MOVE) / map size to
+            add on the receiver (GROW): ``allocation_size_gib * GIB``.
         old_slot_capacity_bytes: Slot capacity of ``old_path``.
-        allocation_size_gib: Outside allocation size of ``old_path``.
+        allocation_size_gib: Outside allocation size of ``old_path`` (MOVE) /
+            requested size (GROW).
         deallocation_request_id: Outside id of the donor deallocation.
         allocation_request_id: Outside id of the receiver allocation.
         release_request_id: Outside id of a rollback receiver release.
@@ -696,6 +768,11 @@ class MoveRecord(BaseModel):
         new_device_index: Receiver DAX index after add.
         new_slot_capacity_bytes: Slot capacity of ``new_path`` after add.
         restored_path: Donor path returned by a rollback allocation.
+        receiver_rebinds: Times a GROW rebound ``receiver`` to an instance
+            that re-registered on the same worker after the allocation, at
+            most ``recovery.GROW_MAX_RECEIVER_REBINDS`` per saga (the next
+            loss blocks). ``0`` for a MOVE and for a record written before
+            this field existed.
         effects: Effect ledger keyed by :class:`EffectName` value.
         drain_started_at: When the donor drain intent was persisted.
         capacity_converged: Whether the usage view reflected the move.
@@ -709,6 +786,7 @@ class MoveRecord(BaseModel):
 
     move_id: str
     state: MoveState
+    kind: MoveKind = MoveKind.MOVE
     outcome: MoveOutcome = MoveOutcome.PENDING
     rollback_step: RollbackStep = RollbackStep.NONE
     donor: InstanceIdentity
@@ -730,6 +808,7 @@ class MoveRecord(BaseModel):
     new_device_index: int = -1
     new_slot_capacity_bytes: int = 0
     restored_path: str = ""
+    receiver_rebinds: int = 0
     effects: dict[str, EffectRecord] = Field(default_factory=dict)
     drain_started_at: float = 0.0
     capacity_converged: bool = False
@@ -747,9 +826,38 @@ class MoveRecord(BaseModel):
         """Whether no further action will ever be taken."""
         return self.state in TERMINAL_MOVE_STATES
 
+    @property
+    def has_donor(self) -> bool:
+        """Whether the saga has a donor (``MOVE``); ``False`` for ``GROW``."""
+        return self.kind is MoveKind.MOVE
+
 
 class MoveCounters(BaseModel):
-    """Minimal persisted counters."""
+    """Minimal persisted counters.
+
+    ``proposed``, ``succeeded``, ``rolled_back`` and ``blocked`` count every
+    saga regardless of kind; ``grown`` is the GROW subset of ``succeeded``.
+
+    Attributes:
+        proposed: Sagas proposed by the policy.
+        succeeded: Sagas that completed ``SUCCEEDED``.
+        rolled_back: Sagas that completed ``ROLLED_BACK``.
+        blocked: Sagas that entered ``BLOCKED``.
+        not_served: GROW sagas that completed ``NOT_SERVED`` (the allocator
+            refused; nothing changed). A journal written before this field
+            existed loads with ``0``.
+        grown: GROW sagas that completed ``SUCCEEDED``. A journal written
+            before this field existed loads with ``0``.
+
+    Compatibility is forward only: a journal written before GROW existed
+    loads here (every added field is defaulted). Every save of this build
+    writes the added keys, and the previous build's models forbid unknown
+    keys, so a journal saved by this build does not load in the previous
+    build even when no GROW ever ran; downgrading requires clearing the
+    journal first. Attach orchestration keeps its success count in memory
+    (see the controller) because attaching is idempotent, not for
+    compatibility.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -757,6 +865,8 @@ class MoveCounters(BaseModel):
     succeeded: int = 0
     rolled_back: int = 0
     blocked: int = 0
+    not_served: int = 0
+    grown: int = 0
 
 
 JOURNAL_SCHEMA_VERSION = 1
@@ -771,9 +881,14 @@ class JournalDocument(BaseModel):
             a normal restart never repeats adoption.
         inventory: Managed allocations.
         cooldowns: Identity key -> wall-clock time until which the instance
-            may not participate in a move.
-        active_move: The single in-progress move, if any.
-        history: Recent terminal moves, newest last (bounded).
+            may not participate in a saga (MOVE or GROW).
+        grow_backoffs: ``worker_ip`` -> wall-clock time until which no GROW
+            is proposed for that worker because the allocator explicitly
+            refused one. Never consulted by candidate ranking, so the
+            worker's receiver stays a MOVE candidate. Absent in journals
+            written before GROW existed (loads as empty).
+        active_move: The single in-progress saga, if any.
+        history: Recent terminal sagas, newest last (bounded).
         counters: See :class:`MoveCounters`.
     """
 
@@ -783,6 +898,7 @@ class JournalDocument(BaseModel):
     initialized: bool = False
     inventory: list[ManagedAllocation] = Field(default_factory=list)
     cooldowns: dict[str, float] = Field(default_factory=dict)
+    grow_backoffs: dict[str, float] = Field(default_factory=dict)
     active_move: MoveRecord | None = None
     history: list[MoveRecord] = Field(default_factory=list)
     counters: MoveCounters = Field(default_factory=MoveCounters)

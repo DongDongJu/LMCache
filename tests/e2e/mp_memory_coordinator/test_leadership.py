@@ -177,7 +177,9 @@ def test_lease_handoff_continues_the_move_with_single_writer(
         "SUCCEEDED",
         "ROLLED_BACK",
     )
-    outside = [r["operation"] for r in harness.allocator_posts()]
+    outside = [
+        r["operation"] for r in harness.move_allocator_posts(follower.client.journal())
+    ]
     assert outside.count("deallocate") <= 1 and outside.count("allocate") <= 1
     request_ids = [r["body"]["request_id"] for r in harness.allocator_posts()]
     assert len(request_ids) == len(set(request_ids))
