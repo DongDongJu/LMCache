@@ -73,6 +73,24 @@ the DAX device, but they are unreachable after the LMCache server restarts.
       "num_load_workers": 4
     }'
 
+.. code-block:: bash
+
+    # Hotplug-only form: start with no Device-DAX device at all.
+    # The adapter is created and healthy with zero capacity, and devices are
+    # attached later through /reconfigure/dax/add (by an operator or by the
+    # MP Memory Coordinator).
+    --l2-adapter '{
+      "type": "dax",
+      "devices": [],
+      "slot_bytes": 268435456,
+      "hotplug_enabled": true
+    }'
+
+A server started in the hotplug-only form declares an ``l2/dax`` compartment
+with ``capacity_bytes: 0`` to the MP Coordinator, so its ``usage_ratio`` is
+``null`` until the first device is added. The MP Memory Coordinator therefore
+does not rank it as a donor or a receiver until then.
+
 Runtime management uses JSON bodies because DAX paths contain slashes. See the
 :doc:`Device-DAX backend guide </kv_cache/storage_backends/dax>` for complete
 examples. These routes use StorageManager's generic L2 adapter reconfiguration

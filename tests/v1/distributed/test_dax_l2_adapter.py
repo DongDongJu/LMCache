@@ -17,6 +17,7 @@ import torch
 # First Party
 from lmcache.lmcache_native import Bitmap
 from lmcache.v1.distributed.api import (
+    CapacitySnapshot,
     MemoryLayoutDesc,
     ObjectKey,
     PrefetchRequestSpec,
@@ -50,6 +51,7 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
 )
+from lmcache.v1.mp_observability.event import Event
 from lmcache.v1.mp_observability.event_bus import EventBus
 from lmcache.v1.platform import consume_fd
 
@@ -493,9 +495,9 @@ class _RecordingBus:
     """Captures capacity-change events instead of publishing them."""
 
     def __init__(self) -> None:
-        self.events: list[object] = []
+        self.events: list[Event] = []
 
-    def publish(self, event: object) -> None:
+    def publish(self, event: Event) -> None:
         self.events.append(event)
 
 
@@ -1005,3 +1007,130 @@ def test_storage_manager_dax_adapter_uses_global_l2_eviction(tmp_path):
         assert adapter.get_usage().usage_fraction == pytest.approx(1.0)
     finally:
         sm.close()
+
+
+def test_dax_adapter_from_dict_starts_with_zero_devices(tmp_path):
+    """The hotplug-only form: no device at startup, capacity arrives via add."""
+    slot_bytes = 2048
+    config = DaxL2AdapterConfig.from_dict(
+        {"slot_bytes": slot_bytes, "hotplug_enabled": True, "devices": []}
+    )
+    assert config.devices == []
+    assert config.device_path == ""
+    adapter = DaxL2Adapter(config)
+    try:
+        status = adapter.report_status()
+        assert status["is_healthy"] is True
+        assert status["hotplug_enabled"] is True
+        assert status["num_devices"] == 0
+        assert status["max_dax_size_bytes"] == 0
+        assert status["device_path"] == ""
+        hotplug = adapter.hotplug_status()
+        assert hotplug["devices"] == []
+        assert hotplug["total_capacity_bytes"] == 0
+        assert adapter.get_usage().total_capacity_bytes == 0
+
+        device_path = tmp_path / "late_dax.bin"
+        with open(device_path, "wb") as fout:
+            fout.truncate(slot_bytes * 4)
+        added = adapter.hotplug_add_device(str(device_path), slot_bytes * 4)
+        assert added["status"] == "ok"
+        assert added["device"]["state"] == "active"
+        assert added["device"]["index"] == 0
+
+        hotplug = adapter.hotplug_status()
+        assert [d["state"] for d in hotplug["devices"]] == ["active"]
+        assert hotplug["total_capacity_bytes"] == slot_bytes * 4
+        assert adapter.report_status()["max_dax_size_bytes"] == slot_bytes * 4
+    finally:
+        adapter.close()
+
+
+def test_dax_adapter_from_dict_rejects_zero_devices_without_hotplug():
+    with pytest.raises(ValueError, match="hotplug_enabled"):
+        DaxL2AdapterConfig.from_dict(
+            {"slot_bytes": 2048, "hotplug_enabled": False, "devices": []}
+        )
+
+
+def test_storage_manager_starts_dax_adapter_with_zero_devices(tmp_path):
+    """A DAX adapter with no devices is created, reconfigurable, and declares
+    a zero-capacity ``l2/dax`` compartment until the first device is added."""
+    slot_bytes = 2048
+    storage_config = StorageManagerConfig(
+        l1_manager_config=L1ManagerConfig(
+            memory_config=L1MemoryManagerConfig(
+                size_in_bytes=1 << 20,
+                use_lazy=False,
+                init_size_in_bytes=1 << 20,
+                align_bytes=0x1000,
+            ),
+            write_ttl_seconds=60,
+            read_ttl_seconds=60,
+        ),
+        eviction_config=EvictionConfig(eviction_policy="noop"),
+        l2_adapter_config=L2AdaptersConfig(
+            [
+                DaxL2AdapterConfig(
+                    devices=[],
+                    hotplug_enabled=True,
+                    slot_bytes=slot_bytes,
+                )
+            ]
+        ),
+    )
+    sm = StorageManager(storage_config)
+    bus = _RecordingBus()
+    sm._event_bus = cast(EventBus, bus)
+    try:
+        status = sm.report_status()
+        assert status["is_healthy"] is True
+        assert status["num_l2_adapters"] == 1
+        dax = status["l2_adapters"][0]
+        assert dax["type"] == "dax"
+        assert dax["is_healthy"] is True
+        assert dax["hotplug_enabled"] is True
+        assert dax["num_devices"] == 0
+        assert dax["max_dax_size_bytes"] == 0
+
+        reconf = sm.get_l2_adapter_reconfigure_status()
+        assert reconf["enabled"] is True
+        assert reconf["num_adapters"] == 1
+        assert reconf["adapters"][0]["status"]["devices"] == []
+        assert reconf["adapters"][0]["status"]["hotplug_enabled"] is True
+
+        sm.publish_capacity()
+        declared = _dax_capacity(bus.events[-1])
+        assert declared == 0
+
+        device_path = tmp_path / "late_dax.bin"
+        with open(device_path, "wb") as fout:
+            fout.truncate(slot_bytes * 4)
+        result = sm.reconfigure_l2_adapter(
+            0, "add", {"device_path": str(device_path), "size_bytes": slot_bytes * 4}
+        )
+        assert result["status"] == "ok"
+        assert result["device"]["state"] == "active"
+        assert result["adapter_index"] == 0
+
+        reconf = sm.get_l2_adapter_reconfigure_status()
+        devices = reconf["adapters"][0]["status"]["devices"]
+        assert [(d["device_path"], d["state"]) for d in devices] == [
+            (str(device_path), "active")
+        ]
+        assert sm.report_status()["l2_adapters"][0]["max_dax_size_bytes"] == (
+            slot_bytes * 4
+        )
+        assert _dax_capacity(bus.events[-1]) == slot_bytes * 4
+    finally:
+        sm.close()
+
+
+def _dax_capacity(event: Event) -> int:
+    """Return the ``l2/dax`` capacity declared by one capacity-changed event."""
+    snapshot: CapacitySnapshot = event.metadata["snapshot"]
+    modules = [
+        m for m in snapshot.modules if m.tier.name == "L2" and m.backend == "dax"
+    ]
+    assert len(modules) == 1, snapshot.modules
+    return int(modules[0].capacity_bytes)
