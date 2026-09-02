@@ -42,9 +42,9 @@ DROP_RESPONSE_STATE_KEY: str = "mock_drop_response"
 """``request.state`` flag a handler sets to have the middleware drop the
 response after its headers (``commit_then_drop``)."""
 
-STATUS_PATH: str = "/api/v2/lmcache"
-DEALLOCATIONS_PATH: str = "/api/v2/lmcache/deallocations"
-ALLOCATIONS_PATH: str = "/api/v2/lmcache/allocations"
+STATUS_PATH: str = "/api/v2/apps/lmcache"
+DEALLOCATIONS_PATH: str = "/api/v2/apps/lmcache/deallocations"
+ALLOCATIONS_PATH: str = "/api/v2/apps/lmcache/allocations"
 
 _ROUTE_OPERATIONS: dict[tuple[str, str], Operation] = {
     ("GET", STATUS_PATH): Operation.STATUS,

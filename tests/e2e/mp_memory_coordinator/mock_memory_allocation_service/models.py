@@ -26,7 +26,7 @@ ALLOCATION_RESPONSE_STATUS: str = "DONE"
 
 
 class DeallocationRequest(BaseModel):
-    """Exact request body of ``POST /api/v2/lmcache/deallocations``.
+    """Exact request body of ``POST /api/v2/apps/lmcache/deallocations``.
 
     Attributes:
         request_id: Caller-chosen identifier echoed back verbatim.
@@ -42,7 +42,7 @@ class DeallocationRequest(BaseModel):
 
 
 class AllocationRequest(BaseModel):
-    """Exact request body of ``POST /api/v2/lmcache/allocations``.
+    """Exact request body of ``POST /api/v2/apps/lmcache/allocations``.
 
     Attributes:
         request_id: Caller-chosen identifier echoed back verbatim.

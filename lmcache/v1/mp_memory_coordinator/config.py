@@ -38,7 +38,7 @@ class MPMemoryCoordinatorConfig:
         mp_coordinator_url: Base URL of the existing MP Coordinator. Only
             ``GET /instances`` and ``GET /instances/usage`` are called.
         memory_allocation_url: Base URL of the outside Memory Allocation
-            service (frozen ``/api/v2/lmcache`` API).
+            service (frozen ``/api/v2/apps/lmcache`` API).
         poll_interval_seconds: Seconds between observation cycles.
         stable_samples: Consecutive eligible samples with the same
             LOW/HIGH classification required before a move is proposed.

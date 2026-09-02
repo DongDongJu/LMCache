@@ -72,7 +72,7 @@ mutates one assigned path.
 Expected initial status for the topology above:
 
 ```bash
-curl -s $OUTSIDE_API_URL/api/v2/lmcache | jq
+curl -s $OUTSIDE_API_URL/api/v2/apps/lmcache | jq
 # {"192.168.0.40": ["/dev/dax-cxl/.../dax0.1"], "192.168.0.41": []}
 ```
 
@@ -262,7 +262,7 @@ Verify each contract point:
 ```bash
 J=$(curl -s localhost:9400/journal)
 echo "$J" | jq '.history[-1] | {old_path, new_path, released_size_gib, granted_size_gib, deallocation_request_id, allocation_request_id}'
-curl -s $OUTSIDE_API_URL/api/v2/lmcache | jq            # donor: [], receiver: [".../dax0.1"] on W2
+curl -s $OUTSIDE_API_URL/api/v2/apps/lmcache | jq            # donor: [], receiver: [".../dax0.1"] on W2
 curl -s http://$W1_IP:9000/reconfigure/dax/status | jq '.adapters[0].status.devices[] | {device_path, state}'   # dax0.1 = "removed" tombstone
 curl -s http://$W2_IP:9000/reconfigure/dax/status | jq '.adapters[0].status.devices[] | {device_path, state}'   # W2 dax0.1 = "active"
 lmcache query coordinator --url $COORD_URL --api usage   # donor 128 -> 64 GiB, receiver 64 -> 128 GiB
@@ -332,9 +332,9 @@ curl -s -X POST http://$W2_IP:9000/reconfigure/dax/remove -H 'content-type: appl
 curl -s -X POST http://$W2_IP:9000/reconfigure/dax/remove -H 'content-type: application/json' \
   -d '{"adapter_index":0,"device_path":"'$DAX_ROOT'/dax0.1","mode":"evict","force":false}'
 # 2. give it back to the pool, allocate the same size to the donor, attach the returned path
-curl -s -X POST $OUTSIDE_API_URL/api/v2/lmcache/deallocations -H 'content-type: application/json' \
+curl -s -X POST $OUTSIDE_API_URL/api/v2/apps/lmcache/deallocations -H 'content-type: application/json' \
   -d '{"request_id":"cleanup-shrink-1","target_node":"'$W2_IP'","device_path":"'$DAX_ROOT'/dax0.1"}'
-curl -s -X POST $OUTSIDE_API_URL/api/v2/lmcache/allocations -H 'content-type: application/json' \
+curl -s -X POST $OUTSIDE_API_URL/api/v2/apps/lmcache/allocations -H 'content-type: application/json' \
   -d '{"request_id":"cleanup-grow-1","target_node":"'$W1_IP'","request_size_gib":64,"mode":"devdax","purpose":"lmcache-dax","access":"exclusive"}'
 curl -s -X POST http://$W1_IP:9000/reconfigure/dax/add -H 'content-type: application/json' \
   -d '{"adapter_index":0,"device_path":"<returned path>","size":"64GiB"}'

@@ -8,7 +8,7 @@ deterministic test services:
 | Service | Package | Production-facing ports | Admin port |
 |---|---|---|---|
 | Scenario server (fake MP Coordinator + fake donor MP + fake receiver MP) | `scenario_server/` | 9300, 8081(+8181), 8082(+8182) | 9091 |
-| Strict mock Memory Allocation service (frozen `/api/v2/lmcache` API) | `mock_memory_allocation_service/` | 8080 | 9090 |
+| Strict mock Memory Allocation service (frozen `/api/v2/apps/lmcache` API) | `mock_memory_allocation_service/` | 8080 | 9090 |
 
 Both load the same immutable fixture `fixtures/two_server_local_dax.yaml`
 and share nothing else. `fixtures/golden/` holds the complete current JSON

@@ -721,7 +721,7 @@ class Harness:
 
     def outside_status(self) -> dict:
         response = requests.get(
-            f"{self.endpoints.allocator_public_url}/api/v2/lmcache", timeout=5
+            f"{self.endpoints.allocator_public_url}/api/v2/apps/lmcache", timeout=5
         )
         response.raise_for_status()
         return response.json()

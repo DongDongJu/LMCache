@@ -24,9 +24,9 @@ import requests
 
 pytestmark = pytest.mark.outside_api
 
-STATUS_PATH = "/api/v2/lmcache"
-DEALLOCATIONS_PATH = "/api/v2/lmcache/deallocations"
-ALLOCATIONS_PATH = "/api/v2/lmcache/allocations"
+STATUS_PATH = "/api/v2/apps/lmcache"
+DEALLOCATIONS_PATH = "/api/v2/apps/lmcache/deallocations"
+ALLOCATIONS_PATH = "/api/v2/apps/lmcache/allocations"
 
 DEALLOCATION_REQUEST_KEYS = {"request_id", "target_node", "device_path"}
 DEALLOCATION_RESPONSE_KEYS = {

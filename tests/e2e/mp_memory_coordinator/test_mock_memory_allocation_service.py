@@ -40,9 +40,9 @@ FIXTURE_PATH = (
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MODULE = "tests.e2e.mp_memory_coordinator.mock_memory_allocation_service"
 
-STATUS_PATH = "/api/v2/lmcache"
-DEALLOCATIONS_PATH = "/api/v2/lmcache/deallocations"
-ALLOCATIONS_PATH = "/api/v2/lmcache/allocations"
+STATUS_PATH = "/api/v2/apps/lmcache"
+DEALLOCATIONS_PATH = "/api/v2/apps/lmcache/deallocations"
+ALLOCATIONS_PATH = "/api/v2/apps/lmcache/allocations"
 
 NODE_196 = "192.0.2.40"
 NODE_197 = "192.0.2.41"

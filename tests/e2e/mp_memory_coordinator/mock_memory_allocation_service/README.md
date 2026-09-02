@@ -38,14 +38,14 @@ uv run pytest -q tests/e2e/mp_memory_coordinator/test_mock_memory_allocation_ser
 ## Public listener (frozen API only)
 
 ```bash
-curl -s http://127.0.0.1:18080/api/v2/lmcache | jq
+curl -s http://127.0.0.1:18080/api/v2/apps/lmcache | jq
 
-curl -s -X POST http://127.0.0.1:18080/api/v2/lmcache/deallocations \
+curl -s -X POST http://127.0.0.1:18080/api/v2/apps/lmcache/deallocations \
   -H 'content-type: application/json' \
   -d '{"request_id":"shrink-0001","target_node":"192.0.2.40",
        "device_path":"/dev/dax-cxl/lmcache-e2e--mp-196/dax0.1"}'
 
-curl -s -X POST http://127.0.0.1:18080/api/v2/lmcache/allocations \
+curl -s -X POST http://127.0.0.1:18080/api/v2/apps/lmcache/allocations \
   -H 'content-type: application/json' \
   -d '{"request_id":"grow-0001","target_node":"192.0.2.41","request_size_gib":64,
        "mode":"devdax","purpose":"lmcache-dax","access":"exclusive"}'
