@@ -6,7 +6,7 @@ metadata:
   name: lmcache-mp-memory-coordinator
 data:
   mp-memory-coordinator.yaml: |
-    mp_coordinator_url: http://lmcache-mp-coordinator:8000
+    mp_coordinator_url: http://lmcache-mp-coordinator:9300
     memory_allocation_url: http://memory-allocation-service:8080
     poll_interval_seconds: 10
     stable_samples: 3

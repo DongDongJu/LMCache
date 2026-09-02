@@ -88,7 +88,7 @@ class MPMemoryCoordinatorConfig:
             when the journal carries no initialization marker.
     """
 
-    mp_coordinator_url: str = "http://lmcache-mp-coordinator:8000"
+    mp_coordinator_url: str = "http://lmcache-mp-coordinator:9300"
     memory_allocation_url: str = "http://memory-allocation-service:8080"
     poll_interval_seconds: float = 10.0
     stable_samples: int = 3

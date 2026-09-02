@@ -35,8 +35,9 @@ spec:
             - name: http
               containerPort: 9400
           livenessProbe:
-            httpGet:
-              path: /healthz
+            # Preserve an intentionally inert corrupt-journal Pod for
+            # diagnosis; readiness and /healthz still report the failure.
+            tcpSocket:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10

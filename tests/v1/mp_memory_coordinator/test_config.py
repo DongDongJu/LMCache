@@ -17,7 +17,7 @@ from lmcache.v1.mp_memory_coordinator.config import (
 )
 
 _REQUIRED_DEFAULTS = {
-    "mp_coordinator_url": "http://lmcache-mp-coordinator:8000",
+    "mp_coordinator_url": "http://lmcache-mp-coordinator:9300",
     "memory_allocation_url": "http://memory-allocation-service:8080",
     "poll_interval_seconds": 10,
     "stable_samples": 3,

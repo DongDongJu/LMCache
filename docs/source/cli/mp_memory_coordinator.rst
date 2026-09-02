@@ -89,7 +89,7 @@ default; ``actuation_enabled`` is ``false`` unless set.
 
 .. code-block:: yaml
 
-   mp_coordinator_url: http://lmcache-mp-coordinator:8000
+   mp_coordinator_url: http://lmcache-mp-coordinator:9300
    memory_allocation_url: http://memory-allocation-service:8080
    poll_interval_seconds: 10
    stable_samples: 3
