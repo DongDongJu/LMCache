@@ -290,7 +290,8 @@ def _config(tmp_path: Path, **overrides: object) -> MPMemoryCoordinatorConfig:
         lease_duration_seconds=15.0,
         lease_renew_interval_seconds=5.0,
     )
-    fields.update(overrides)
+    for key, value in overrides.items():
+        fields[key] = value
     return config_from_mapping(fields)
 
 
@@ -324,6 +325,38 @@ def test_acquires_free_lease_with_bearer_token_and_renews(tmp_path: Path) -> Non
     # Renewal keeps the same holder and does not bump transitions.
     assert asyncio.run(elector.ensure_leader()) is True
     assert server.lease["spec"]["leaseTransitions"] == 1
+
+
+def test_projected_service_account_token_rotates_between_renewals(
+    tmp_path: Path,
+) -> None:
+    server = FakeLeaseServer()
+    clock = Clock()
+    config = _config(tmp_path)
+    elector = _elector(server, config, clock, "pod-a")
+
+    assert asyncio.run(elector.ensure_leader()) is True
+    assert server.tokens == ["Bearer secret-token", "Bearer secret-token"]
+
+    Path(config.kubernetes_token_path).write_text("rotated-token\n")
+    assert asyncio.run(elector.ensure_leader()) is True
+    assert server.tokens[-2:] == ["Bearer rotated-token", "Bearer rotated-token"]
+
+
+def test_unreadable_projected_service_account_token_loses_leadership(
+    tmp_path: Path,
+) -> None:
+    server = FakeLeaseServer()
+    clock = Clock()
+    config = _config(tmp_path)
+    elector = _elector(server, config, clock, "pod-a")
+    assert asyncio.run(elector.ensure_leader()) is True
+    requests_before = len(server.tokens)
+
+    Path(config.kubernetes_token_path).unlink()
+    assert asyncio.run(elector.ensure_leader()) is False
+    assert not elector.is_leader()
+    assert len(server.tokens) == requests_before
 
 
 def test_does_not_steal_a_live_lease_but_takes_an_expired_one(tmp_path: Path) -> None:

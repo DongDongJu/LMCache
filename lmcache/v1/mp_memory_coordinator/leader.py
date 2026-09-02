@@ -14,7 +14,7 @@ and expects the Lease to be pre-created by the manifests.
 """
 
 # Standard
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
@@ -111,6 +111,40 @@ def _parse_micro(value: object) -> float:
     return 0.0
 
 
+class _ProjectedServiceAccountTokenAuth(httpx.Auth):
+    """Load the Kubernetes bearer token immediately before every request.
+
+    Kubernetes rotates projected service-account tokens by replacing the file
+    behind the mounted path. Reading it inside the auth flow makes the next
+    Lease request use the replacement without recreating the HTTP client.
+    """
+
+    def __init__(self, token_path: Path) -> None:
+        self._token_path = token_path
+
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> AsyncIterator[httpx.Request]:
+        """Attach the current token, failing before I/O when it is unusable."""
+        try:
+            token = self._token_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            raise httpx.RequestError(
+                "Kubernetes service-account token is unreadable", request=request
+            ) from exc
+        if (
+            not token
+            or not token.isascii()
+            or not token.isprintable()
+            or any(character.isspace() for character in token)
+        ):
+            raise httpx.RequestError(
+                "Kubernetes service-account token is invalid", request=request
+            )
+        request.headers["Authorization"] = f"Bearer {token}"
+        yield request
+
+
 class KubernetesLeaseElector:
     """Holds a pre-created ``coordination.k8s.io/v1`` Lease.
 
@@ -156,16 +190,13 @@ class KubernetesLeaseElector:
             f"{api_url.rstrip('/')}/apis/coordination.k8s.io/v1/namespaces/"
             f"{namespace}/leases/{config.lease_name}"
         )
-        headers: dict[str, str] = {}
         token_path = Path(config.kubernetes_token_path)
-        if token_path.exists():
-            headers["Authorization"] = f"Bearer {token_path.read_text().strip()}"
         verify: bool | str = config.kubernetes_ca_path or False
         if api_url.startswith("http://"):
             verify = False
         self._client = httpx.AsyncClient(
             timeout=config.request_timeout_seconds,
-            headers=headers,
+            auth=_ProjectedServiceAccountTokenAuth(token_path),
             verify=verify,
             transport=transport,
         )
