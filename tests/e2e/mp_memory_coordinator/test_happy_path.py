@@ -264,7 +264,6 @@ def test_dry_run_proposes_but_never_mutates(harness: Harness) -> None:
     assert status["counters"]["proposed"] >= 1
 
 
-@pytest.mark.local_only
 def test_discovery_moves_a_device_without_any_allowlist(harness: Harness) -> None:
     """The default mode derives ownership from outside status alone.
 
@@ -408,6 +407,7 @@ def test_present_assigned_device_is_attached_then_adopted(harness: Harness) -> N
     assert harness.memcoord.client.readyz().status_code == 200
 
 
+@pytest.mark.local_only
 def test_explicit_adoption_command_populates_inventory(harness: Harness) -> None:
     """Adoption requires the exact (worker_ip, path, size) tuple."""
     result = harness.memcoord.adopt(

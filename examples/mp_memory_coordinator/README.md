@@ -176,10 +176,12 @@ kubectl -n lmcache-system get lease lmcache-mp-memory-coordinator \
 curl -fsS http://127.0.0.1:9400/metrics | grep '^lmcache_memcoord_'
 ```
 
-Require `leader: true`, `initialized: true`, `actuation_enabled: false`, the
+Require `leader: true`, `actuation_enabled: false`, the
 exact approved inventory, a reachable MP Coordinator, and no journal error.
-Readiness can remain `503` until Lease acquisition, adoption, and the first
-inventory reconciliation finish.
+Readiness can remain `503` until Lease acquisition and the first inventory
+reconciliation finish. `initialized` only turns `true` once an adoption
+allowlist has been applied; with discovery alone it stays `false`, which is
+expected.
 
 Under an eligible LOW/HIGH workload, wait for `stable_samples` accepted
 samples and check the dry-run result:
@@ -189,10 +191,12 @@ curl -fsS http://127.0.0.1:9400/status | jq \
   '.last_cycle | {proposal, rejections, error}'
 ```
 
-The expected donor, receiver, and device should appear in `proposal`, with an
-`actuation_disabled` rejection. Confirm in the allocator logs that no mutating
-POST was sent. Observe this mode for the intended canary window before
-enabling changes.
+The first proposal for a pressured server is a grow (`kind: grow`, with the
+receiver and the requested size); a donor move (`kind: move`, with donor,
+receiver, and device) is proposed only after the allocator has refused to
+serve that server. Either carries an `actuation_disabled` rejection. Confirm in
+the allocator logs that no mutating POST was sent. Observe this mode for the
+intended canary window before enabling changes.
 
 ## 5. Enable and verify one canary move
 
@@ -210,13 +214,20 @@ kubectl -n lmcache-system rollout status \
   deployment/lmcache-mp-memory-coordinator --timeout=5m
 ```
 
-Watch `/journal`. A successful move records effects in this order:
+Watch `/journal`. A successful grow records effects in this order:
+
+```text
+allocate -> receiver_add
+```
+
+If the allocator refuses, the grow ends with `outcome: NOT_SERVED` (no side
+effects, no cooldown) and the next cycle proposes a donor move, which records:
 
 ```text
 donor_drain -> donor_evict -> deallocate -> allocate -> receiver_add
 ```
 
-It finishes in `history[-1]` with `state: COMPLETE` and
+Either finishes in `history[-1]` with `state: COMPLETE` and
 `outcome: SUCCEEDED`. Also verify the outside status at
 `/api/v2/apps/lmcache`, both MP servers' `/reconfigure/dax/status`, and the MP
 Coordinator's `/instances/usage` capacity totals.

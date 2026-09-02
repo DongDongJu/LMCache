@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """One-time adoption of pre-existing runtime devices from an allowlist.
 
-Normal startup never discovers devices. An operator lists every allocation
+The running coordinator discovers allocator-assigned devices on every cycle
+(see :mod:`lmcache.v1.mp_memory_coordinator.discovery`); adoption is the
+explicit alternative for paths an operator wants to approve by hand. An
+operator lists every allocation
 explicitly (worker IP, exact path, allocation GiB, DAX map bytes); each is
 adopted only when the path is active at DAX index ``> 0`` on the MP instance
 registered for that worker, is listed under the same worker in outside

@@ -44,7 +44,7 @@ policy.py        sandwich read, LOW/HIGH history, ranking, preflight rules, grow
 recovery.py      the pure decision function: (MoveRecord, Evidence) -> one next safe action
 controller.py    the cycle: observe -> propose -> persist -> one effect -> persist
 persistence/     atomic, checksummed, versioned journal (tmp + fsync + rename + dir fsync)
-adoption.py      explicit one-time allowlist adoption; never discovers devices
+adoption.py      explicit one-time allowlist adoption (optional; discovery covers assigned devices)
 discovery.py     per-cycle inventory derivation from outside status (the default)
 attachment.py    per-cycle attach plan for present, outside-assigned, unattached devices
 leader.py        Kubernetes Lease elector (resourceVersion CAS) or static single-process leader

@@ -58,7 +58,8 @@ class MPMemoryCoordinatorCommand(BaseCommand):
             default=None,
             help=(
                 "Operator-approved allowlist of existing runtime allocations to "
-                "adopt into the journal once, then exit. Never discovers devices."
+                "adopt into the journal once, then exit. Optional: the running "
+                "coordinator discovers allocator-assigned devices on its own."
             ),
         )
         parser.add_argument(
