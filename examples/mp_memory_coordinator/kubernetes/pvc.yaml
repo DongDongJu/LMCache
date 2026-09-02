@@ -1,0 +1,15 @@
+# The crash-safe journal must survive Pod replacement and be mounted by at
+# most one Pod. The cluster's default CSI StorageClass must support RWOP.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lmcache-mp-memory-coordinator-journal
+  labels:
+    app.kubernetes.io/name: lmcache-mp-memory-coordinator
+    app.kubernetes.io/part-of: lmcache
+spec:
+  accessModes:
+    - ReadWriteOncePod
+  resources:
+    requests:
+      storage: 1Gi

@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: lmcache-system
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - rbac.yaml
+  - lease.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+
+# Kustomize adds a content hash to this ConfigMap and rewrites the Deployment
+# reference. Changing either file causes a Recreate rollout; only apply a
+# change when /status shows no active or BLOCKED move.
+configMapGenerator:
+  - name: lmcache-mp-memory-coordinator-config
+    files:
+      - mp-memory-coordinator.yaml=config/mp-memory-coordinator.yaml
+      - adoption.yaml=config/adoption.yaml
+
+images:
+  # Replace this with a tested LMCache release tag or image digest.
+  - name: lmcache/standalone
+    newTag: REPLACE_WITH_RELEASE_TAG

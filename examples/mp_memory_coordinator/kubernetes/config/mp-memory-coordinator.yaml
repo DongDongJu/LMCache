@@ -1,0 +1,40 @@
+# The MP Coordinator and Memory Allocation services must already be reachable
+# at these base URLs. The allocation client appends /api/v2/apps/lmcache itself.
+mp_coordinator_url: http://lmcache-mp-coordinator:9300
+memory_allocation_url: http://memory-allocation-service:8080
+
+# Prevent new moves initially. Recovery of a move already stored in the
+# journal still runs; enable new moves only after adoption and dry-run review.
+actuation_enabled: false
+poll_interval_seconds: 10
+stable_samples: 3
+high_ratio: 0.75
+low_ratio: 0.40
+minimum_ratio_gap: 0.25
+projected_donor_max_ratio: 0.70
+cooldown_seconds: 300
+
+adapter_index: 0
+min_devices_per_instance: 1
+allowed_device_path_prefix: /dev/dax-cxl/
+drain_timeout_seconds: 300
+state_directory: /var/lib/lmcache-memory-coordinator
+
+http_host: 0.0.0.0
+http_port: 9400
+request_timeout_seconds: 5
+get_retry_attempts: 3
+dax_poll_interval_seconds: 2
+dax_add_max_attempts: 3
+capacity_convergence_timeout_seconds: 120
+
+leader_election: kubernetes
+lease_name: lmcache-mp-memory-coordinator
+lease_namespace: ""
+lease_duration_seconds: 15
+lease_renew_interval_seconds: 5
+
+# After replacing every value in adoption.yaml, set this to
+# /etc/lmcache/adoption.yaml before the first real deployment. Leaving it
+# empty guarantees that the example cannot claim any existing allocation.
+adoption_file: ""

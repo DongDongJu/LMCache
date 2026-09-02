@@ -169,6 +169,62 @@ Endpoints
    * - ``/metrics``
      - Prometheus counters: proposed, succeeded, rolled back, blocked moves.
 
+Kubernetes deployment example
+-----------------------------
+
+A production Kustomize example is available in
+`examples/mp_memory_coordinator/README.md`_. It creates namespace
+``lmcache-system``, a single-replica ``Recreate`` Deployment, narrow Lease
+RBAC, a pre-created Lease, a ``ReadWriteOncePod`` journal PVC, probes, and a
+Service on port 9400.
+
+Before applying it, edit
+``examples/mp_memory_coordinator/kubernetes/config/mp-memory-coordinator.yaml``
+with the MP Coordinator base URL, set the pinned LMCache image in the
+Kustomization, and keep ``actuation_enabled: false``. No allowlist is
+required: the coordinator discovers the devices the outside service assigns
+to each worker. Fill in ``adoption.yaml`` and point ``adoption_file`` at
+``/etc/lmcache/adoption.yaml`` only if a path must be approved explicitly.
+The
+``memory_allocation_url`` value is the allocator **base URL**; do not include
+an API path. The client calls ``<base>/api/v2/apps/lmcache`` for status and
+``<base>/api/v2/apps/lmcache/allocations`` or
+``<base>/api/v2/apps/lmcache/deallocations`` for mutations.
+
+From the repository root, render and deploy the example, then inspect its
+read-only status API:
+
+.. code-block:: bash
+
+   kubectl kustomize examples/mp_memory_coordinator/kubernetes
+   kubectl apply -k examples/mp_memory_coordinator/kubernetes
+   kubectl -n lmcache-system rollout status \
+     deployment/lmcache-mp-memory-coordinator --timeout=5m
+   kubectl -n lmcache-system port-forward \
+     service/lmcache-mp-memory-coordinator 9400:9400
+
+In another terminal, require ``leader: true``, the expected inventory, and
+``actuation_enabled: false`` before considering actuation. If the inventory is
+empty, ``last_cycle.discovery.skipped`` names the reason for every live device
+that was declined:
+
+.. code-block:: bash
+
+   curl -fsS http://127.0.0.1:9400/healthz
+   curl -sS http://127.0.0.1:9400/readyz
+   curl -fsS http://127.0.0.1:9400/status | jq \
+     '{leader, actuation_enabled, inventory, active_move, last_cycle}'
+   curl -fsS http://127.0.0.1:9400/status | jq .last_cycle.discovery
+
+Observe an eligible dry-run proposal and confirm that the allocator received
+no POST before setting ``actuation_enabled: true`` and re-applying the
+Kustomization. Never scale above one replica, change the ``Recreate`` strategy,
+or delete/detach the journal PVC. Observation mode prevents new moves but does
+not stop recovery of an already durable move; preserve a ``BLOCKED`` journal
+for manual reconciliation.
+
+.. _examples/mp_memory_coordinator/README.md: https://github.com/LMCache/LMCache/blob/dev/examples/mp_memory_coordinator/README.md
+
 Rollout
 -------
 

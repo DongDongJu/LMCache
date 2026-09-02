@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: lmcache-mp-memory-coordinator
+  labels:
+    app.kubernetes.io/name: lmcache-mp-memory-coordinator
+    app.kubernetes.io/part-of: lmcache
+spec:
+  type: ClusterIP
+  # Keep /status, /journal, and /metrics reachable while /readyz is 503 so an
+  # operator can diagnose dependency failures or a BLOCKED move.
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: lmcache-mp-memory-coordinator
+  ports:
+    - name: http
+      port: 9400
+      targetPort: http

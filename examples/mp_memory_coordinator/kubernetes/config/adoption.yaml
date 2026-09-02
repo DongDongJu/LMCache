@@ -1,0 +1,8 @@
+# Replace this documentation-only entry with every existing runtime allocation
+# the coordinator is allowed to manage. It is ignored while adoption_file is
+# empty in mp-memory-coordinator.yaml.
+allocations:
+  - worker_ip: 192.0.2.40
+    device_path: /dev/dax-cxl/REPLACE_WITH_RUNTIME_OWNER/dax0.1
+    allocation_size_gib: 64
+    device_map_size_bytes: 68719476736
