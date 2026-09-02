@@ -40,6 +40,7 @@ controller.py    the cycle: observe -> propose -> persist -> one effect -> persi
 persistence/     atomic, checksummed, versioned journal (tmp + fsync + rename + dir fsync)
 adoption.py      explicit one-time allowlist adoption; never discovers devices
 discovery.py     per-cycle inventory derivation from outside status (the default)
+attachment.py    per-cycle attach plan for present, outside-assigned, unattached devices
 leader.py        Kubernetes Lease elector (resourceVersion CAS) or static single-process leader
 app.py           /healthz /readyz /status /journal /metrics; graceful stop
 ```
@@ -171,6 +172,66 @@ worker in outside status, matches the approved map size, and is not owned.
 Note that `--adopt` adopts and exits without starting the control loop, and
 that `adoption_file` is read only while the journal carries no
 `initialized` marker.
+
+### Attach orchestration
+
+Discovery only sees devices an MP server has already mapped. An MP server
+whose DAX adapter runs a presence watcher (`watch_directory` in its
+`--l2-adapter` config; see `docs/design/v1/distributed/l2_adapters/dax.md`)
+additionally reports every path in its watched directory under
+`/reconfigure/dax/status ... status.watcher.present_devices`, each with a
+read-only physical inspection (`mode`, sysfs `size`, driver). The server
+**never** attaches one on its own: presence is not ownership -- FREE runtime
+devices are visible on every worker and a deallocated donor path stays
+present after its removal -- and only the coordinator can prove ownership.
+
+`attachment.py` therefore applies the *same* rule discovery uses. Each cycle
+with no active move, for every accepted instance whose watcher is enabled,
+a present device is planned for `POST /reconfigure/dax/add` (size = the
+whole device from sysfs) when:
+
+* its physical `mode` is `devdax` (`system-ram`, `unbound`, `absent`,
+  `not-a-device`, `unknown` are never attached);
+* its path starts with `allowed_device_path_prefix`;
+* no non-tombstone adapter entry already has the path;
+* the adapter accepts hotplug (`hotplug_enabled`);
+* outside status lists that exact path under exactly the one worker IP the
+  instance registered;
+* its sysfs size is a positive whole number of GiB; and
+* no add of it failed within the last `cooldown_seconds` (the same knob as
+  the post-move participant cooldown).
+
+The step runs after discovery and before ranking, and **only when no move
+is active**: a move's receiver add and a donor's post-evict window must never
+be raced by a second writer of the same adapter, and the move already
+re-attaches its own paths. One outside read per cycle serves both discovery
+and attach orchestration so they never disagree about ownership. With
+`actuation_enabled: false` (or after a stop request) the plan is reported
+as `would_attach` and no POST is made; with actuation, leadership is
+re-renewed once (planned adds are withheld and reported as `skipped_pass:
+not leader` if that fails) and each planned add is issued at most once per
+cycle. A failure (transport error, non-2xx, or a non-`active` entry in the
+response) is logged and remembered so the path is retried only after
+`cooldown_seconds`.
+
+**An attach cycle never proposes.** The sandwich read predates the add, so
+the adapter's capacity it recorded is stale once an add was issued (or may
+be, after an ambiguous failure). A `MoveRecord` built from that snapshot
+would carry the pre-attach capacity and the move would then wait for
+capacity convergence forever. Whenever an add was attempted -- `attached` or `failed` non-empty
+-- the cycle reconciles the inventory, reports the decision `attach issued;
+re-observing next cycle`, and returns before ranking; the next cycle reads a
+fresh sandwich and proposes from post-attach capacities.
+
+No journal record is written for an attach and nothing about it is
+persisted: a same-size re-add is idempotent on the MP server (`200` with the
+existing entry), and the next cycle's discovery adopts the now-live device
+through the unchanged ownership rule, so a crash between the add and the
+adoption loses nothing. The success count (`counters.attached` in `/status`,
+`lmcache_memcoord_devices_attached_total`) is in-memory and restarts from
+zero on purpose: attaches are idempotent and need no durable count. Every
+present device that is *not* planned is reported with its reason in
+`/status.last_cycle.attachments.skipped`.
 
 ## Leadership and deployment
 

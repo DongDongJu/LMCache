@@ -10,7 +10,7 @@ Endpoints:
   and the last cycle report.
 * ``GET /journal`` -- the durable journal document (read-only).
 * ``GET /metrics`` -- Prometheus counters for proposed / succeeded /
-  rolled-back / blocked moves.
+  rolled-back / blocked moves, and attached devices.
 
 :func:`run_memory_coordinator` wires the clients, journal, leader elector,
 and controller, serves the app with uvicorn, and stops gracefully: on
@@ -69,7 +69,9 @@ class Metrics:
     """Minimal counters exported at ``/metrics``.
 
     Gauges mirror the persisted journal counters so a restart reports the
-    durable totals rather than restarting from zero.
+    durable totals rather than restarting from zero; the attached-devices
+    gauge mirrors the controller's in-memory count and does restart from
+    zero (attaching is idempotent and is deliberately not journaled).
     """
 
     def __init__(self) -> None:
@@ -94,6 +96,11 @@ class Metrics:
             "Moves that entered BLOCKED",
             registry=self.registry,
         )
+        self.attached = Gauge(
+            "lmcache_memcoord_devices_attached_total",
+            "Present, outside-assigned devices attached by attach orchestration",
+            registry=self.registry,
+        )
         self.leader = Gauge(
             "lmcache_memcoord_leader",
             "1 when this process holds leadership",
@@ -101,12 +108,13 @@ class Metrics:
         )
 
     def update(self, controller: RebalanceController) -> None:
-        """Copy the controller's persisted counters into the gauges."""
+        """Copy the controller's counters into the gauges."""
         counters = controller.document.counters
         self.proposed.set(counters.proposed)
         self.succeeded.set(counters.succeeded)
         self.rolled_back.set(counters.rolled_back)
         self.blocked.set(counters.blocked)
+        self.attached.set(controller.attached_devices)
         self.leader.set(1 if controller.readiness()[0] else 0)
 
 

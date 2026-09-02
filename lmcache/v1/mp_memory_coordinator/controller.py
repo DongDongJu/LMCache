@@ -4,8 +4,10 @@
 Each cycle performs a sandwich read. With no active move it reads each
 relevant MP server's DAX status once, discovers newly owned devices from
 outside status (see :mod:`lmcache.v1.mp_memory_coordinator.discovery`),
-reconciles the inventory, updates the pressure history, ranks candidates,
-preflights the best pair, and logs a structured dry-run proposal; with
+attaches present devices the outside service assigns to that worker (see
+:mod:`lmcache.v1.mp_memory_coordinator.attachment`), reconciles the
+inventory, updates the pressure history, ranks candidates, preflights the
+best pair, and logs a structured dry-run proposal; with
 ``actuation_enabled`` and leadership it persists a ``SELECTED`` record. With
 an active move it gathers :class:`Evidence`, asks :func:`decide` for the one
 next action, executes at most one side effect, and persists the result --
@@ -31,6 +33,10 @@ from lmcache.v1.mp_memory_coordinator.adoption import (
     AdoptionResult,
     adopt,
 )
+from lmcache.v1.mp_memory_coordinator.attachment import (
+    AttachPlan,
+    plan_attachments,
+)
 from lmcache.v1.mp_memory_coordinator.clients import (
     AmbiguousMutationError,
     ClientConnectionError,
@@ -53,6 +59,8 @@ from lmcache.v1.mp_memory_coordinator.config import MPMemoryCoordinatorConfig
 from lmcache.v1.mp_memory_coordinator.discovery import discover
 from lmcache.v1.mp_memory_coordinator.leader import LeaderElector
 from lmcache.v1.mp_memory_coordinator.models import (
+    DAX_ACTIVE_STATE,
+    GIB,
     AllocationOrigin,
     AllocationRequest,
     AllocationResponse,
@@ -245,6 +253,13 @@ class CycleReport:
         decision: Decision type and reason for an active move.
         discovery: What device discovery adopted and skipped this cycle
             (empty while a move is active, when discovery does not run).
+        attachments: What attach orchestration did this cycle: ``planned``
+            (eligible adds), ``attached`` (adds confirmed active),
+            ``would_attach`` (adds withheld: dry run or stopping), ``failed``
+            (``path -> error``), ``skipped`` (``path -> reason`` for devices
+            not planned); or ``skipped_pass`` with a reason when the pass
+            did not run (outside status unavailable) or its planned adds
+            were withheld (leadership lost). Empty while a move is active.
         error: Error text, if the cycle failed.
     """
 
@@ -258,6 +273,7 @@ class CycleReport:
     move_state: str = ""
     decision: str = ""
     discovery: dict[str, object] = field(default_factory=dict)
+    attachments: dict[str, object] = field(default_factory=dict)
     error: str = ""
 
     def as_dict(self) -> dict[str, object]:
@@ -273,6 +289,7 @@ class CycleReport:
             "move_state": self.move_state,
             "decision": self.decision,
             "discovery": self.discovery,
+            "attachments": self.attachments,
             "error": self.error,
         }
 
@@ -346,6 +363,14 @@ class RebalanceController:
         self._was_leader = False
         self._last_report = CycleReport(at=0.0)
         self._cycle_lock = asyncio.Lock()
+        # device_path -> wall-clock time of the last failed attach; an entry
+        # is dropped once it is older than ``cooldown_seconds`` or the path
+        # is attached, so the map never outgrows the set of failing paths.
+        self._attach_failures: dict[str, float] = {}
+        # Successful adds since this process started. Deliberately not
+        # persisted: attaching is idempotent, so a restart that starts from
+        # zero loses nothing that matters.
+        self._attached = 0
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -379,6 +404,14 @@ class RebalanceController:
         """The most recent cycle report."""
         return self._last_report
 
+    @property
+    def attached_devices(self) -> int:
+        """Devices attached by attach orchestration since this process started.
+
+        In-memory only (restarts from zero); see :meth:`status`.
+        """
+        return self._attached
+
     def request_stop(self) -> None:
         """Start no new move; the current cycle completes and persists."""
         self._stopping = True
@@ -405,7 +438,11 @@ class RebalanceController:
         return True, "ok"
 
     def status(self) -> dict[str, object]:
-        """Return a JSON-serializable status for ``/status``."""
+        """Return a JSON-serializable status for ``/status``.
+
+        ``counters`` carries the persisted journal counters plus
+        ``attached``, the in-memory count of :attr:`attached_devices`.
+        """
         move = self._document.active_move
         return {
             "leader": self._leader.is_leader(),
@@ -417,7 +454,10 @@ class RebalanceController:
             "cooldowns": dict(self._document.cooldowns),
             "history": self._history.snapshot(),
             "active_move": move.model_dump(mode="json") if move is not None else None,
-            "counters": self._document.counters.model_dump(),
+            "counters": {
+                **self._document.counters.model_dump(),
+                "attached": self._attached,
+            },
             "last_cycle": self._last_report.as_dict(),
         }
 
@@ -540,9 +580,19 @@ class RebalanceController:
         if not snapshot.coordinator_reachable:
             return
         statuses = await self._collect_dax_statuses(snapshot)
+        # One outside read serves both discovery and attach orchestration so
+        # the two never disagree about ownership within a cycle.
         outside = await self._remote.outside_status()
         report.discovery = self._discover(snapshot, statuses, outside)
+        report.attachments = await self._attach(snapshot, statuses, outside)
         self._reconcile_inventory(snapshot, statuses)
+        if report.attachments.get("attached") or report.attachments.get("failed"):
+            # The sandwich read predates the add: the adapter's capacity has
+            # changed (or may have, after an ambiguous failure), so a move
+            # selected now would carry stale capacities in its record and
+            # never converge. Re-observe before proposing anything.
+            report.decision = "attach issued; re-observing next cycle"
+            return
         candidates = rank_candidates(
             snapshot, self._history, self._document.cooldowns, self._clock()
         )
@@ -692,6 +742,125 @@ class RebalanceController:
         if result.discovered:
             self._save()
         return result.as_dict()
+
+    async def _attach(
+        self,
+        snapshot: MembershipSnapshot,
+        statuses: Mapping[str, DaxHotplugStatus],
+        outside: OutsideStatus | None,
+    ) -> dict[str, object]:
+        """Attach present devices the outside service assigns to their worker.
+
+        Runs only with no active move (the caller guarantees it): a saga's
+        receiver add and a donor's post-evict window must never be raced by
+        a second writer of the same adapter. With ``actuation_enabled`` off
+        or after :meth:`request_stop` the plan is only reported
+        (``would_attach``); when leadership cannot be renewed the planned
+        adds are withheld and reported as ``skipped_pass``. Each planned add
+        is issued at most once per cycle; a failure is remembered so the
+        path is not retried before ``cooldown_seconds``. Nothing is
+        journaled and nothing is persisted: a same-size re-add is idempotent
+        on the MP server, the next cycle's discovery adopts the device
+        through the unchanged ownership rule, and the success count is
+        in-memory only. Never raises: client errors from the add are caught
+        and reported.
+
+        Args:
+            snapshot: The current sandwich read.
+            statuses: Per-instance DAX status from
+                :meth:`_collect_dax_statuses`.
+            outside: This cycle's outside status, or ``None`` when the read
+                failed (the pass is then skipped).
+
+        Returns:
+            The JSON-friendly attachment summary for the cycle report (see
+            :class:`CycleReport`).
+        """
+        if outside is None:
+            return {"skipped_pass": "outside status unavailable"}
+        now = self._clock()
+        self._attach_failures = {
+            path: at
+            for path, at in self._attach_failures.items()
+            if at + self._config.cooldown_seconds > now
+        }
+        report = plan_attachments(
+            snapshot.samples,
+            statuses,
+            outside,
+            self._config,
+            failures=self._attach_failures,
+            now=now,
+        )
+        summary: dict[str, object] = {
+            "planned": [plan.as_dict() for plan in report.planned],
+            "attached": [],
+            "would_attach": [],
+            "failed": {},
+            "skipped": dict(report.skipped),
+        }
+        if not report.planned:
+            return summary
+        if not self._config.actuation_enabled or self._stopping:
+            summary["would_attach"] = [plan.device_path for plan in report.planned]
+            return summary
+        if not await self._leader.ensure_leader():
+            summary["skipped_pass"] = "not leader"
+            return summary
+        attached: list[str] = []
+        failed: dict[str, str] = {}
+        for plan in report.planned:
+            error = await self._attach_one(plan)
+            if error:
+                failed[plan.device_path] = error
+                self._attach_failures[plan.device_path] = self._clock()
+            else:
+                attached.append(plan.device_path)
+                self._attach_failures.pop(plan.device_path, None)
+                self._attached += 1
+        summary["attached"] = attached
+        summary["failed"] = failed
+        return summary
+
+    async def _attach_one(self, plan: AttachPlan) -> str:
+        """Issue one add for ``plan`` and classify the outcome.
+
+        Args:
+            plan: The planned add.
+
+        Returns:
+            ``""`` when the server answered with an ``active`` entry, else
+            the error text (also logged at WARNING).
+        """
+        try:
+            added = await self._remote.add_device(
+                plan.identity, plan.device_path, plan.size_bytes
+            )
+        except ClientError as exc:
+            logger.warning(
+                "attach %s on %s failed: %s",
+                plan.device_path,
+                plan.identity.instance_id,
+                exc,
+            )
+            return str(exc)[:200]
+        if added.device.state != DAX_ACTIVE_STATE:
+            error = f"add returned state {added.device.state}"
+            logger.warning(
+                "attach %s on %s: %s",
+                plan.device_path,
+                plan.identity.instance_id,
+                error,
+            )
+            return error
+        logger.info(
+            "attached %s on %s (%d GiB, index %d; outside status confirms ownership)",
+            plan.device_path,
+            plan.identity.instance_id,
+            plan.size_bytes // GIB,
+            added.device.index,
+        )
+        return ""
 
     def _reconcile_inventory(
         self,

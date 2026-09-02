@@ -129,6 +129,43 @@ Devices that are declined are reported per path in
 ``/status.last_cycle.discovery.skipped``, so an empty inventory is always
 explained.
 
+Attaching present devices
+-------------------------
+
+An MP server whose DAX adapter runs a presence watcher (``watch_directory``
+in its ``--l2-adapter`` configuration) reports every path in that directory
+under ``/reconfigure/dax/status``; it never attaches one itself, because a
+visible device is not necessarily an assigned one. Each cycle with no move in
+progress, the coordinator issues ``POST /reconfigure/dax/add`` for a present
+device that is bound to ``device_dax`` (physical mode ``devdax``), lies under
+``allowed_device_path_prefix``, is not yet attached, is listed by the outside
+service under exactly that worker IP, and has a whole-GiB sysfs size -- the
+same ownership rule discovery applies (an adapter with hotplug disabled is
+skipped). A cycle that issued an add proposes no move; the next cycle's
+discovery adopts the device and ranking resumes from fresh capacities. With
+``actuation_enabled: false`` the add is only reported. A failed add is
+retried no sooner than ``cooldown_seconds`` later. The outcome of every
+cycle is in ``/status.last_cycle.attachments``:
+
+.. code-block:: json
+
+   {
+     "planned": [{"instance_id": "...", "worker_ip": "...", "device_path": "...", "size_bytes": 68719476736}],
+     "attached": ["/dev/dax-cxl/NAMESPACE_POD_NAME/dax0.2"],
+     "would_attach": [],
+     "failed": {},
+     "skipped": {"/dev/dax-cxl/NAMESPACE_POD_NAME/dax0.0": "already attached"}
+   }
+
+``would_attach`` lists the adds a dry run withheld; ``failed`` maps a path to
+the error of this cycle's add; ``skipped`` names the reason for every present
+device that was not planned; ``skipped_pass`` replaces all of that when the
+pass could not run (outside status unavailable) or leadership was lost.
+Successful attaches are counted in ``counters.attached`` of ``/status``
+(``lmcache_memcoord_devices_attached_total``); the count is in-memory and
+restarts from zero, since attaches are idempotent and deliberately not
+journaled.
+
 Adoption allowlist
 ------------------
 
@@ -167,7 +204,8 @@ Endpoints
    * - ``/journal``
      - The durable journal document (read-only).
    * - ``/metrics``
-     - Prometheus counters: proposed, succeeded, rolled back, blocked moves.
+     - Prometheus counters: proposed, succeeded, rolled back, blocked moves;
+       attached devices.
 
 Kubernetes deployment example
 -----------------------------
@@ -215,6 +253,7 @@ that was declined:
    curl -fsS http://127.0.0.1:9400/status | jq \
      '{leader, actuation_enabled, inventory, active_move, last_cycle}'
    curl -fsS http://127.0.0.1:9400/status | jq .last_cycle.discovery
+   curl -fsS http://127.0.0.1:9400/status | jq .last_cycle.attachments
 
 Observe an eligible dry-run proposal and confirm that the allocator received
 no POST before setting ``actuation_enabled: true`` and re-applying the

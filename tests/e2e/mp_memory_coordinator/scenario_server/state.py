@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
+import posixpath
 import threading
 import time
 
@@ -37,6 +38,12 @@ from .faults import (
 GIB = 1 << 30
 SLOT_BYTES = 1 << 20
 """Slot geometry: 1 MiB slots, so whole-GiB devices map exactly."""
+DAX_ALIGN_BYTES = 2 << 20
+"""sysfs ``align`` every fake device reports (2 MiB, the Device-DAX default)."""
+DAX_CHAR_MAJOR = 249
+"""Character-device major every fake device reports."""
+WATCHER_INTERVAL_SECONDS = 1.0
+"""``watcher.interval_seconds`` every fake MP server reports."""
 L1_CAPACITY_BYTES = 4 * GIB
 DONOR_ID = "mp-donor"
 RECEIVER_ID = "mp-receiver"
@@ -70,6 +77,9 @@ _TERMINAL_STATES: frozenset[str] = frozenset({"closed", "removed"})
 _LOOKUP_EXCLUDED_STATES: frozenset[str] = frozenset({"closed", "removed", "failed"})
 
 RemoveMode = Literal["migrate", "evict", "drain"]
+PhysicalMode = Literal[
+    "devdax", "system-ram", "unbound", "not-a-device", "absent", "unknown"
+]
 IdentityBump = Literal["registration_time", "endpoint", "both"]
 AuditKind = Literal["request", "response", "mutation"]
 SizeRequest = int | str
@@ -97,6 +107,47 @@ def _usage_ratio(used_bytes: int, capacity_bytes: int) -> float | None:
     if capacity_bytes <= 0:
         return None
     return used_bytes / capacity_bytes
+
+
+def physical_status(
+    device_path: str,
+    minor: int,
+    mode: PhysicalMode,
+    size_bytes: int,
+    align_bytes: int = DAX_ALIGN_BYTES,
+) -> dict[str, object]:
+    """Build one physical-inspection entry with the production key set.
+
+    Mirrors ``DaxPhysicalState.as_dict()`` of the real DAX adapter: what a
+    read-only ``stat`` + sysfs probe reports for one path.
+
+    Args:
+        device_path: The inspected path.
+        minor: Character-device minor number (also the ``daxX.Y`` suffix).
+        mode: Physical mode; ``devdax`` is the only attachable one.
+        size_bytes: sysfs ``size``.
+        align_bytes: sysfs ``align``.
+
+    Returns:
+        ``{"device_path", "mode", "present", "major", "minor",
+        "kernel_name", "driver", "size_bytes", "align_bytes", "probed_at",
+        "detail"}``.
+    """
+    driver = {"devdax": "device_dax", "system-ram": "kmem"}.get(mode, "")
+    present = mode != "absent"
+    return {
+        "device_path": device_path,
+        "mode": mode,
+        "present": present,
+        "major": DAX_CHAR_MAJOR if present else 0,
+        "minor": minor if present else 0,
+        "kernel_name": f"dax2.{minor}" if present else "",
+        "driver": driver,
+        "size_bytes": size_bytes,
+        "align_bytes": align_bytes,
+        "probed_at": time.time(),
+        "detail": "" if mode == "devdax" else f"scenario server reports {mode}",
+    }
 
 
 def _module_status(
@@ -194,6 +245,24 @@ class DeviceUpdate(BaseModel):
     used_bytes: int = Field(default=0, ge=0)
 
 
+class PresentDevice(BaseModel):
+    """Body of ``POST /__test/present_devices``: a path the watcher sees.
+
+    Declares a device that is physically present in the instance's watched
+    directory without attaching it. Attached devices are always present;
+    this adds the unattached ones (or overrides the physical state of an
+    attached path, e.g. to report ``system-ram``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    instance_id: str
+    device_path: str
+    mode: PhysicalMode = "devdax"
+    size_bytes: int = Field(default=64 * GIB, ge=0)
+    align_bytes: int = Field(default=DAX_ALIGN_BYTES, ge=0)
+
+
 _DEVICE_COUNTER_FIELDS = (
     "locked_key_count",
     "borrowed_slot_count",
@@ -267,6 +336,16 @@ class DaxDevice:
         """True while the device contributes to adapter capacity."""
         return self.state in _CAPACITY_STATES
 
+    def physical(self) -> dict[str, object]:
+        """Return the physical state of an attached device (always ``devdax``).
+
+        Returns:
+            See :func:`physical_status`.
+        """
+        return physical_status(
+            self.device_path, self.device_id, "devdax", self.max_dax_size_bytes
+        )
+
     def status(self, index: int) -> dict[str, object]:
         """Return the golden device status entry.
 
@@ -274,7 +353,9 @@ class DaxDevice:
             index: Position of the device in the adapter device list.
 
         Returns:
-            Dict with exactly the golden ``devices[]`` keys.
+            Dict with exactly the golden ``devices[]`` keys, including the
+            device's own ``physical`` state (the hotplug status overrides it
+            from the watcher snapshot, as the real adapter does).
         """
         return {
             "is_healthy": self.is_healthy,
@@ -295,6 +376,7 @@ class DaxDevice:
             "inflight_store_tasks": self.inflight_store_tasks,
             "inflight_lookup_tasks": self.inflight_lookup_tasks,
             "inflight_load_tasks": self.inflight_load_tasks,
+            "physical": self.physical(),
         }
 
 
@@ -327,6 +409,11 @@ class ScenarioInstance:
         devices: Adapter device list including tombstones, in index order.
         next_device_id: ``device_id`` assigned to the next added device.
         stale_capacity: Delayed-capacity bookkeeping.
+        present_devices: Physical state per path declared through the admin
+            port; the watcher reports these in addition to every attached
+            (or tombstoned) device path.
+        watch_directory: The directory the fake presence watcher scans (the
+            bootstrap device's directory, fixed at construction).
     """
 
     instance_id: str
@@ -338,6 +425,32 @@ class ScenarioInstance:
     devices: list[DaxDevice]
     next_device_id: int
     stale_capacity: StaleCapacity = field(default_factory=StaleCapacity)
+    present_devices: dict[str, dict[str, object]] = field(default_factory=dict)
+    watch_directory: str = ""
+
+    def present(self) -> dict[str, dict[str, object]]:
+        """Physical state of every path the watcher currently sees.
+
+        Every adapter entry's path is present (a removed device's node stays
+        on the host); admin-declared entries are added and take precedence.
+
+        Returns:
+            ``device_path -> physical entry`` (see :func:`physical_status`).
+        """
+        present: dict[str, dict[str, object]] = {}
+        for device in self.devices:
+            present.setdefault(device.device_path, device.physical())
+        present.update(self.present_devices)
+        return present
+
+    def present_sorted(self) -> list[dict[str, object]]:
+        """Return :meth:`present` entries ordered by path (copies).
+
+        Returns:
+            The ``present_devices`` list a watcher snapshot reports.
+        """
+        present = self.present()
+        return [dict(present[path]) for path in sorted(present)]
 
     @property
     def capacity_bytes(self) -> int:
@@ -681,6 +794,44 @@ class ScenarioState:
                 },
             )
             return device.status(index)
+
+    def declare_present_device(self, declared: PresentDevice) -> dict[str, object]:
+        """Make the instance's watcher report a path as physically present.
+
+        Nothing is attached: the coordinator decides whether the device is
+        also assigned by the outside service and issues the add itself.
+
+        Args:
+            declared: The path and its physical state.
+
+        Returns:
+            The physical entry now reported under ``watcher.present_devices``.
+
+        Raises:
+            KeyError: If the instance is unknown.
+        """
+        with self._lock:
+            instance = self._instances[declared.instance_id]
+            entry = physical_status(
+                declared.device_path,
+                len(instance.present()),
+                declared.mode,
+                declared.size_bytes,
+                declared.align_bytes,
+            )
+            instance.present_devices[declared.device_path] = entry
+            self.audit.record_mutation(
+                declared.instance_id,
+                "POST",
+                "/__test/present_devices",
+                {
+                    "instance_id": declared.instance_id,
+                    "device_path": declared.device_path,
+                    "mode": declared.mode,
+                    "size_bytes": declared.size_bytes,
+                },
+            )
+            return dict(entry)
 
     def reregister(self, instance_id: str, bump: IdentityBump) -> dict[str, object]:
         """Permanently change an instance's registration identity.
@@ -1126,6 +1277,7 @@ class ScenarioState:
             used_bytes=_DEFAULT_USED_BYTES.get(instance_id, 0),
             devices=devices,
             next_device_id=len(devices),
+            watch_directory=posixpath.dirname(devices[0].device_path),
         )
 
     def _snapshot_locked(self) -> dict[str, object]:
@@ -1150,6 +1302,7 @@ class ScenarioState:
                         device.status(index)
                         for index, device in enumerate(instance.devices)
                     ],
+                    "present_devices": instance.present_sorted(),
                 }
                 for instance in self._instances.values()
             ],
@@ -1232,7 +1385,11 @@ class ScenarioState:
     def _hotplug_status_locked(
         self, instance: ScenarioInstance, faults: MpFaults
     ) -> dict[str, object]:
+        present = instance.present()
         devices = [d.status(i) for i, d in enumerate(instance.devices)]
+        for status in devices:
+            path = str(status["device_path"])
+            status["physical"] = dict(present[path])
         return {
             "hotplug_enabled": not faults.hotplug_disabled,
             "slot_bytes": SLOT_BYTES,
@@ -1243,6 +1400,13 @@ class ScenarioState:
                 if d.counts_capacity
             ),
             "devices": devices,
+            "watcher": {
+                "enabled": True,
+                "directory": instance.watch_directory,
+                "interval_seconds": WATCHER_INTERVAL_SECONDS,
+                "last_scan_at": time.time(),
+                "present_devices": instance.present_sorted(),
+            },
         }
 
     def _adapter_report_locked(

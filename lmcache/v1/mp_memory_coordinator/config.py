@@ -48,7 +48,9 @@ class MPMemoryCoordinatorConfig:
         projected_donor_max_ratio: Upper bound of the donor's ratio after
             its device is removed (``used / (capacity - slot_capacity)``).
         cooldown_seconds: Seconds after a completed move during which
-            neither participant may be selected again.
+            neither participant may be selected again. Also the minimum
+            interval before a failed attach of the same device path is
+            retried (see :mod:`lmcache.v1.mp_memory_coordinator.attachment`).
         adapter_index: Backend-local DAX adapter index. Only ``0`` is
             supported (one adapter per MP instance).
         min_devices_per_instance: Active DAX devices a donor must keep

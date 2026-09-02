@@ -202,6 +202,37 @@ no proposal; that is the expected idle state.
 
 ---
 
+### 3.1 Watching attach orchestration
+
+If the MP servers run the DAX presence watcher (add `"watch_directory":
+"$DAX_ROOT"` to their `--l2-adapter` config), every path in that directory
+appears in their DAX status, and the coordinator attaches a present device
+only when the outside service lists it under the same worker. To see it work
+without a move: with the coordinator in observation mode, assign a free
+candidate to `W1` through your outside service and confirm the dry run
+reports it; then enable actuation and confirm the single add and the
+adoption that follows:
+
+```bash
+curl -s http://$W1_IP:9000/reconfigure/dax/status | jq '.adapters[0].status.watcher'   # present_devices lists dax0.2, mode devdax
+curl -s -X POST $OUTSIDE_API_URL/api/v2/apps/lmcache/allocations -H 'content-type: application/json'   -d '{"request_id":"grow-w1-1","target_node":"'$W1_IP'","request_size_gib":64,"mode":"devdax","purpose":"lmcache-dax","access":"exclusive"}'
+curl -s localhost:9400/status | jq '.last_cycle.attachments'    # dry run: would_attach [".../dax0.2"], no add issued
+# actuation on: attached [".../dax0.2"] on one cycle, then discovery adopts it
+curl -s localhost:9400/status | jq '{attachments: .last_cycle.attachments, attached: .counters.attached, discovery: .last_cycle.discovery, inventory: [.inventory[].device_path]}'
+curl -s http://$W1_IP:9000/reconfigure/dax/status | jq '.adapters[0].status.devices[] | {device_path, state, physical: .physical.mode}'
+```
+
+`attachments.skipped` explains every present device that was not attached
+(`already attached`, `hotplug disabled`, `mode is system-ram`, `outside
+status lists the path under [] ...`, `recent attach failure`). The cycle that
+issued the add reports `decision: "attach issued; re-observing next cycle"`
+and proposes nothing. `counters.attached` is in-memory (not in `/journal`)
+and restarts from zero. Nothing is attached while a move is active, and a
+device the outside service does not list under that worker is never
+attached however visible it is.
+
+---
+
 ## 4. Make the receiver HIGH with `lmcache bench server`
 
 `lmcache bench server` drives a running MP server over ZMQ: a cold pass

@@ -30,6 +30,7 @@ from .state import (
     DeviceUpdate,
     HttpResult,
     IdentityBump,
+    PresentDevice,
     ScenarioState,
     SizeRequest,
 )
@@ -427,6 +428,13 @@ def build_admin_app(state: ScenarioState) -> FastAPI:
             return _error(404, f"unknown instance {body.instance_id!r}")
         except LookupError:
             return _error(404, f"unknown device {body.device_path!r}")
+
+    @app.post("/__test/present_devices")
+    async def declare_present_device(body: PresentDevice) -> JSONResponse:
+        try:
+            return JSONResponse(state.declare_present_device(body))
+        except KeyError:
+            return _error(404, f"unknown instance {body.instance_id!r}")
 
     @app.post("/__test/instances/{instance_id}/reregister")
     async def reregister(instance_id: str, body: ReregisterRequest) -> JSONResponse:

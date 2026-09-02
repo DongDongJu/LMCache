@@ -48,6 +48,9 @@ DAX_TERMINAL_STATES = frozenset({"closed", "removed"})
 """Tombstone states: never selected, owned, or attached."""
 DAX_ACTIVE_STATE = "active"
 DAX_DRAINING_STATE = "draining"
+DAX_PHYSICAL_DEVDAX = "devdax"
+"""``DaxPhysicalStatus.mode`` of a device bound to ``device_dax``: the only
+mode the coordinator ever attaches."""
 
 
 # -- MP Coordinator wire models ----------------------------------------------
@@ -165,8 +168,74 @@ class MPStatus(BaseModel):
     storage_manager: StorageManagerStatus
 
 
+class DaxPhysicalStatus(BaseModel):
+    """Read-only physical inspection of one Device-DAX path by the MP server.
+
+    Mirrors the MP server's ``DaxPhysicalState.as_dict()``: what the server
+    learned from ``stat`` and sysfs without ever opening the device.
+
+    Attributes:
+        device_path: The inspected path.
+        mode: ``devdax`` (bound to ``device_dax``, usable), ``system-ram``
+            (bound to ``kmem``, never usable), ``unbound``, ``not-a-device``,
+            ``absent``, or ``unknown``.
+        present: Whether the path exists.
+        major: Character-device major number (``0`` when not a char device).
+        minor: Character-device minor number.
+        kernel_name: Kernel device name such as ``dax2.3`` (``""`` unknown).
+        driver: ``device_dax``, ``kmem``, or ``""``.
+        size_bytes: sysfs ``size`` of the device (``0`` when unknown).
+        align_bytes: sysfs ``align`` (``0`` when unknown).
+        probed_at: Wall-clock time of the probe on the MP server.
+        detail: Human-readable reason for a non-``devdax`` mode, else ``""``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    device_path: str
+    mode: str
+    present: bool
+    major: int
+    minor: int
+    kernel_name: str
+    driver: str
+    size_bytes: int
+    align_bytes: int
+    probed_at: float
+    detail: str
+
+
+class DaxWatcherStatus(BaseModel):
+    """The ``watcher`` block of a DAX adapter's hotplug status.
+
+    The MP server reports the devices *present* in its watched directory;
+    presence is never ownership, so the coordinator attaches one only when
+    the outside service lists it under the same worker.
+
+    Attributes:
+        enabled: Whether the server runs a presence watcher at all. A
+            server that predates the field parses as ``enabled=False``.
+        directory: The watched directory (``""`` when disabled).
+        interval_seconds: Scan interval (``0.0`` when disabled).
+        last_scan_at: Wall-clock time of the last scan (``0.0`` before one).
+        present_devices: Physical state of every path found in the directory.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    enabled: bool
+    directory: str = ""
+    interval_seconds: float = 0.0
+    last_scan_at: float = 0.0
+    present_devices: list[DaxPhysicalStatus] = Field(default_factory=list)
+
+
 class DaxDeviceStatus(BaseModel):
-    """One device of ``GET /reconfigure/dax/status``."""
+    """One device of ``GET /reconfigure/dax/status``.
+
+    ``physical`` is ``None`` only when the MP server predates the field
+    (older servers omit it); every field below it is always present.
+    """
 
     model_config = ConfigDict(extra="allow")
 
@@ -187,6 +256,7 @@ class DaxDeviceStatus(BaseModel):
     inflight_store_tasks: int
     inflight_lookup_tasks: int
     inflight_load_tasks: int
+    physical: DaxPhysicalStatus | None = None
 
     @property
     def slot_capacity_bytes(self) -> int:
@@ -213,7 +283,11 @@ class DaxDeviceStatus(BaseModel):
 
 
 class DaxHotplugStatus(BaseModel):
-    """The ``status`` section of one DAX adapter."""
+    """The ``status`` section of one DAX adapter.
+
+    ``watcher`` defaults to a disabled :class:`DaxWatcherStatus` so a server
+    that predates the presence watcher parses as "no watcher".
+    """
 
     model_config = ConfigDict(extra="allow")
 
@@ -222,6 +296,9 @@ class DaxHotplugStatus(BaseModel):
     total_capacity_bytes: int
     total_used_bytes: int
     devices: list[DaxDeviceStatus]
+    watcher: DaxWatcherStatus = Field(
+        default_factory=lambda: DaxWatcherStatus(enabled=False)
+    )
 
     def live_devices(self) -> list[DaxDeviceStatus]:
         """Return every non-tombstone device entry."""

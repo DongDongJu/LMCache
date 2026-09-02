@@ -14,7 +14,10 @@ Both load the same immutable fixture `fixtures/two_server_local_dax.yaml`
 and share nothing else. `fixtures/golden/` holds the complete current JSON
 schemas captured from the real MP Coordinator and MP server (Phase 0); the
 scenario server reproduces them and the coordinator's DTOs are tested
-against them.
+against them. Exception: the presence-watcher additions in the DAX status
+goldens (`watcher`, per-device `physical`) were written by hand to the
+watcher contract, not captured; re-capture them from a real MP server with
+`watch_directory` set once one is available.
 
 ## Run
 
@@ -114,6 +117,8 @@ DELETE /__test/faults                      -> reset faults to defaults
 POST   /__test/usage                       -> {"instance_id","used_bytes"}
 POST   /__test/devices                     -> {"instance_id","device_path", any of locked_key_count, borrowed_slot_count,
                                               active_read_count, active_write_count, inflight_*_tasks, used_bytes}
+POST   /__test/present_devices             -> {"instance_id","device_path", optional mode ("devdax" default), size_bytes, align_bytes}:
+                                              the fake presence watcher reports the path present without attaching it
 POST   /__test/instances/{id}/reregister   -> {"bump":"registration_time"|"endpoint"|"both"}
 POST   /__test/barriers                    -> {"instance_id","operation":"drain"|"evict"|"add","when":"before"|"after","name"}
 POST   /__test/barriers/{name}/release

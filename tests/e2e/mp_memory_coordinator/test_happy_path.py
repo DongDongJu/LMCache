@@ -21,6 +21,7 @@ from .conftest import (
     RECEIVER_RUNTIME,
     RECEIVER_SPARE,
     Harness,
+    wait_until,
 )
 
 pytestmark = pytest.mark.kind
@@ -282,6 +283,90 @@ def test_discovery_declines_a_path_outside_status_does_not_confirm(
     assert status["inventory"] == []
     skipped = status["last_cycle"]["discovery"]["skipped"]
     assert DONOR_RUNTIME in skipped, skipped
+
+
+def test_present_assigned_device_is_attached_then_adopted(harness: Harness) -> None:
+    """Attach orchestration: present + outside-assigned + unattached -> add.
+
+    The donor's spare path is made present in the fake MP server's watched
+    directory and assigned to the donor by the allocator, but not attached.
+    The coordinator must issue exactly one ``/reconfigure/dax/add`` for it
+    (no outside POST), and discovery must adopt it on a later cycle.
+    """
+    response = requests.post(
+        f"{harness.endpoints.allocator_public_url}/api/v2/apps/lmcache/allocations",
+        json={
+            "request_id": "assign-donor-spare",
+            "target_node": DONOR_IP,
+            "request_size_gib": 64,
+            "mode": "devdax",
+            "purpose": "lmcache-dax",
+            "access": "exclusive",
+        },
+        timeout=5,
+    )
+    assert response.status_code < 300, response.text
+    assert response.json()["device_path"] == DONOR_SPARE
+    assert harness.outside_status()[DONOR_IP] == [DONOR_RUNTIME, DONOR_SPARE]
+    setup_posts = len(harness.allocator_posts())
+    harness.scenario.post(
+        "/__test/present_devices",
+        {"instance_id": "mp-donor", "device_path": DONOR_SPARE, "size_bytes": 64 * GIB},
+    )
+    # Keep the fleet ineligible for a move so only attach orchestration acts.
+    harness.scenario.post(
+        "/__test/usage", {"instance_id": "mp-receiver", "used_bytes": 8 * GIB}
+    )
+
+    harness.memcoord.start()
+
+    def _attached() -> bool:
+        return any(
+            r["service"] == "mp-donor"
+            and r["path"] == "/reconfigure/dax/add"
+            and r["body"]
+            == {
+                "adapter_index": 0,
+                "device_path": DONOR_SPARE,
+                "size": "64GiB",
+            }
+            for r in harness.scenario_posts()
+        )
+
+    wait_until(_attached, 60.0, what="attach of the donor spare")
+
+    def _adopted() -> bool:
+        return DONOR_SPARE in [
+            a["device_path"] for a in harness.memcoord.client.journal()["inventory"]
+        ]
+
+    wait_until(_adopted, 60.0, what="discovery adopting the attached spare")
+    harness.memcoord.client.wait_cycles(3, timeout=30)
+
+    # Exactly one add, no outside mutation, and the device is live + owned.
+    assert [(r["service"], r["path"]) for r in harness.scenario_posts()] == [
+        ("mp-donor", "/reconfigure/dax/add")
+    ]
+    assert len(harness.allocator_posts()) == setup_posts
+    donor = next(
+        i
+        for i in harness.scenario.state()["instances"]
+        if i["instance_id"] == "mp-donor"
+    )
+    assert {d["device_path"]: d["state"] for d in donor["devices"]}[DONOR_SPARE] == (
+        "active"
+    )
+    assert donor["capacity_bytes"] == 192 * GIB
+    status = harness.memcoord.client.status()
+    adopted = next(a for a in status["inventory"] if a["device_path"] == DONOR_SPARE)
+    assert adopted["origin"] == "discovered"
+    assert adopted["worker_ip"] == DONOR_IP
+    assert status["counters"]["attached"] == 1
+    attachments = status["last_cycle"]["attachments"]
+    assert attachments["planned"] == [] and attachments["attached"] == []
+    assert attachments["skipped"][DONOR_SPARE] == "already attached"
+    assert harness.memcoord.client.active_move() is None
+    assert harness.memcoord.client.readyz().status_code == 200
 
 
 def test_explicit_adoption_command_populates_inventory(harness: Harness) -> None:

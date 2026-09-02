@@ -191,8 +191,8 @@ present on its host, and a receiver device may be visible before the
 allocator grants it. Under the coordinator's ownership rule a device is
 managed iff the outside allocator lists its exact path under exactly the one
 `worker_ip` this instance registered, and only the MP Memory Coordinator can
-check that. The MP server therefore only reports `watcher.present_devices`
-and leaves the add to a caller that can check ownership. A watcher that
+check that. The MP server therefore only reports `watcher.present_devices`;
+the coordinator decides and issues `/reconfigure/dax/add`. A watcher that
 attached on its own would re-map a donor device within one interval of the
 coordinator's evict, bypass capacity publication (only
 `StorageManager.reconfigure_l2_adapter` publishes `SM_CAPACITY_CHANGED`), and
@@ -232,7 +232,7 @@ check: a healthy same-size re-add stays idempotent (`200` with the existing
 entry), but a re-add whose probe now reports `system-ram` or `unbound` is
 rejected with `400` and the existing entry is left untouched. That is the
 honest answer (the mapping is dead once the device is rebound) and does not
-affect a caller that only adds when no live entry exists.
+affect the coordinator, which only plans an add when no live entry exists.
 
 ## Current Limits
 

@@ -11,9 +11,11 @@ the same journal directory.
 """
 
 # Standard
+from collections.abc import Callable
 from pathlib import Path
 import asyncio
 import json
+import posixpath
 
 # Third Party
 import pytest
@@ -33,7 +35,7 @@ from lmcache.v1.mp_memory_coordinator.config import (
     config_from_mapping,
 )
 from lmcache.v1.mp_memory_coordinator.controller import RebalanceController
-from lmcache.v1.mp_memory_coordinator.leader import StaticLeader
+from lmcache.v1.mp_memory_coordinator.leader import LeaderElector, StaticLeader
 from lmcache.v1.mp_memory_coordinator.models import (
     GIB,
     AllocationOrigin,
@@ -85,6 +87,23 @@ R_RUN2 = "/dev/dax-cxl/lmcache-e2e--mp-197/dax0.2"
 SLOT = 1 << 20
 
 
+def _physical(path: str, size_bytes: int, mode: str = "devdax") -> dict[str, object]:
+    """A watcher/physical entry as the MP server reports it."""
+    return {
+        "device_path": path,
+        "mode": mode,
+        "present": mode != "absent",
+        "major": 249,
+        "minor": 0,
+        "kernel_name": "dax2.0",
+        "driver": "device_dax" if mode == "devdax" else "",
+        "size_bytes": size_bytes,
+        "align_bytes": 2 << 20,
+        "probed_at": 1000.0,
+        "detail": "",
+    }
+
+
 def _config(**overrides: object) -> MPMemoryCoordinatorConfig:
     fields: dict[object, object] = dict(
         state_directory="/tmp/unused",
@@ -116,6 +135,37 @@ class Clock:
         return self.now
 
 
+class LosingLeader:
+    """Controllable leader used to lose the gate between two renewals."""
+
+    def __init__(self) -> None:
+        self._leader = True
+        self.ensure_calls = 0
+
+    @property
+    def identity(self) -> str:
+        return "losing-leader"
+
+    def is_leader(self) -> bool:
+        return self._leader
+
+    async def ensure_leader(self) -> bool:
+        self.ensure_calls += 1
+        return self._leader
+
+    async def run(self, stop: asyncio.Event) -> None:
+        await stop.wait()
+
+    async def release(self) -> None:
+        self._leader = False
+
+    def lose(self) -> None:
+        self._leader = False
+
+    def restore(self) -> None:
+        self._leader = True
+
+
 class Device:
     """One fake DAX device entry."""
 
@@ -143,6 +193,11 @@ class Instance:
         self.status_down = False
         self.adapters = 1
         self.reported_capacity: int | None = None  # delayed capacity fault
+        # Presence watcher: every attached path is present; ``present``
+        # adds paths the watcher sees but the adapter has not mapped.
+        self.watcher_enabled = True
+        self.directory = posixpath.dirname(devices[0].path)
+        self.present: dict[str, dict[str, object]] = {}
 
     @property
     def identity(self) -> InstanceIdentity:
@@ -166,6 +221,27 @@ class Instance:
             if d.state in ("active", "draining", "migrating", "resizing", "removing")
         )
 
+    def declare_present(
+        self, path: str, size_bytes: int = 64 * GIB, mode: str = "devdax"
+    ) -> None:
+        """Make the watcher report ``path`` present without attaching it."""
+        self.present[path] = _physical(path, size_bytes, mode)
+
+    def watcher(self) -> dict[str, object]:
+        if not self.watcher_enabled:
+            return {"enabled": False}
+        present: dict[str, dict[str, object]] = {}
+        for device in self.devices:
+            present.setdefault(device.path, _physical(device.path, 64 * GIB))
+        present.update(self.present)
+        return {
+            "enabled": True,
+            "directory": self.directory,
+            "interval_seconds": 1.0,
+            "last_scan_at": 1000.0,
+            "present_devices": [present[path] for path in sorted(present)],
+        }
+
     def hotplug(self) -> DaxHotplugStatus:
         template = json.loads((GOLDEN / "mp_reconfigure_dax_status.json").read_text())[
             "adapters"
@@ -187,6 +263,7 @@ class Instance:
                     "max_slots": 64 * 1024,
                     "live_slot_count": 0 if terminal else device.used_gib * 1024,
                     "locked_key_count": device.busy,
+                    "physical": _physical(device.path, 64 * GIB),
                 }
             )
             entries.append(entry)
@@ -198,6 +275,7 @@ class Instance:
                 "total_capacity_bytes": sum(e["max_dax_size_bytes"] for e in live),
                 "total_used_bytes": sum(e["live_slot_count"] * SLOT for e in live),
                 "devices": entries,
+                "watcher": self.watcher(),
             }
         )
 
@@ -227,6 +305,7 @@ class FakeWorld:
         self.add_fail = 0
         self.crash_after_effects: int | None = None
         self.effects = 0
+        self.after_sandwich: Callable[[], None] | None = None
 
     # -- helpers ---------------------------------------------------------------
 
@@ -301,7 +380,10 @@ class FakeWorld:
                 else 0
             ]
         ]
-        return join_sandwich(instances, usage, instances, 0.0)
+        snapshot = join_sandwich(instances, usage, instances, 0.0)
+        if self.after_sandwich is not None:
+            self.after_sandwich()
+        return snapshot
 
     async def preflight(self, identity: InstanceIdentity) -> LivePreflight | None:
         instance = self.by_identity(identity)
@@ -372,6 +454,18 @@ class FakeWorld:
             self.add_fail = max(0, self.add_fail - 1)
             self._maybe_crash()
             raise ClientHTTPError(400, '{"error": "failed to map DAX device"}', "add")
+        if self.faults.get("add") == "inactive":
+            # 2xx with a non-active entry (e.g. the path was being drained
+            # concurrently); nothing stays mapped on the fake server.
+            probe = Device(device_path, 0)
+            probe.state = "draining"
+            instance.devices.append(probe)
+            entry = instance.hotplug().find_live(device_path)
+            instance.devices.remove(probe)
+            self._maybe_crash()
+            return DaxAddResponse(
+                status="ok", operation="add", adapter_index=0, device=entry
+            )
         existing = instance.live(device_path)
         if existing is None:
             existing = Device(device_path, 0)
@@ -477,13 +571,17 @@ def _inventory() -> list[ManagedAllocation]:
 
 
 def _controller(
-    tmp_path: Path, world: FakeWorld, clock: Clock, config: MPMemoryCoordinatorConfig
+    tmp_path: Path,
+    world: FakeWorld,
+    clock: Clock,
+    config: MPMemoryCoordinatorConfig,
+    leader: LeaderElector | None = None,
 ) -> tuple[RebalanceController, CrashingJournal]:
     journal = CrashingJournal(tmp_path / "state")
     if not journal.exists():
         journal.save(JournalDocument(initialized=True, inventory=_inventory()))
     controller = RebalanceController(
-        config, journal, world, StaticLeader("test"), clock=clock
+        config, journal, world, leader or StaticLeader("test"), clock=clock
     )
     controller.load()
     return controller, journal
@@ -491,6 +589,13 @@ def _controller(
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def _status_section(controller: RebalanceController, key: str) -> dict[str, object]:
+    """One mapping-valued section of ``/status`` (``counters``, ...)."""
+    section = controller.status()[key]
+    assert isinstance(section, dict), section
+    return section
 
 
 async def _drive(controller: RebalanceController, cycles: int) -> None:
@@ -748,7 +853,286 @@ def test_discovery_is_skipped_while_the_outside_service_is_down(
     report = _run(_cycles(controller, 3))
     assert controller.document.inventory == []
     assert report.discovery == {"skipped_pass": "outside status unavailable"}
+    assert report.attachments == {"skipped_pass": "outside status unavailable"}
     assert world.audit == []
+
+
+# -- attach orchestration --------------------------------
+
+
+def _present_and_assigned(world: FakeWorld) -> None:
+    """The donor's spare is present, unattached, and assigned to the donor."""
+    world.donor.declare_present(D_RUN2)
+    world.outside[DONOR_IP][D_RUN2] = "assigned"
+    # Keep the fleet ineligible for a move so only the attach path acts.
+    world.receiver.used_bytes = 8 * GIB
+
+
+def _adds(world: FakeWorld) -> list[tuple]:
+    return [a for a in world.audit if a[0] == "add"]
+
+
+def test_attach_dry_run_reports_would_attach_and_never_posts(tmp_path: Path) -> None:
+    world = FakeWorld()
+    _present_and_assigned(world)
+    controller, _ = _controller(
+        tmp_path, world, Clock(), _config(actuation_enabled=False)
+    )
+    report = _run(_cycles(controller, 3))
+    assert report.attachments["would_attach"] == [D_RUN2]
+    assert report.attachments["attached"] == []
+    assert [p["device_path"] for p in report.attachments["planned"]] == [D_RUN2]
+    assert world.audit == []
+    assert world.donor.live(D_RUN2) is None
+    assert D_RUN2 not in {a.device_path for a in controller.document.inventory}
+    assert controller.attached_devices == 0
+    assert _status_section(controller, "counters")["attached"] == 0
+
+
+def test_attach_posts_exactly_once_and_discovery_adopts_next_cycle(
+    tmp_path: Path,
+) -> None:
+    world = FakeWorld()
+    _present_and_assigned(world)
+    controller, journal = _controller(tmp_path, world, Clock(), _config())
+
+    async def run():
+        first = await controller.run_once()
+        assert _adds(world) == [("add", "mp-donor", D_RUN2, 64 * GIB)]
+        assert first.attachments["attached"] == [D_RUN2]
+        assert first.attachments["failed"] == {}
+        assert first.decision == "attach issued; re-observing next cycle"
+        assert world.donor.live(D_RUN2) is not None
+        # Not in the inventory yet: adoption is discovery's job, next cycle.
+        assert D_RUN2 not in {a.device_path for a in controller.document.inventory}
+        second = await controller.run_once()
+        assert second.attachments["skipped"][D_RUN2] == "already attached"
+        assert second.attachments["planned"] == []
+        assert second.discovery["discovered"] == [D_RUN2]
+        await controller.run_once()
+
+    _run(run())
+    assert len(_adds(world)) == 1
+    adopted = controller.document.find_allocation(D_RUN2)
+    assert adopted is not None
+    assert adopted.origin is AllocationOrigin.DISCOVERED
+    assert adopted.worker_ip == DONOR_IP and adopted.allocation_size_gib == 64
+    assert controller.attached_devices == 1
+    assert _status_section(controller, "counters")["attached"] == 1
+    assert not any(a[0] in ("deallocate", "allocate") for a in world.audit)
+    # The count is in-memory only (attaching is idempotent): the journal
+    # never carries it and a restart starts from zero.
+    assert "attached" not in journal.load().model_dump(mode="json")["counters"]
+    restarted = RebalanceController(
+        _config(), journal, world, StaticLeader("test"), clock=Clock()
+    )
+    restarted.load()
+    assert restarted.attached_devices == 0
+    assert restarted.document.find_allocation(D_RUN2) is not None
+
+
+@pytest.mark.parametrize(
+    "mutate,expected",
+    [
+        (
+            lambda w: w.outside[DONOR_IP].__setitem__(D_RUN2, "free"),
+            f"outside status lists the path under [], not [{DONOR_IP}]",
+        ),
+        (
+            lambda w: (
+                w.outside[RECEIVER_IP].__setitem__(D_RUN2, "assigned")
+                or w.outside[DONOR_IP].__setitem__(D_RUN2, "free")
+            ),
+            f"outside status lists the path under ['{RECEIVER_IP}'], not [{DONOR_IP}]",
+        ),
+        (
+            lambda w: w.donor.declare_present(D_RUN2, mode="system-ram"),
+            "mode is system-ram",
+        ),
+        (
+            lambda w: w.donor.declare_present(D_RUN2, size_bytes=64 * GIB + 1),
+            f"size {64 * GIB + 1} is not a positive whole number of GiB",
+        ),
+    ],
+)
+def test_attach_never_posts_without_proven_ownership_or_a_usable_device(
+    tmp_path: Path, mutate: Callable[[FakeWorld], object], expected: str
+) -> None:
+    world = FakeWorld()
+    _present_and_assigned(world)
+    mutate(world)
+    controller, _ = _controller(tmp_path, world, Clock(), _config())
+    report = _run(_cycles(controller, 3))
+    assert world.audit == []
+    assert report.attachments["planned"] == []
+    assert report.attachments["skipped"][D_RUN2] == expected
+    assert report.attachments["skipped"][D_RUN1] == "already attached"
+    assert world.donor.live(D_RUN2) is None
+
+
+def test_attach_is_deferred_while_a_move_is_active(tmp_path: Path) -> None:
+    world = FakeWorld()
+    controller, _ = _controller(tmp_path, world, Clock(), _config())
+
+    async def run():
+        await _drive(controller, 3)  # MOVE SELECTED, drain issued
+        assert [a[0] for a in world.audit] == ["remove"]
+        world.donor.declare_present(D_RUN2)
+        world.outside[DONOR_IP][D_RUN2] = "assigned"
+        for _ in range(20):
+            report = await controller.run_once()
+            if controller.document.active_move is None:
+                break
+            assert report.attachments == {}
+            assert all(a[2] != D_RUN2 for a in _adds(world))
+        assert controller.document.history[-1].outcome is MoveOutcome.SUCCEEDED
+        # Only once the saga is over does the spare get attached.
+        report = await controller.run_once()
+        assert report.attachments["attached"] == [D_RUN2]
+
+    _run(run())
+    adds = _adds(world)
+    assert adds[-1] == ("add", "mp-donor", D_RUN2, 64 * GIB)
+    assert [a[2] for a in adds] == [R_RUN1, D_RUN2]
+
+
+def test_attach_failure_backs_off_for_the_cooldown(tmp_path: Path) -> None:
+    world = FakeWorld()
+    _present_and_assigned(world)
+    world.faults["add"] = "always"
+    clock = Clock()
+    controller, _ = _controller(tmp_path, world, clock, _config(cooldown_seconds=10.0))
+
+    async def run():
+        first = await controller.run_once()
+        assert len(_adds(world)) == 1
+        assert list(first.attachments["failed"]) == [D_RUN2]
+        assert first.attachments["attached"] == []
+        for _ in range(3):
+            report = await controller.run_once()
+            assert report.attachments["skipped"][D_RUN2] == "recent attach failure"
+        assert len(_adds(world)) == 1, "no retry within the cooldown"
+        clock.now += 10.0
+        world.faults.pop("add")
+        report = await controller.run_once()
+        assert report.attachments["attached"] == [D_RUN2]
+
+    _run(run())
+    assert len(_adds(world)) == 2
+    assert controller.attached_devices == 1
+
+
+def test_non_active_add_response_is_a_failure_that_backs_off(tmp_path: Path) -> None:
+    world = FakeWorld()
+    _present_and_assigned(world)
+    world.faults["add"] = "inactive"
+    controller, _ = _controller(
+        tmp_path, world, Clock(), _config(cooldown_seconds=10.0)
+    )
+
+    async def run():
+        first = await controller.run_once()
+        assert first.attachments["failed"] == {D_RUN2: "add returned state draining"}
+        assert first.attachments["attached"] == []
+        assert first.decision == "attach issued; re-observing next cycle"
+        assert controller.attached_devices == 0
+        second = await controller.run_once()
+        assert second.attachments["skipped"][D_RUN2] == "recent attach failure"
+        assert second.attachments["planned"] == []
+
+    _run(run())
+    assert _adds(world) == [("add", "mp-donor", D_RUN2, 64 * GIB)]
+    assert _status_section(controller, "counters")["attached"] == 0
+    assert world.donor.live(D_RUN2) is None
+
+
+def test_attach_is_withheld_when_leadership_cannot_be_renewed(tmp_path: Path) -> None:
+    world = FakeWorld()
+    _present_and_assigned(world)
+    leader = LosingLeader()
+    controller, _ = _controller(tmp_path, world, Clock(), _config(), leader=leader)
+    world.after_sandwich = leader.lose  # is_leader() held at cycle start
+
+    async def run():
+        report = await controller.run_once()
+        assert report.attachments["skipped_pass"] == "not leader"
+        assert [p["device_path"] for p in report.attachments["planned"]] == [D_RUN2]
+        assert D_RUN2 not in report.attachments["skipped"]
+        assert report.attachments["attached"] == []
+        assert world.audit == []
+        world.after_sandwich = None
+        leader.restore()
+        report = await controller.run_once()
+        assert report.attachments["attached"] == [D_RUN2]
+        assert "skipped_pass" not in report.attachments
+
+    _run(run())
+    assert _adds(world) == [("add", "mp-donor", D_RUN2, 64 * GIB)]
+    assert controller.attached_devices == 1
+
+
+def test_stop_request_withholds_planned_attaches(tmp_path: Path) -> None:
+    world = FakeWorld()
+    _present_and_assigned(world)
+    controller, _ = _controller(tmp_path, world, Clock(), _config())
+    controller.request_stop()
+    report = _run(_cycles(controller, 2))
+    assert report.attachments["would_attach"] == [D_RUN2]
+    assert report.attachments["attached"] == []
+    assert [p["device_path"] for p in report.attachments["planned"]] == [D_RUN2]
+    assert world.audit == []
+    assert controller.attached_devices == 0
+
+
+def test_attach_cycle_never_selects_a_move_from_the_pre_attach_snapshot(
+    tmp_path: Path,
+) -> None:
+    # Donor LOW, receiver HIGH: the fleet is move-eligible from the third
+    # sample on. The spare becomes present + assigned right before that
+    # cycle, so the add and the would-be SELECT share one sandwich read; a
+    # record built from it would carry the pre-attach donor capacity and the
+    # saga would wait for capacity convergence forever.
+    world = FakeWorld()
+    controller, _ = _controller(tmp_path, world, Clock(), _config())
+
+    async def run():
+        await _drive(controller, 2)
+        assert world.audit == []
+        world.donor.declare_present(D_RUN2)
+        world.outside[DONOR_IP][D_RUN2] = "assigned"
+        third = await controller.run_once()
+        assert third.attachments["attached"] == [D_RUN2]
+        assert third.proposal is None
+        assert third.decision == "attach issued; re-observing next cycle"
+        assert controller.document.active_move is None
+        assert _adds(world) == [("add", "mp-donor", D_RUN2, 64 * GIB)]
+        fourth = await controller.run_once()
+        assert fourth.attachments["skipped"][D_RUN2] == "already attached"
+        assert fourth.discovery["discovered"] == [D_RUN2]
+        assert fourth.proposal is not None
+        move = controller.document.active_move
+        assert move is not None
+        # The record captures the post-attach capacity, so the saga converges.
+        assert move.donor_capacity_bytes == 192 * GIB
+        await _drive(controller, 16)
+
+    _run(run())
+    assert _terminal(controller)
+    move = controller.document.history[-1]
+    assert move.state is MoveState.COMPLETE and move.outcome is MoveOutcome.SUCCEEDED
+    assert move.donor_capacity_bytes == 192 * GIB
+    assert world.donor.capacity() == 128 * GIB
+    # The spare's attach precedes the move in the audit; count MOVE effects.
+    attach, *rest = world.audit
+    assert attach == ("add", "mp-donor", D_RUN2, 64 * GIB)
+    world.audit = rest
+    assert _counts(world) == {
+        "add": 1,
+        "remove:drain": 1,
+        "remove:evict": 1,
+        "deallocate": 1,
+        "allocate": 1,
+    }
 
 
 def test_coordinator_outage_resets_history_and_holds_a_move(tmp_path: Path) -> None:

@@ -1030,6 +1030,105 @@ def test_reset_restores_defaults(harness: Harness) -> None:
     assert harness.add(harness.receiver, RECEIVER_RUNTIME, "64GiB").status_code == 200
 
 
+def test_present_devices_feed_the_watcher_without_attaching(
+    harness: Harness,
+) -> None:
+    donor, admin = harness.donor, harness.admin
+    spare = "/dev/dax-cxl/lmcache-e2e--mp-196/dax0.2"
+
+    def watcher() -> dict[str, object]:
+        body = donor.get("/reconfigure/dax/status").json()
+        return dict(body["adapters"][0]["status"]["watcher"])
+
+    def present_devices() -> list[dict[str, object]]:
+        devices = watcher()["present_devices"]
+        assert isinstance(devices, list), devices
+        return devices
+
+    def physical(device: dict[str, object]) -> dict[str, object]:
+        view = device["physical"]
+        assert isinstance(view, dict), view
+        return view
+
+    # Attached devices are present by construction; nothing else is.
+    initial = watcher()
+    assert initial["enabled"] is True
+    assert initial["directory"] == "/dev/dax-cxl/lmcache-e2e--mp-196"
+    assert [p["device_path"] for p in present_devices()] == [
+        DONOR_BOOT,
+        DONOR_RUNTIME,
+    ]
+    for device in harness.devices(donor):
+        assert physical(device)["device_path"] == device["device_path"]
+        assert physical(device)["mode"] == "devdax"
+        assert physical(device)["size_bytes"] == device["max_dax_size_bytes"]
+
+    declared = admin.post(
+        "/__test/present_devices",
+        json={"instance_id": DONOR_ID, "device_path": spare, "size_bytes": 64 * GIB},
+    )
+    assert declared.status_code == 200
+    assert declared.json()["mode"] == "devdax"
+    assert declared.json()["driver"] == "device_dax"
+    present = {str(p["device_path"]): p for p in present_devices()}
+    assert set(present) == {DONOR_BOOT, DONOR_RUNTIME, spare}
+    assert present[spare]["size_bytes"] == 64 * GIB
+    # Present is not attached: the adapter still lists two devices.
+    assert [d["device_path"] for d in harness.devices(donor)] == [
+        DONOR_BOOT,
+        DONOR_RUNTIME,
+    ]
+    assert harness.capacity(donor) == 128 * GIB
+    # A declared state overrides the attached device's own physical view.
+    override = admin.post(
+        "/__test/present_devices",
+        json={
+            "instance_id": DONOR_ID,
+            "device_path": DONOR_RUNTIME,
+            "mode": "system-ram",
+            "size_bytes": 64 * GIB,
+        },
+    )
+    assert override.status_code == 200
+    runtime = next(
+        d for d in harness.devices(donor) if d["device_path"] == DONOR_RUNTIME
+    )
+    assert physical(runtime)["mode"] == "system-ram"
+    assert physical(runtime)["driver"] == "kmem"
+    assert runtime["state"] == "active"
+    # Once added, the spare is both present and attached.
+    assert harness.add(donor, spare, "64GiB").status_code == 200
+    assert [d["device_path"] for d in harness.devices(donor)] == [
+        DONOR_BOOT,
+        DONOR_RUNTIME,
+        spare,
+    ]
+    assert len(present_devices()) == 3
+    snapshot = admin.get("/__test/state").json()
+    donor_state = next(i for i in snapshot["instances"] if i["instance_id"] == DONOR_ID)
+    assert [p["device_path"] for p in donor_state["present_devices"]] == [
+        DONOR_BOOT,
+        DONOR_RUNTIME,
+        spare,
+    ]
+    mutations = [
+        r
+        for r in admin.get("/__test/audit").json()["records"]
+        if r["kind"] == "mutation" and r["path"] == "/__test/present_devices"
+    ]
+    assert [m["mutation"]["device_path"] for m in mutations] == [spare, DONOR_RUNTIME]
+    unknown = admin.post(
+        "/__test/present_devices", json={"instance_id": "nope", "device_path": spare}
+    )
+    assert unknown.status_code == 404
+    # Reset drops every declaration.
+    admin.post("/__test/reset")
+    assert [p["device_path"] for p in present_devices()] == [
+        DONOR_BOOT,
+        DONOR_RUNTIME,
+    ]
+
+
 def test_admin_usage_and_device_counters(harness: Harness) -> None:
     admin = harness.admin
     usage = admin.post(

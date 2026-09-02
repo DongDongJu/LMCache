@@ -35,7 +35,20 @@
             "state": "active",
             "inflight_store_tasks": 0,
             "inflight_lookup_tasks": 0,
-            "inflight_load_tasks": 0
+            "inflight_load_tasks": 0,
+            "physical": {
+              "device_path": "/dev/dax-cxl/lmcache-e2e--mp-196/dax0.0",
+              "mode": "devdax",
+              "present": true,
+              "major": 249,
+              "minor": 0,
+              "kernel_name": "dax2.0",
+              "driver": "device_dax",
+              "size_bytes": 512,
+              "align_bytes": 2097152,
+              "probed_at": 1700000000.0,
+              "detail": ""
+            }
           },
           {
             "is_healthy": false,
@@ -55,9 +68,56 @@
             "state": "removed",
             "inflight_store_tasks": 0,
             "inflight_lookup_tasks": 0,
-            "inflight_load_tasks": 0
+            "inflight_load_tasks": 0,
+            "physical": {
+              "device_path": "/dev/dax-cxl/lmcache-e2e--mp-196/dax0.1",
+              "mode": "devdax",
+              "present": true,
+              "major": 249,
+              "minor": 1,
+              "kernel_name": "dax2.1",
+              "driver": "device_dax",
+              "size_bytes": 512,
+              "align_bytes": 2097152,
+              "probed_at": 1700000000.0,
+              "detail": ""
+            }
           }
-        ]
+        ],
+        "watcher": {
+          "enabled": true,
+          "directory": "/dev/dax-cxl/lmcache-e2e--mp-196",
+          "interval_seconds": 1.0,
+          "last_scan_at": 1700000000.5,
+          "present_devices": [
+            {
+              "device_path": "/dev/dax-cxl/lmcache-e2e--mp-196/dax0.0",
+              "mode": "devdax",
+              "present": true,
+              "major": 249,
+              "minor": 0,
+              "kernel_name": "dax2.0",
+              "driver": "device_dax",
+              "size_bytes": 512,
+              "align_bytes": 2097152,
+              "probed_at": 1700000000.0,
+              "detail": ""
+            },
+            {
+              "device_path": "/dev/dax-cxl/lmcache-e2e--mp-196/dax0.1",
+              "mode": "devdax",
+              "present": true,
+              "major": 249,
+              "minor": 1,
+              "kernel_name": "dax2.1",
+              "driver": "device_dax",
+              "size_bytes": 512,
+              "align_bytes": 2097152,
+              "probed_at": 1700000000.0,
+              "detail": ""
+            }
+          ]
+        }
       },
       "adapter_index": 0,
       "l2_adapter_index": 0

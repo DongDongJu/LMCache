@@ -192,8 +192,9 @@ The MP server never attaches a present device on its own. Presence proves
 that a node is usable, not that this server owns it: the same ``major:minor``
 can be exposed under any number of directories, and a device that the
 outside allocator has already handed to another node still looks identical
-in ``/dev``. Only a caller that can prove allocator assignment should
-consume ``watcher.present_devices`` and issue ``/reconfigure/dax/add``.
+in ``/dev``. Only the MP Memory Coordinator can prove allocator assignment,
+so it consumes ``watcher.present_devices`` and issues
+``/reconfigure/dax/add`` itself.
 
 **Add gate:** ``POST /reconfigure/dax/add`` probes the path before mapping
 and rejects the request with ``400`` (creating no entry) only on a positive
