@@ -424,9 +424,10 @@ class Memcoord:
     def seed_inventory(self) -> None:
         """Adopt the donor's runtime path through the real ``--adopt`` command.
 
-        The coordinator never discovers devices, so every scenario that
-        expects a move first adopts the exact ``(worker_ip, path, size)``
-        tuple the fixture declares as the donor's assigned runtime device.
+        Discovery would find the donor's device on its own; scenarios that
+        want a deterministic, explicitly adopted inventory (or that exercise
+        the ``--adopt`` command itself) still seed the exact
+        ``(worker_ip, path, size)`` tuple the fixture declares.
         """
         result = self.adopt(
             {

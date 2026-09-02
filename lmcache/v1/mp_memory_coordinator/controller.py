@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """The control loop: observe, propose, and drive one move at a time.
 
-Each cycle performs a sandwich read. With no active move it reconciles the
-inventory, updates the pressure history, ranks candidates, preflights the
-best pair, and logs a structured dry-run proposal; with
+Each cycle performs a sandwich read. With no active move it reads each
+relevant MP server's DAX status once, discovers newly owned devices from
+outside status (see :mod:`lmcache.v1.mp_memory_coordinator.discovery`),
+reconciles the inventory, updates the pressure history, ranks candidates,
+preflights the best pair, and logs a structured dry-run proposal; with
 ``actuation_enabled`` and leadership it persists a ``SELECTED`` record. With
 an active move it gathers :class:`Evidence`, asks :func:`decide` for the one
 next action, executes at most one side effect, and persists the result --
@@ -14,7 +16,7 @@ injected fakes; :class:`HttpRemote` binds it to the real clients.
 """
 
 # Standard
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 import asyncio
@@ -48,6 +50,7 @@ from lmcache.v1.mp_memory_coordinator.clients.mp_server_client import (
     format_gib,
 )
 from lmcache.v1.mp_memory_coordinator.config import MPMemoryCoordinatorConfig
+from lmcache.v1.mp_memory_coordinator.discovery import discover
 from lmcache.v1.mp_memory_coordinator.leader import LeaderElector
 from lmcache.v1.mp_memory_coordinator.models import (
     AllocationOrigin,
@@ -240,6 +243,8 @@ class CycleReport:
         move_id: Active move id (``""`` if none).
         move_state: Active move state (``""`` if none).
         decision: Decision type and reason for an active move.
+        discovery: What device discovery adopted and skipped this cycle
+            (empty while a move is active, when discovery does not run).
         error: Error text, if the cycle failed.
     """
 
@@ -252,6 +257,7 @@ class CycleReport:
     move_id: str = ""
     move_state: str = ""
     decision: str = ""
+    discovery: dict[str, object] = field(default_factory=dict)
     error: str = ""
 
     def as_dict(self) -> dict[str, object]:
@@ -266,6 +272,7 @@ class CycleReport:
             "move_id": self.move_id,
             "move_state": self.move_state,
             "decision": self.decision,
+            "discovery": self.discovery,
             "error": self.error,
         }
 
@@ -532,7 +539,10 @@ class RebalanceController:
         self._history.observe(snapshot, self._config)
         if not snapshot.coordinator_reachable:
             return
-        await self._reconcile_inventory(snapshot)
+        statuses = await self._collect_dax_statuses(snapshot)
+        outside = await self._remote.outside_status()
+        report.discovery = self._discover(snapshot, statuses, outside)
+        self._reconcile_inventory(snapshot, statuses)
         candidates = rank_candidates(
             snapshot, self._history, self._document.cooldowns, self._clock()
         )
@@ -622,19 +632,88 @@ class RebalanceController:
                 rejections.extend(result)
         return None, rejections
 
-    async def _reconcile_inventory(self, snapshot: MembershipSnapshot) -> None:
+    async def _collect_dax_statuses(
+        self, snapshot: MembershipSnapshot
+    ) -> dict[str, DaxHotplugStatus]:
+        """Read every accepted instance's DAX adapter status once per cycle.
+
+        Any accepted instance may be holding an undiscovered device, and
+        reconciliation needs the same documents, so each is read exactly
+        once. Unreadable instances are simply absent from the result.
+
+        Args:
+            snapshot: The current sandwich read.
+
+        Returns:
+            ``instance_id -> DaxHotplugStatus`` for every instance read
+            successfully.
+        """
+        statuses: dict[str, DaxHotplugStatus] = {}
+        for sample in snapshot.samples.values():
+            identity = sample.identity
+            status = await self._remote.dax_status(identity)
+            if status is not None:
+                statuses[identity.instance_id] = status
+        return statuses
+
+    def _discover(
+        self,
+        snapshot: MembershipSnapshot,
+        statuses: Mapping[str, DaxHotplugStatus],
+        outside: OutsideStatus | None,
+    ) -> dict[str, object]:
+        """Run one discovery pass and persist anything it adopted.
+
+        Discovery needs the outside status to prove ownership; when that
+        read failed the pass is skipped and the existing inventory is left
+        untouched, so a transient outside outage never shrinks what the
+        coordinator manages.
+
+        Args:
+            snapshot: The current sandwich read.
+            statuses: Per-instance DAX status from
+                :meth:`_collect_dax_statuses`.
+            outside: This cycle's outside status, or ``None`` when the read
+                failed.
+
+        Returns:
+            The JSON-friendly discovery summary for the cycle report.
+        """
+        if outside is None:
+            return {"skipped_pass": "outside status unavailable"}
+        result = discover(
+            snapshot.samples,
+            statuses,
+            outside,
+            self._document,
+            self._config,
+            self._clock(),
+        )
+        if result.discovered:
+            self._save()
+        return result.as_dict()
+
+    def _reconcile_inventory(
+        self,
+        snapshot: MembershipSnapshot,
+        statuses: Mapping[str, DaxHotplugStatus],
+    ) -> None:
         """Re-bind managed allocations to current instances and confirm them.
 
         An MP re-registration (new instance id or epoch for the same worker)
         updates the allocation's ``instance_id``; a device that is no
         longer live is logged but never re-attached from here -- no outside
         POST ever results from reconciliation.
+
+        Args:
+            snapshot: The current sandwich read.
+            statuses: Per-instance DAX status from
+                :meth:`_collect_dax_statuses`.
         """
         by_worker = {
             s.identity.worker_ip: s.identity for s in snapshot.samples.values()
         }
         changed = False
-        statuses: dict[str, DaxHotplugStatus | None] = {}
         for allocation in self._document.inventory:
             identity = by_worker.get(allocation.worker_ip)
             if identity is None:
@@ -653,9 +732,7 @@ class RebalanceController:
                 )
                 allocation.instance_id = identity.instance_id
                 changed = True
-            if identity.instance_id not in statuses:
-                statuses[identity.instance_id] = await self._remote.dax_status(identity)
-            dax = statuses[identity.instance_id]
+            dax = statuses.get(identity.instance_id)
             if dax is None:
                 continue
             live = dax.find_live(allocation.device_path)

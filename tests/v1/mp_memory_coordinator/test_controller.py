@@ -501,6 +501,14 @@ async def _drive(controller: RebalanceController, cycles: int) -> None:
             return
 
 
+async def _cycles(controller: RebalanceController, cycles: int):
+    """Run ``cycles`` cycles and return the last :class:`CycleReport`."""
+    report = None
+    for _ in range(cycles):
+        report = await controller.run_once()
+    return report
+
+
 def _terminal(controller: RebalanceController) -> bool:
     move = controller.document.active_move
     return move is None or move.state is MoveState.BLOCKED
@@ -667,7 +675,11 @@ def test_live_ratio_mismatch_produces_zero_posts(tmp_path: Path) -> None:
 
 
 def test_only_bootstrap_or_unapproved_paths_produce_zero_posts(tmp_path: Path) -> None:
+    # The donor's runtime device is live but the outside service does not
+    # call it assigned, so with an empty journal nothing is ever movable
+    # however healthy the fleet is.
     world = FakeWorld()
+    world.outside[DONOR_IP][D_RUN1] = "free"
     journal = CrashingJournal(tmp_path / "state")
     journal.save(JournalDocument(initialized=True, inventory=[]))
     controller = RebalanceController(
@@ -677,6 +689,66 @@ def test_only_bootstrap_or_unapproved_paths_produce_zero_posts(tmp_path: Path) -
     _run(_drive(controller, 5))
     assert world.audit == []
     assert controller.document.active_move is None
+    assert controller.document.inventory == []
+
+
+def test_discovery_makes_an_empty_journal_movable(tmp_path: Path) -> None:
+    # The default mode re-derives ownership from outside status, so no
+    # allowlist is needed for the same fleet to produce a move.
+    world = FakeWorld()
+    journal = CrashingJournal(tmp_path / "state")
+    journal.save(JournalDocument(initialized=True, inventory=[]))
+    controller = RebalanceController(
+        _config(), journal, world, StaticLeader("t"), clock=Clock()
+    )
+    controller.load()
+    _run(_drive(controller, 5))
+    paths = {a.device_path for a in controller.document.inventory}
+    assert D_RUN1 in paths
+    assert all(
+        a.origin is AllocationOrigin.DISCOVERED
+        for a in controller.document.inventory
+        if a.device_path == D_RUN1
+    )
+    assert "remove:drain" in _counts(world)
+
+
+def test_discovery_never_claims_a_path_outside_status_does_not_confirm(
+    tmp_path: Path,
+) -> None:
+    world = FakeWorld()
+    # The device stays live on the donor but the outside service stops
+    # calling it assigned: ownership is unproven, so it must never be
+    # claimed and no POST may follow.
+    world.outside[DONOR_IP][D_RUN1] = "free"
+    journal = CrashingJournal(tmp_path / "state")
+    journal.save(JournalDocument(initialized=True, inventory=[]))
+    controller = RebalanceController(
+        _config(), journal, world, StaticLeader("t"), clock=Clock()
+    )
+    controller.load()
+    report = _run(_cycles(controller, 5))
+    paths = {a.device_path for a in controller.document.inventory}
+    assert D_RUN1 not in paths
+    assert D_RUN1 in report.discovery["skipped"]
+    assert world.audit == []
+
+
+def test_discovery_is_skipped_while_the_outside_service_is_down(
+    tmp_path: Path,
+) -> None:
+    world = FakeWorld()
+    world.outside_up = False
+    journal = CrashingJournal(tmp_path / "state")
+    journal.save(JournalDocument(initialized=True, inventory=[]))
+    controller = RebalanceController(
+        _config(), journal, world, StaticLeader("t"), clock=Clock()
+    )
+    controller.load()
+    report = _run(_cycles(controller, 3))
+    assert controller.document.inventory == []
+    assert report.discovery == {"skipped_pass": "outside status unavailable"}
+    assert world.audit == []
 
 
 def test_coordinator_outage_resets_history_and_holds_a_move(tmp_path: Path) -> None:

@@ -460,6 +460,7 @@ class AllocationOrigin(str, Enum):
 
     ADOPTED = "adopted"
     ALLOCATED = "allocated"
+    DISCOVERED = "discovered"
     RESTORED = "restored"
 
 

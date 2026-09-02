@@ -355,7 +355,7 @@ lmcache mp-memory-coordinator --config memcoord.yaml --adopt adopt.yaml
 | `history_not_stable` | fewer than three consecutive same-level samples |
 | `preflight_failed` | unhealthy/closing adapter, hotplug disabled, zero or two DAX adapters, non-active device |
 | `live_ratio_mismatch` | coordinator usage says HIGH/LOW but `/reconfigure/dax/status` totals disagree |
-| `no_managed_runtime_device` | nothing adopted on the donor, or only the bootstrap device is active |
+| `no_managed_runtime_device` | nothing managed on the donor, or only the bootstrap device is active; `/status.last_cycle.discovery.skipped` names the reason per live device |
 | `projected_donor_ratio` | removing the device would push the donor above 0.70 |
 | `cooldown` | a move completed within `cooldown_seconds` |
 | `actuation_disabled` | dry run; the proposal is logged only |

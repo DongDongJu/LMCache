@@ -12,6 +12,7 @@ import json
 
 # Third Party
 import pytest
+import requests
 
 # Local
 from .conftest import (
@@ -157,12 +158,29 @@ def test_adapter_gate(harness: Harness, adapters: int) -> None:
 
 
 def test_ownership_gate_without_approved_runtime_path(harness: Harness) -> None:
-    """No adoption: only the bootstrap path exists in the MP, and the
-    coordinator owns nothing, so nothing is movable."""
+    """The donor's runtime path is live in the MP but the outside service no
+    longer calls it assigned: the coordinator owns nothing, discovery
+    declines it with a reason, and nothing is movable."""
+    response = requests.post(
+        f"{harness.endpoints.allocator_public_url}/api/v2/apps/lmcache/deallocations",
+        json={
+            "request_id": "unown-donor-runtime",
+            "target_node": DONOR_IP,
+            "device_path": DONOR_RUNTIME,
+        },
+        timeout=5,
+    )
+    assert response.status_code < 300, response.text
+    setup_posts = len(harness.allocator_posts())
+
     harness.memcoord.start()
     harness.memcoord.client.wait_cycles(6, timeout=60)
-    _no_posts(harness)
-    rejections = harness.memcoord.client.status()["last_cycle"]["rejections"]
+    assert harness.scenario_posts() == []
+    assert len(harness.allocator_posts()) == setup_posts
+    status = harness.memcoord.client.status()
+    assert status["inventory"] == []
+    assert DONOR_RUNTIME in status["last_cycle"]["discovery"]["skipped"]
+    rejections = status["last_cycle"]["rejections"]
     assert any(r["reason"] == "no_managed_runtime_device" for r in rejections), (
         rejections
     )

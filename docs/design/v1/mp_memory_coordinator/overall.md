@@ -39,6 +39,7 @@ recovery.py      the pure decision function: (MoveRecord, Evidence) -> one next 
 controller.py    the cycle: observe -> propose -> persist -> one effect -> persist
 persistence/     atomic, checksummed, versioned journal (tmp + fsync + rename + dir fsync)
 adoption.py      explicit one-time allowlist adoption; never discovers devices
+discovery.py     per-cycle inventory derivation from outside status (the default)
 leader.py        Kubernetes Lease elector (resourceVersion CAS) or static single-process leader
 app.py           /healthz /readyz /status /journal /metrics; graceful stop
 ```
@@ -141,13 +142,35 @@ bounded history, counters, and the `initialized` marker. Loading fails
 closed on a corrupt, truncated, checksum-invalid, or unknown-version file:
 the process stays alive (`/healthz` 503), unready, and mutates nothing.
 
-## Adoption
+## Owning a device: discovery and adoption
 
-Normal startup never discovers devices. `lmcache mp-memory-coordinator
+The coordinator only ever moves a device that is in its managed inventory,
+because the donor step ends in `POST /deallocations` and must never hand
+back memory the coordinator does not own. There are two ways in.
+
+**Discovery (every cycle).** `discovery.py` re-derives ownership from the
+outside Memory Allocation service, which is already the single writer for
+managed nodes and paths. A live device is adopted when its DAX index is
+`> 0`, its state is `active` and it is healthy and not closing, its path
+starts with `allowed_device_path_prefix`, outside status lists that exact
+path under exactly the one worker IP the instance registered, its map size
+is a positive whole number of GiB, and no inventory entry already claims
+it. Because it re-runs every cycle, a path that changes with its Pod name
+is re-derived rather than going stale, and no allowlist has to be
+maintained. Discovery is purely additive: it never removes an entry, and it
+is skipped entirely (leaving the inventory untouched) when the outside
+status read fails. Every live device it does *not* adopt is reported with
+a reason in `/status.last_cycle.discovery`, so an empty inventory is
+always explained.
+
+**Allowlist adoption** remains available. `lmcache mp-memory-coordinator
 --config C --adopt allowlist.yaml` (or `adoption_file` when the journal is
 uninitialized) adopts an entry only when its path is active at DAX index
 `> 0` on the instance registered for that worker IP, appears under the same
 worker in outside status, matches the approved map size, and is not owned.
+Note that `--adopt` adopts and exits without starting the control loop, and
+that `adoption_file` is read only while the journal carries no
+`initialized` marker.
 
 ## Leadership and deployment
 

@@ -9,6 +9,7 @@ and confirmed phase, never by cross-process wall clocks.
 
 # Third Party
 import pytest
+import requests
 
 # Local
 from .conftest import (
@@ -232,6 +233,57 @@ def test_dry_run_proposes_but_never_mutates(harness: Harness) -> None:
 
 
 @pytest.mark.local_only
+def test_discovery_moves_a_device_without_any_allowlist(harness: Harness) -> None:
+    """The default mode derives ownership from outside status alone.
+
+    No ``seed_inventory``, no ``adoption_file``, no ``--adopt``: the donor's
+    runtime path is claimed because the outside service lists it under the
+    donor's worker IP, and the same single move follows.
+    """
+    assert harness.outside_status() == {DONOR_IP: [DONOR_RUNTIME], RECEIVER_IP: []}
+
+    harness.memcoord.start()
+    move = harness.memcoord.client.wait_terminal(timeout=120)
+    assert move["state"] == "COMPLETE", move
+    assert move["outcome"] == "SUCCEEDED", move
+
+    # Exactly the one device the outside service confirmed, and nothing else.
+    assert [r["operation"] for r in harness.allocator_posts()] == [
+        "deallocate",
+        "allocate",
+    ]
+    status = harness.memcoord.client.status()
+    origins = {a["origin"] for a in status["inventory"]}
+    assert origins <= {"discovered", "allocated"}, status["inventory"]
+
+
+def test_discovery_declines_a_path_outside_status_does_not_confirm(
+    harness: Harness,
+) -> None:
+    """A live device the outside service does not list is never claimed."""
+    response = requests.post(
+        f"{harness.endpoints.allocator_public_url}/api/v2/apps/lmcache/deallocations",
+        json={
+            "request_id": "unown-donor-runtime",
+            "target_node": DONOR_IP,
+            "device_path": DONOR_RUNTIME,
+        },
+        timeout=5,
+    )
+    assert response.status_code < 300, response.text
+    assert harness.outside_status() == {DONOR_IP: [], RECEIVER_IP: []}
+    setup_posts = len(harness.allocator_posts())
+
+    harness.memcoord.start()
+    harness.memcoord.client.wait_cycles(6, timeout=60)
+    assert harness.scenario_posts() == []
+    assert len(harness.allocator_posts()) == setup_posts
+    status = harness.memcoord.client.status()
+    assert status["inventory"] == []
+    skipped = status["last_cycle"]["discovery"]["skipped"]
+    assert DONOR_RUNTIME in skipped, skipped
+
+
 def test_explicit_adoption_command_populates_inventory(harness: Harness) -> None:
     """Adoption requires the exact (worker_ip, path, size) tuple."""
     result = harness.memcoord.adopt(

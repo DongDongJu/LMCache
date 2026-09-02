@@ -74,7 +74,8 @@ Options
      - Required. YAML configuration file (keys below).
    * - ``--adopt PATH``
      - Adopt the allocations listed in this allowlist into the journal once,
-       then exit. The coordinator never discovers devices on its own.
+       then exit without starting the control loop. Stop a running
+       coordinator first: the journal has no cross-process lock.
    * - ``--check``
      - Validate the configuration and exit.
 
@@ -112,8 +113,27 @@ default; ``actuation_enabled`` is ``false`` unless set.
    lease_renew_interval_seconds: 5
    adoption_file: ""              # applied once when the journal is uninitialized
 
+Which devices the coordinator manages
+-------------------------------------
+
+The coordinator only moves a device in its managed inventory, because the
+donor step ends in ``POST /deallocations`` and must never hand back memory it
+does not own. Every cycle it re-derives ownership from the outside Memory
+Allocation service: a live device is adopted when its DAX index is ``> 0``,
+its state is ``active`` and it is healthy and not closing, its path starts
+with ``allowed_device_path_prefix``, the outside service lists that exact
+path under exactly the one worker IP the MP instance registered, and its DAX
+map size is a positive whole number of GiB. No allowlist is needed, and a
+path that changes with its Pod name is re-derived instead of going stale.
+Devices that are declined are reported per path in
+``/status.last_cycle.discovery.skipped``, so an empty inventory is always
+explained.
+
 Adoption allowlist
 ------------------
+
+Optional: discovery finds the same devices on its own. Use it when a path
+must be approved explicitly before the coordinator may manage it.
 
 .. code-block:: yaml
 
@@ -125,7 +145,9 @@ Adoption allowlist
 
 An entry is adopted only when the path is active at DAX index ``> 0`` on the
 MP server registered for that worker IP, is listed under the same worker by
-the outside allocation service, and matches the approved size.
+the outside allocation service, and matches the approved size. ``adoption_file``
+is read only while the journal carries no ``initialized`` marker; ``--adopt``
+applies an allowlist at any time.
 
 Endpoints
 ---------
@@ -150,8 +172,9 @@ Endpoints
 Rollout
 -------
 
-1. Deploy with ``actuation_enabled: false`` and an explicit adoption
-   allowlist; observe proposals and rejection reasons for at least 24 hours.
+1. Deploy with ``actuation_enabled: false``; confirm the discovered (or
+   adopted) inventory is exactly what you expect, then observe proposals and
+   rejection reasons for at least 24 hours.
 2. Confirm ``high_ratio`` is below any local eviction trigger.
 3. Enable one donor/receiver canary with a five-minute cooldown and alert on
    ``BLOCKED`` (``/readyz`` turns 503, ``lmcache_memcoord_moves_blocked_total``).
