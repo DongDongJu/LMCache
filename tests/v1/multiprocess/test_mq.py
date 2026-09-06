@@ -834,6 +834,58 @@ def test_add_affinity_thread_pool():
     server.close()
 
 
+@pytest.mark.parametrize("affinity", [False, True])
+def test_close_waits_for_running_and_queued_handlers(
+    affinity: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Draining stops admission and finishes queued work before returning."""
+    context = zmq.Context.instance()
+    server = MessageQueueServer("tcp://127.0.0.1:*", context)
+    endpoint = server.socket.getsockopt_string(zmq.LAST_ENDPOINT)
+    started = threading.Event()
+    release = threading.Event()
+    completed: list[int] = []
+
+    def blocking_lookup(key: IPCCacheServerKey, read_locks: int) -> None:
+        started.set()
+        assert release.wait(timeout=10)
+        completed.append(read_locks)
+
+    add_handler_helper(server, RequestType.LOOKUP, blocking_lookup)
+    add_handler_helper(server, RequestType.NOOP, test_mq_handler_helpers.noop_handler)
+    add_pool = (
+        server.add_affinity_thread_pool if affinity else server.add_normal_thread_pool
+    )
+    add_pool([RequestType.LOOKUP], max_workers=1)
+    server.start()
+    client = MessageQueueClient(endpoint, context)
+    closer = threading.Thread(target=server.close, kwargs={"wait_for_handlers": True})
+    try:
+        client.submit_request(RequestType.LOOKUP, [create_cache_key(1), 1])
+        assert started.wait(timeout=5)
+        client.submit_request(RequestType.LOOKUP, [create_cache_key(2), 2])
+        # A synchronous response confirms both earlier requests were admitted.
+        assert (
+            client.submit_request(RequestType.NOOP, []).result(timeout=5) == "NOOP_OK"
+        )
+        closer.start()
+        server.worker_thread.join(timeout=5)
+        assert not server.worker_thread.is_alive()
+        assert closer.is_alive()
+        assert completed == []
+    finally:
+        release.set()
+        if closer.ident is not None:
+            closer.join(timeout=5)
+        else:
+            server.close(wait_for_handlers=True)
+        client.close()
+
+    assert not closer.is_alive()
+    assert completed == [1, 2]
+    assert "Error in blocking handler" not in caplog.text
+
+
 def test_normal_pool_error_on_sync_handler():
     """
     Test that add_normal_thread_pool raises TypeError for SYNC handlers.

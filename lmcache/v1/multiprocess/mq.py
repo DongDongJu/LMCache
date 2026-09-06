@@ -879,11 +879,21 @@ class MessageQueueServer:
                 )
         self.worker_thread.start()
 
-    def close(self) -> None:
+    def close(self, wait_for_handlers: bool = False) -> None:
+        """Stop request admission and shut down handler pools.
+
+        Args:
+            wait_for_handlers (bool): Wait for all admitted blocking handlers,
+                including queued work, before returning. Defaults to False.
+
+        Waiting drains handlers, but does not guarantee response delivery.
+        Call from outside the request handlers to avoid joining their own pool.
+        """
         self.is_finished.set()
         if self.worker_thread.is_alive():
             self.worker_thread.join()
         self.socket.close()
         for pool in self.extra_pools:
-            pool.shutdown(wait=False)
+            pool.shutdown(wait=wait_for_handlers)
+        # Handler completion callbacks still use this notifier while draining.
         self._output_efd.close()
