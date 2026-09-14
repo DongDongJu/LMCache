@@ -34,6 +34,7 @@ from lmcache.v1.storage_backend.raw_block.key_codec import (
     decode_legacy_key,
     slot_identity_from_encoded_key,
 )
+from lmcache.v1.storage_backend.raw_block.uecc import classify_oserror
 
 logger = init_logger(__name__)
 
@@ -390,6 +391,18 @@ class RawBlockCore:
         self._meta_stop_evt = threading.Event()
         self._meta_thread: Optional[threading.Thread] = None
 
+        # UECC / critical error state. The device starts active and healthy.
+        # The transition to blocked happens exactly once (first UECC).
+        self._device_active: bool = True
+        self._device_blocked: bool = False
+        self._uecc_count: int = 0
+        self._critical_error: bool = False
+        self._quarantined_slots: set[int] = set()
+        self._critical_error_transitioned: bool = False
+        self._critical_error_ts: float = 0.0
+        self._critical_error_status: int = 0
+        self._state_lock = threading.Lock()
+
         try:
             self._ensure_capacity_and_layout()
             if self.load_checkpoint_on_init:
@@ -616,6 +629,9 @@ class RawBlockCore:
         Returns:
             A metadata-or-None list aligned with ``encoded_keys``.
         """
+        # A5: Whole-device gate — refuse metadata reads after UECC.
+        if self._device_blocked:
+            return [None] * len(encoded_keys)
         with self._lock:
             metas: list[DiskCacheMetadata | None] = []
             for encoded_key in encoded_keys:
@@ -643,6 +659,9 @@ class RawBlockCore:
             Metadata for the contiguous leading hit prefix. The returned list
             stops at the first missing key.
         """
+        # A5: Whole-device gate — refuse metadata reads after UECC.
+        if self._device_blocked:
+            return []
         with self._lock:
             metas: list[DiskCacheMetadata] = []
             for encoded_key in encoded_keys:
@@ -743,6 +762,14 @@ class RawBlockCore:
             raise ValueError("keys and objs must be non-empty")
         if len(keys) != len(objs):
             raise ValueError("keys and objs must have the same length")
+
+        # A5: Whole-device gate — refuse writes after UECC transition.
+        if self._device_blocked:
+            return RawBlockPutManyResult(
+                results=[False] * len(keys),
+                stored_keys=[],
+            )
+
         per_key_placement_ids = normalize_raw_block_placement_ids(
             placement_ids,
             len(keys),
@@ -791,6 +818,16 @@ class RawBlockCore:
                 if inflight is None:
                     results[i] = False
                     continue
+                # A7: Late-store fence — recheck after I/O. If UECC was
+                # detected during or after the write, abort and do not
+                # publish the key to the index.
+                if self._device_blocked:
+                    self._append_free_slot_locked(
+                        self._offset_to_slot(int(inflight.offset))
+                    )
+                    self._meta_dirty_total += 1
+                    results[i] = False
+                    continue
                 if inflight.canceled or not success:
                     self._append_free_slot_locked(
                         self._offset_to_slot(int(inflight.offset))
@@ -829,6 +866,9 @@ class RawBlockCore:
             A list of booleans aligned with ``encoded_keys``.
         """
         results: list[bool] = []
+        # A5: Whole-device gate — refuse lookups after UECC transition.
+        if self._device_blocked:
+            return [False] * len(encoded_keys)
         with self._lock:
             for encoded_key in encoded_keys:
                 found = encoded_key in self._index
@@ -869,6 +909,10 @@ class RawBlockCore:
         if len(encoded_keys) != len(objs):
             raise ValueError("encoded_keys and objs must have the same length")
 
+        # A5: Whole-device gate — refuse reads after UECC transition.
+        if self._device_blocked:
+            return [False] * len(encoded_keys)
+
         with self._lock:
             items = [
                 (encoded_key, self._index.get(encoded_key))
@@ -877,6 +921,7 @@ class RawBlockCore:
             self._inflight_io_count += 1
 
         results = [False] * len(encoded_keys)
+        uecc_detected = False
         try:
             for i, (encoded_key, entry) in enumerate(items):
                 if entry is None:
@@ -921,14 +966,43 @@ class RawBlockCore:
                         )
                     objs[i].metadata.cached_positions = entry.meta.cached_positions
                     results[i] = True
-                except Exception as e:
-                    if raise_on_error:
-                        raise
-                    logger.error("RawBlockCore load failed for %s: %s", encoded_key, e)
+                except OSError as e:
+                    # A3/A4: Check for UECC error during read
+                    classification = classify_oserror(e)
+                    if classification["is_uecc"]:
+                        uecc_detected = True
+                        self._handle_uecc_on_read(e)
+                        results[i] = False
+                        if raise_on_error:
+                            raise
+                        logger.error(
+                            "RawBlockCore UECC load failed for %s: status=0x%04x",
+                            encoded_key, classification["decoded"]["status_code"],
+                        )
+                    else:
+                        if raise_on_error:
+                            raise
+                        logger.error(
+                            "RawBlockCore load failed for %s: %s",
+                            encoded_key, e,
+                        )
         finally:
             with self._lock:
                 self._inflight_io_count -= 1
                 self._last_io_ts = time.monotonic()
+
+        # A8: Late-load fence — recheck after all I/O completes.
+        # If UECC was detected, invalidate the entire batch and purge entries.
+        if self._device_blocked:
+            for i in range(len(results)):
+                results[i] = False
+            if uecc_detected:
+                self._purge_poisoned_entries(encoded_keys, results)
+            return results
+
+        if uecc_detected:
+            self._purge_poisoned_entries(encoded_keys, results)
+
         return results
 
     def unlock_many(self, encoded_keys: Sequence[str]) -> None:
@@ -963,6 +1037,9 @@ class RawBlockCore:
             A list of per-key deletion booleans aligned with ``encoded_keys``.
         """
         deleted: list[bool] = []
+        # A5: Whole-device gate — refuse deletes after UECC (conservative).
+        if self._device_blocked:
+            return [False] * len(encoded_keys)
         with self._lock:
             for encoded_key in encoded_keys:
                 entry = self._index.get(encoded_key)
@@ -1051,10 +1128,179 @@ class RawBlockCore:
                 "fdp_slot_affinity_fallback_count": (
                     self._fdp_slot_affinity_fallback_count
                 ),
+                # UECC / critical error state
+                "device_active": self._device_active,
+                "device_blocked": self._device_blocked,
+                "uecc_count": self._uecc_count,
+                "has_critical_error": self._critical_error,
+                "quarantined_slot_count": len(self._quarantined_slots),
+                "critical_error_transitioned": self._critical_error_transitioned,
             }
 
+    # ------------------------------------------------------------------
+    # UECC / critical error state management (A2-A4)
+    # ------------------------------------------------------------------
+
+    @property
+    def device_active(self) -> bool:
+        """Return True if the device has not been blocked by a critical error."""
+        with self._state_lock:
+            return self._device_active
+
+    @property
+    def device_blocked(self) -> bool:
+        """Return True if the device has been blocked due to critical error."""
+        with self._state_lock:
+            return self._device_blocked
+
+    @property
+    def uecc_count(self) -> int:
+        """Return the number of UECC errors observed (cumulative)."""
+        with self._state_lock:
+            return self._uecc_count
+
+    @property
+    def has_critical_error(self) -> bool:
+        """Return True if a critical error has been recorded."""
+        with self._state_lock:
+            return self._critical_error
+
+    @property
+    def quarantined_slots(self) -> frozenset[int]:
+        """Return an immutable view of currently quarantined slot indices."""
+        with self._state_lock:
+            return frozenset(self._quarantined_slots)
+
+    def is_slot_quarantined(self, slot_index: int) -> bool:
+        """Return True if the given slot index is quarantined.
+
+        Args:
+            slot_index: The slot index to check.
+
+        Returns:
+            True when the slot is in the quarantine set.
+        """
+        with self._state_lock:
+            return slot_index in self._quarantined_slots
+
+    def record_uecc(self, status: int, *, logger_inst=None) -> bool:
+        """Record a UECC error and transition the device to blocked state.
+
+        On the first UECC detection, this method atomically transitions the
+        device state to blocked, sets the critical error flag, and returns
+        True. Subsequent calls increment the counter but return False because
+        the transition has already occurred.
+
+        Args:
+            status: The NVMe status word from the UECC error.
+            logger_inst: Optional logger instance for structured critical
+                log emission. Uses the module-level ``logger`` if None.
+
+        Returns:
+            True if this call caused the state transition (first UECC),
+            False if the device is already blocked (duplicate UECC).
+        """
+        transitioned = False
+        with self._state_lock:
+            self._uecc_count += 1
+            if not self._critical_error:
+                self._device_blocked = True
+                self._device_active = False
+                self._critical_error = True
+                self._critical_error_transitioned = True
+                self._critical_error_ts = time.monotonic()
+                self._critical_error_status = int(status)
+                transitioned = True
+
+        if transitioned and logger_inst is not None:
+            logger_inst.critical(
+                "RawBlockCore: UECC detected on device %s "
+                "(status=0x%04x, uecc_count=%d). Device blocked.",
+                self.device_path,
+                self._critical_error_status,
+                self._uecc_count,
+            )
+        return transitioned
+
+    def quarantine_slot(self, slot_index: int) -> None:
+        """Mark a slot as poisoned and exclude it from future allocation.
+
+        The slot is added to the quarantine set and removed from both the
+        global free list and the FDP placement-ID free list if present.
+
+        Args:
+            slot_index: The slot index to quarantine.
+        """
+        with self._state_lock:
+            self._quarantined_slots.add(int(slot_index))
+            # Remove from global free list
+            self._free_slots.pop(int(slot_index), None)
+            # Remove from FDP placement-ID free list
+            if self.fdp_slot_affinity_enabled:
+                pid = self._slot_placement_ids.get(int(slot_index))
+                if pid is not None:
+                    pid_map = self._free_slots_by_placement_id.get(pid)
+                    if pid_map is not None:
+                        pid_map.pop(int(slot_index), None)
+
+    def _is_available_for_allocation(self) -> bool:
+        """Return True if the device is available for new slot allocations.
+
+        Internal helper called under ``self._lock`` (the index lock).
+        Returns False if the device is blocked.
+        """
+        return self._device_active
+
+    def _handle_uecc_on_read(self, exc: OSError) -> None:
+        """Handle a UECC error detected during a read operation.
+
+        This is called from the read path and delegates to ``record_uecc``
+        which handles thread-safety. The device remains open so that
+        subsequent operations short-circuit instead of raising.
+
+        Args:
+            exc: The OSError raised by the raw-device read.
+        """
+        status = int(getattr(exc, "errno", 0) or 0)
+        self.record_uecc(status, logger_inst=logger)
+
+    def _purge_poisoned_entries(self, encoded_keys, results):
+        """Remove poisoned keys from the index and quarantine their slots.
+
+        Called after a UECC is detected during ``load_many_into``. Entries
+        that were found in the index AND read successfully (results[i] is True)
+        are purged because they may have been read from a corrupted slot.
+
+        Thread-safe: uses ``self._lock`` and ``self._state_lock``.
+
+        Args:
+            encoded_keys: The list of encoded keys that were attempted.
+            results: Per-key success booleans from the load operation.
+        """
+        with self._lock:
+            for encoded_key, ok in zip(encoded_keys, results, strict=False):
+                if not ok:
+                    continue  # already a miss or non-UECC error
+                entry = self._index.pop(encoded_key, None)
+                if entry is not None:
+                    slot_idx = self._offset_to_slot(int(entry.offset))
+                    self._quarantined_slots.add(slot_idx)
+                    self._free_slots.pop(slot_idx, None)
+                    if self.fdp_slot_affinity_enabled:
+                        pid = self._slot_placement_ids.get(slot_idx)
+                        if pid is not None:
+                            pid_map = self._free_slots_by_placement_id.get(pid)
+                            if pid_map is not None:
+                                pid_map.pop(slot_idx, None)
+                    self._lock_refcnt.pop(encoded_key, None)
+                    self._meta_dirty_total += 1
+
     def close(self) -> None:
-        """Stop checkpointing, write a final checkpoint, and close the device."""
+        """Stop checkpointing, and close the device.
+
+        If the device was blocked by a UECC error, the final checkpoint is
+        skipped to avoid writing potentially stale or corrupted metadata.
+        """
         with self._lock:
             if self._closed:
                 return
@@ -1065,17 +1311,20 @@ class RawBlockCore:
             self._meta_thread.join(timeout=5)
             self._meta_thread = None
 
-        try:
-            self._checkpoint_once(force=True)
-        except Exception as e:
-            logger.warning("RawBlockCore final checkpoint failed: %s", e)
+        # Skip final checkpoint if device was blocked by UECC.
+        if not self._device_blocked:
+            try:
+                self._checkpoint_once(force=True)
+            except Exception as e:
+                logger.warning("RawBlockCore final checkpoint failed: %s", e)
 
         if self._raw is not None:
             try:
                 self._raw.close()
             except Exception as e:
                 logger.warning(
-                    "Failed to close raw block device %s: %s", self.device_path, e
+                    "Failed to close raw block device %s: %s",
+                    self.device_path, e,
                 )
             finally:
                 self._raw = None
@@ -1650,33 +1899,51 @@ class RawBlockCore:
         return (offset - self._data_base_offset) // self.slot_bytes
 
     def _allocate_slot_locked(self, placement_id: PlacementId = None) -> int:
-        """Allocate a slot offset while ``self._lock`` is held."""
+        """Allocate a slot offset while ``self._lock`` is held.
+
+        Skips slots that have been quarantined due to UECC errors.
+        """
         self._ensure_capacity_and_layout()
 
         if self.fdp_slot_affinity_enabled and placement_id is not None:
             affinity_slots = self._free_slots_by_placement_id.get(placement_id)
             if affinity_slots:
-                slot, _ = affinity_slots.popitem()
-                if not affinity_slots:
-                    self._free_slots_by_placement_id.pop(placement_id, None)
-                self._free_slots.pop(slot, None)
-                self._fdp_slot_affinity_hit_count += 1
-                self._set_slot_placement_id_locked(slot, placement_id)
-                return self._slot_to_offset(slot)
+                # Try to find a non-quarantined slot
+                for slot in list(affinity_slots.keys()):
+                    if slot not in self._quarantined_slots:
+                        del affinity_slots[slot]
+                        if not affinity_slots:
+                            self._free_slots_by_placement_id.pop(placement_id, None)
+                        self._free_slots.pop(slot, None)
+                        self._fdp_slot_affinity_hit_count += 1
+                        self._set_slot_placement_id_locked(slot, placement_id)
+                        return self._slot_to_offset(slot)
+                # All affinity slots quarantined, fall through
 
         if self._free_slots:
-            slot, _ = self._free_slots.popitem()
-            self._remove_slot_from_affinity_pool_locked(slot)
-            if self.fdp_slot_affinity_enabled and placement_id is not None:
-                self._fdp_slot_affinity_fallback_count += 1
-            self._set_slot_placement_id_locked(slot, placement_id)
-            return self._slot_to_offset(slot)
+            # Find a non-quarantined slot from the free list
+            for slot in list(self._free_slots.keys()):
+                if slot not in self._quarantined_slots:
+                    del self._free_slots[slot]
+                    self._remove_slot_from_affinity_pool_locked(slot)
+                    if self.fdp_slot_affinity_enabled and placement_id is not None:
+                        self._fdp_slot_affinity_fallback_count += 1
+                    self._set_slot_placement_id_locked(slot, placement_id)
+                    return self._slot_to_offset(slot)
+            # All free slots quarantined, continue to next slot allocation
 
         if self._next_slot < self._max_slots:
             slot = self._next_slot
             self._next_slot += 1
-            self._set_slot_placement_id_locked(slot, placement_id)
-            return self._slot_to_offset(slot)
+            # Skip quarantined slots in the next_slot path
+            while slot in self._quarantined_slots and self._next_slot < self._max_slots:
+                self._next_slot += 1
+                slot = self._next_slot
+            if slot not in self._quarantined_slots:
+                self._set_slot_placement_id_locked(slot, placement_id)
+                return self._slot_to_offset(slot)
+            # All remaining slots are quarantined
+            raise RuntimeError("No free slots available (all quarantined)")
         raise RuntimeError("No free slots available")
 
     def _append_free_slot_locked(self, slot: int) -> None:
@@ -1716,9 +1983,15 @@ class RawBlockCore:
         self._slot_placement_ids[slot] = placement_id
 
     def _checkpoint_loop(self) -> None:
-        """Periodically checkpoint dirty metadata until shutdown."""
+        """Periodically checkpoint dirty metadata until shutdown.
+
+        Skips checkpointing when the device is blocked (UECC transition).
+        """
         interval = max(1, self.meta_checkpoint_interval_sec)
         while not self._meta_stop_evt.wait(interval):
+            # A6: Skip periodic checkpoint when device is blocked.
+            if self._device_blocked:
+                continue
             try:
                 self._checkpoint_once(force=False)
             except Exception as e:
@@ -1900,7 +2173,15 @@ class RawBlockCore:
         return True
 
     def _checkpoint_once(self, force: bool) -> bool:
-        """Write a metadata checkpoint when dirty and sufficiently idle."""
+        """Write a metadata checkpoint when dirty and sufficiently idle.
+
+        Refuses to checkpoint when the device is blocked, even when
+        ``force=True``, to avoid writing stale or corrupted metadata.
+        """
+        # A6: Refuse checkpoint when device is blocked.
+        if self._device_blocked:
+            return False
+
         with self._lock:
             dirty = self._meta_dirty_total > self._meta_persisted
             idle_ok = self._inflight_io_count == 0 and (

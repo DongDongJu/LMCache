@@ -22,6 +22,13 @@ from lmcache.v1.storage_backend.raw_block.key_codec import (
     object_key_to_string,
     slot_identity_from_encoded_key,
 )
+from lmcache.v1.storage_backend.raw_block.uecc import (
+    UECC_STATUS_CODE,
+    UECC_STATUS_MASK,
+    classify_oserror,
+    decode_uecc_status,
+    is_uecc_errno,
+)
 
 __all__ = [
     "RawBlockCore",
@@ -37,8 +44,14 @@ __all__ = [
     "encode_legacy_key",
     "encode_object_key",
     "object_key_to_string",
+    "slot_identity_from_encoded_key",
     "normalize_raw_block_io_engine",
     "round_up",
-    "slot_identity_from_encoded_key",
     "validate_raw_block_io_options",
+    # UECC
+    "UECC_STATUS_CODE",
+    "UECC_STATUS_MASK",
+    "is_uecc_errno",
+    "decode_uecc_status",
+    "classify_oserror",
 ]

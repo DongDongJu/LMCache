@@ -695,6 +695,17 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._raise_if_closed_locked()
             task_id = self._get_next_task_id_locked()
             self._store_inflight_tasks += 1
+
+        # A9: Short-circuit store when device is blocked by UECC.
+        if self._core.device_blocked:
+            with self._lock:
+                self._store_inflight_tasks -= 1
+                self._completed_store_tasks[task_id] = L2StoreResult(
+                    success=False, bytes_transferred=0,
+                )
+                self._signal_event_fd(self._store_efd)
+            return task_id
+
         try:
             future = self._store_pool.submit(
                 self._run_store_task, list(keys), list(objects)
@@ -734,6 +745,16 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._raise_if_closed_locked()
             task_id = self._get_next_task_id_locked()
             self._lookup_inflight_tasks += 1
+
+        # A9: Short-circuit lookup when device is blocked by UECC.
+        if self._core.device_blocked:
+            with self._lock:
+                self._lookup_inflight_tasks -= 1
+                bitmap = _make_bitmap(len(keys))
+                self._completed_lookup_tasks[task_id] = bitmap
+                self._signal_event_fd(self._lookup_efd)
+            return task_id
+
         try:
             future = self._lookup_pool.submit(self._run_lookup_task, list(keys))
         except Exception:
@@ -779,6 +800,16 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._raise_if_closed_locked()
             task_id = self._get_next_task_id_locked()
             self._load_inflight_tasks += 1
+
+        # A9: Short-circuit load when device is blocked by UECC.
+        if self._core.device_blocked:
+            with self._lock:
+                self._load_inflight_tasks -= 1
+                bitmap = _make_bitmap(len(keys))
+                self._completed_load_tasks[task_id] = bitmap
+                self._signal_event_fd(self._load_efd)
+            return task_id
+
         try:
             future = self._load_pool.submit(
                 self._run_load_task, list(keys), list(objects)
@@ -874,7 +905,11 @@ class RawBlockL2Adapter(L2AdapterInterface):
             )
         with self._lock:
             return {
-                "is_healthy": core_status.get("is_healthy", True) and not self._closed,
+                "is_healthy": (
+                    core_status.get("is_healthy", True)
+                    and not self._closed
+                    and not core_status.get("device_blocked", False)
+                ),
                 "type": "RawBlockL2Adapter",
                 "store_inflight_task_count": self._store_inflight_tasks,
                 "lookup_inflight_task_count": self._lookup_inflight_tasks,
@@ -895,6 +930,13 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 "completed_store_task_count": len(self._completed_store_tasks),
                 "completed_lookup_task_count": len(self._completed_lookup_tasks),
                 "completed_load_task_count": len(self._completed_load_tasks),
+                # UECC / critical error fields (A9)
+                "device_active": core_status.get("device_active", True),
+                "device_blocked": core_status.get("device_blocked", False),
+                "critical_error": core_status.get("has_critical_error", False),
+                "uecc_count": core_status.get("uecc_count", 0),
+                "quarantined_slot_count": core_status.get("quarantined_slot_count", 0),
+                "replacement_recommended": core_status.get("has_critical_error", False),
                 "core": core_status,
             }
 
@@ -1217,10 +1259,19 @@ class RawBlockL2Adapter(L2AdapterInterface):
             - newly stored object keys
             - raw-block slot byte charges aligned with the newly stored keys
         """
+        # A7: Check state before starting the store.
+        if self._core.device_blocked:
+            return False, [], []
+
         specs = [encode_object_key(key) for key in keys]
         placement_ids = self._assign_fdp_placement_ids(keys)
         put_result = self._core.put_many(specs, objects, placement_ids=placement_ids)
+
+        # A7: Recheck after I/O — if UECC detected during write, abort.
         stored_encoded = set(put_result.stored_keys)
+        if self._core.device_blocked:
+            stored_encoded = set()
+
         slot_bytes = int(self._core.slot_bytes)
         stored_keys: list[ObjectKey] = []
         stored_sizes: list[int] = []
@@ -1245,13 +1296,23 @@ class RawBlockL2Adapter(L2AdapterInterface):
             bytes_transferred = sum(stored_sizes)
         except Exception as e:
             logger.error("RawBlockL2Adapter store task %d failed: %s", task_id, e)
+            success = False
         with self._lock:
             self._store_inflight_tasks -= 1
+            # A7: If device is blocked after the store, do not publish results.
+            if self._core.device_blocked:
+                self._completed_store_tasks[task_id] = L2StoreResult(
+                    success=False, bytes_transferred=0,
+                )
+                event_fd = self._store_efd
+                self._signal_event_fd(event_fd)
+                return
             self._completed_store_tasks[task_id] = L2StoreResult(
                 success, bytes_transferred
             )
             event_fd = self._store_efd
-        if stored_keys:
+        # Only notify if device is still healthy.
+        if stored_keys and not self._core.device_blocked:
             try:
                 self._notify_keys_stored(stored_keys, stored_sizes)
             except Exception as e:
@@ -1287,7 +1348,29 @@ class RawBlockL2Adapter(L2AdapterInterface):
         objects: list[MemoryObj],
     ) -> tuple[Bitmap, list[ObjectKey]]:
         specs = [encode_object_key(key) for key in keys]
-        results = self._core.load_many_into([spec.encoded for spec in specs], objects)
+        encoded = [spec.encoded for spec in specs]
+
+        # A8: Pre-check before load.
+        if self._core.device_blocked:
+            return _make_bitmap(len(keys)), []
+
+        try:
+            results = self._core.load_many_into(encoded, objects, raise_on_error=False)
+        except OSError as e:
+            from lmcache.v1.storage_backend.raw_block.uecc import classify_oserror
+            if classify_oserror(e).get("is_uecc"):
+                # UECC detected — the core already handled the transition.
+                # Return all misses.
+                return _make_bitmap(len(keys)), []
+            raise
+
+        # A8: Late-load fence — recheck after load completes.
+        if self._core.device_blocked:
+            # Force all results to False; UECC may have been detected
+            # during the batch read.
+            for i in range(len(results)):
+                results[i] = False
+
         bitmap = _make_bitmap(len(keys))
         accessed_keys: list[ObjectKey] = []
         for i, ok in enumerate(results):
@@ -1307,13 +1390,20 @@ class RawBlockL2Adapter(L2AdapterInterface):
             logger.error("RawBlockL2Adapter load task %d failed: %s", task_id, e)
         with self._lock:
             self._load_inflight_tasks -= 1
+            # A8: If device is blocked after the load, clear results.
+            if self._core.device_blocked:
+                bitmap = _make_bitmap(bitmap_size)
+                accessed_keys = []
             self._completed_load_tasks[task_id] = bitmap
             event_fd = self._load_efd
-        if accessed_keys:
+        # Only notify if device is still healthy.
+        if accessed_keys and not self._core.device_blocked:
             try:
                 self._notify_keys_accessed(accessed_keys)
             except Exception as e:
-                logger.warning("RawBlockL2Adapter access notification failed: %s", e)
+                logger.warning(
+                    "RawBlockL2Adapter access notification failed: %s", e,
+                )
         self._signal_event_fd(event_fd)
 
     def _signal_event_fd(self, event_fd: EventNotifier | None) -> None:
