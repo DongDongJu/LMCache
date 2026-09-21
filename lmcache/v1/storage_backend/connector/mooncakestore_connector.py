@@ -38,9 +38,19 @@ _LEGACY_SETUP_KEYS = [
 # positional-arg ``store.setup()`` API (C++/pybind11).
 _LEGACY_INT_KEYS = {"global_segment_size", "local_buffer_size"}
 
+# Mooncake's dict API renamed two keys used by its positional API.
+_DICT_SETUP_KEY_ALIASES = {
+    "device_name": "rdma_devices",
+    "master_server_address": "master_server_addr",
+}
+
 # Keys whose values may contain credentials and must be
 # redacted when the setup dict is logged.
-_SENSITIVE_SETUP_KEYS = {"metadata_server", "master_server_address"}
+_SENSITIVE_SETUP_KEYS = {
+    "metadata_server",
+    "master_server_addr",
+    "master_server_address",
+}
 
 
 def _sanitize_setup_config(
@@ -87,15 +97,20 @@ def setup_mooncake_store(
         None.  ``store`` is mutated in place.
 
     Raises:
-        Exception: Any exception raised by ``store.setup()``
-            other than :class:`TypeError` is propagated to the
-            caller (``TypeError`` is caught and used as the
-            signal to fall back to the legacy API).
+        RuntimeError: If ``store.setup()`` returns a nonzero error code.
+        Exception: Any exception raised by ``store.setup()`` other than
+            :class:`TypeError` is propagated to the caller (``TypeError`` is
+            caught and used as the signal to fall back to the legacy API).
     """
     setup_dict = config.setup_config
     try:
         # New API (Mooncake PR #1445): setup(config: dict)
-        store.setup(setup_dict)
+        dict_setup = dict(setup_dict)
+        for legacy_key, dict_key in _DICT_SETUP_KEY_ALIASES.items():
+            if dict_key not in dict_setup and legacy_key in dict_setup:
+                dict_setup[dict_key] = dict_setup[legacy_key]
+            dict_setup.pop(legacy_key, None)
+        result = store.setup(dict_setup)
         logger.info("Using dict-based setup API (new)")
     except TypeError:
         # Legacy API: setup with positional arguments.
@@ -106,14 +121,18 @@ def setup_mooncake_store(
         )
         args: List[Any] = []
         for k in _LEGACY_SETUP_KEYS:
-            v: Any = setup_dict.get(k, "")
+            dict_key = _DICT_SETUP_KEY_ALIASES.get(k, k)
+            v: Any = setup_dict.get(dict_key, setup_dict.get(k, ""))
             if k in _LEGACY_INT_KEYS:
                 try:
                     v = int(v) if v != "" else 0
                 except (TypeError, ValueError):
                     v = 0
             args.append(v)
-        store.setup(*args)
+        result = store.setup(*args)
+
+    if result != 0:
+        raise RuntimeError(f"Mooncake store setup failed with error code {result}")
 
 
 # Prefix for keys that should be forwarded to mooncake setup.

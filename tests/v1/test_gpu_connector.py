@@ -356,6 +356,82 @@ def test_vllm_paged_connector_v3_with_gpu_and_mla(
     allocator.close()
 
 
+@pytest.mark.parametrize("version", [2, 3])
+def test_vllm_paged_connector_store_waits_for_producer_stream(version: int) -> None:
+    num_blocks = 8
+    block_size = 16
+    num_layers = 8
+    num_heads = 8
+    head_size = 128
+    num_tokens = 16
+    device = torch_device_type
+    engine_kv_format = lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS
+    kv_caches = generate_kv_cache_paged_list_tensors(
+        num_blocks=num_blocks,
+        device=device,
+        block_size=block_size,
+        num_layers=num_layers,
+        head_size=head_size,
+        engine_kv_format=engine_kv_format,
+    )
+    for cache in kv_caches:
+        cache.zero_()
+    slot_mapping = torch.arange(num_tokens, device=device, dtype=torch.int64)
+    allocator = PinMemoryAllocator(64 * 1024 * 1024)
+
+    if version == 2:
+        connector = VLLMPagedMemGPUConnectorV2(num_heads * head_size, num_layers)
+        memory_obj = allocator.allocate(
+            connector.get_shape(num_tokens), kv_caches[0].dtype
+        )
+    else:
+        cache_dict = {str(i): cache for i, cache in enumerate(kv_caches)}
+        metadata = _create_metadata(False, cache_dict, engine_kv_format)
+        connector = VLLMPagedMemGPUConnectorV3(metadata, slot_mapping.device)
+        memory_obj = allocator.allocate(
+            metadata.get_shapes(num_tokens), metadata.get_dtypes()
+        )
+    assert memory_obj is not None
+
+    # Initialize connector state before creating the cross-stream race.
+    connector.from_gpu(
+        memory_obj,
+        0,
+        num_tokens,
+        kvcaches=kv_caches,
+        slot_mapping=slot_mapping,
+    )
+
+    delay_a = torch.ones((8192, 8192), device=device)
+    delay_b = torch.ones((8192, 8192), device=device)
+    delay_out = torch.empty_like(delay_a)
+    torch.mm(delay_a, delay_b, out=delay_out)
+    torch.cuda.synchronize()
+
+    producer_stream = torch.cuda.Stream()
+    with torch.cuda.stream(producer_stream):
+        torch.mm(delay_a, delay_b, out=delay_out)
+        for cache in kv_caches:
+            cache.fill_(7)
+        connector.from_gpu(
+            memory_obj,
+            0,
+            num_tokens,
+            kvcaches=kv_caches,
+            slot_mapping=slot_mapping,
+        )
+    producer_stream.synchronize()
+
+    stored = memory_obj.tensor if version == 2 else memory_obj.get_tensor(0)
+    assert stored is not None
+    stored_after_producer = bool(torch.all(stored == 7))
+    memory_obj.ref_count_down()
+    allocator_clean = allocator.memcheck()
+    allocator.close()
+    assert stored_after_producer
+    assert allocator_clean
+
+
 @pytest.mark.parametrize("use_gpu", [True])
 @pytest.mark.parametrize(
     "engine_kv_format",

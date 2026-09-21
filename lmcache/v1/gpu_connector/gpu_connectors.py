@@ -370,8 +370,10 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+        current_stream = torch.cuda.current_stream(self.kvcaches[0].device)
 
         with torch.cuda.stream(self.store_stream):
+            self.store_stream.wait_stream(current_stream)
             if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
                 device_ops.multi_layer_kv_transfer(
                     memory_obj.tensor,
@@ -596,7 +598,9 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         assert self.kvcaches[0].device == self.device
         self._initialize_kv_cache_pointers()
         assert self.group_kv_cache_pointers_on_gpu is not None
+        current_stream = torch.cuda.current_stream(self.device)
         with torch.cuda.stream(self.store_stream):
+            self.store_stream.wait_stream(current_stream)
             if not self.use_gpu or end - start != self.chunk_size:
                 for i, kv_cache_pointer in enumerate(
                     self.group_kv_cache_pointers_on_gpu
