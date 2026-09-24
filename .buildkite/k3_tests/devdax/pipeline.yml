@@ -1,0 +1,10 @@
+{
+  "steps": [{
+    "label": "DevDAX L1/L2 — QEMU",
+    "key": "devdax-qemu",
+    "agents": {"queue": "devdax-qemu"},
+    "timeout_in_minutes": 30,
+    "command": "bash .buildkite/k3_tests/devdax/run.sh",
+    "artifact_paths": ["artifacts/devdax-qemu/**/*"]
+  }]
+}

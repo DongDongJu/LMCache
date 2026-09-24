@@ -160,3 +160,6 @@ docs/source/locale/**/*.mo
 
 # CodeBuddy
 .codebuddy
+
+# Local DevDAX QEMU reports (guest images belong outside the checkout)
+/artifacts/devdax-qemu/
