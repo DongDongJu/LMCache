@@ -1,0 +1,86 @@
+name: Build DevDAX CI image
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: devdax-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      DEVDAX_BUNDLE: /opt/lmcache-devdax
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+        with:
+          disable-sudo-and-containers: false
+          egress-policy: audit
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/free-disk-space
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get install -y build-essential flex bison bc libelf-dev libssl-dev \
+            libglib2.0-dev libpixman-1-dev libslirp-dev ninja-build python3-venv \
+            cloud-image-utils jq
+          test -c /dev/kvm
+          sudo mkdir -p "$DEVDAX_BUNDLE"
+          sudo chown "$(id -u):$(id -g)" "$DEVDAX_BUNDLE"
+      - name: Build QEMU, kernel and guest image
+        run: |
+          recipe=.buildkite/k3_tests/devdax/image
+          for asset in qemu_source kernel_source rootfs; do
+            url=$(jq -r --arg key "${asset}_url" '.[$key]' "$recipe/manifest.json")
+            curl -fL --retry 3 "$url" -o "$RUNNER_TEMP/$asset"
+          done
+          bash "$recipe/build-qemu.sh" "$RUNNER_TEMP/qemu_source" "$DEVDAX_BUNDLE/qemu"
+          bash "$recipe/build-kernel.sh" "$RUNNER_TEMP/kernel_source" "$DEVDAX_BUNDLE/kernel"
+          export PATH="$DEVDAX_BUNDLE/qemu/bin:$PATH"
+          sudo -n -u "$(id -un)" -g "#$(stat -c %g /dev/kvm)" env PATH="$PATH" \
+            bash .buildkite/k3_tests/devdax/run.sh --prepare-image \
+            --base "$RUNNER_TEMP/rootfs" --image "$DEVDAX_BUNDLE/base.qcow2"
+      - name: Build CI container
+        run: |
+          docker build --file docker/Dockerfile.devdax \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag devdax-ci:build "$DEVDAX_BUNDLE"
+      - name: Verify both suites in the container
+        run: |
+          export LMCACHE_DEVDAX_CONTAINER_IMAGE
+          LMCACHE_DEVDAX_CONTAINER_IMAGE=$(docker image inspect --format '{{.Id}}' devdax-ci:build)
+          LMCACHE_DEVDAX_SUITE=both bash .buildkite/k3_tests/devdax/run.sh
+      - name: Login to GHCR
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish verified image
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}-devdax-ci"
+          tag="build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker tag devdax-ci:build "$image:$tag"
+          docker push "$image:$tag"
+          if [[ "$GITHUB_REF_NAME" == dev ]]; then
+            docker tag devdax-ci:build "$image:nightly"
+            docker push "$image:nightly"
+          fi
+          docker image inspect --format '{{json .RepoDigests}}' "$image:$tag" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload test and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: devdax-image-validation
+          path: artifacts/devdax-qemu/

@@ -11,8 +11,8 @@ trap 'rm -rf "$build"' EXIT
 tar -xf "$archive" -C "$build" --strip-components=1
 cd "$build"
 ./configure --prefix="$prefix" --target-list=x86_64-softmmu \
-    --enable-kvm --enable-tcg --enable-slirp --enable-download \
-    --disable-docs --disable-werror --disable-rust --disable-gtk --disable-sdl \
-    --disable-vnc --disable-opengl
+    --without-default-features --enable-system --enable-tools \
+    --enable-kvm --enable-tcg --enable-slirp --enable-pixman --enable-download \
+    --disable-werror
 make -j"${LMCACHE_DEVDAX_QEMU_JOBS:-4}"
 make install

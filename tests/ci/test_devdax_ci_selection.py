@@ -68,6 +68,9 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "tests/v1/distributed/test_dax_l2_integration.py",
         ".buildkite/k3_tests/devdax/image/manifest.json",
         ".github/scripts/install_lmcache_cpu.sh",
+        ".github/workflows/build_devdax_image.yml",
+        ".github/workflows/nightly_build.yml",
+        "docker/Dockerfile.devdax",
         "requirements/common.txt",
         ".buildkite/k3_tests/common_scripts/helpers.sh",
     ],
@@ -376,3 +379,52 @@ def test_strict_configuration_errors(
     monkeypatch.setenv("PYTEST_XDIST_WORKER", worker)
     with pytest.raises(ValueError, match=message):
         provider.DeviceProvider(tmp_path, "l1")
+
+
+@pytest.mark.parametrize("accel", ["kvm", "tcg"])
+def test_container_entrypoint_uses_image_id_and_propagates_failure(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, accel: str
+) -> None:
+    """The container gets current source and required devices; failures reach CI."""
+    runner = repo / ".buildkite/k3_tests/devdax/run.sh"
+    helpers = repo / ".buildkite/k3_tests/common_scripts/helpers.sh"
+    for target, source in (
+        (runner, CI / "run.sh"),
+        (helpers, CI.parent / "common_scripts/helpers.sh"),
+    ):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+    binary = repo / "bin"
+    binary.mkdir()
+    docker = binary / "docker"
+    docker.write_text("""#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+with open('docker-calls.jsonl', 'a') as log:
+    log.write(json.dumps(args) + '\\n')
+if args[:2] == ['image', 'inspect']:
+    print('sha256:verified' if args[3] == '{{.Id}}' else '{}')
+if args[0] == 'run':
+    sys.exit(23)
+""")
+    docker.chmod(0o755)
+    stat = binary / "stat"
+    stat.write_text("#!/bin/sh\necho 1234\n")
+    stat.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binary}:{os.environ['PATH']}")
+    monkeypatch.setenv("BUILDKITE", "true")
+    monkeypatch.setenv("BUILDKITE_PULL_REQUEST", "false")
+    monkeypatch.setenv("LMCACHE_DEVDAX_QEMU_ACCEL", accel)
+    monkeypatch.delenv("LMCACHE_DEVDAX_CONTAINER_IMAGE", raising=False)
+    result = subprocess.run(["bash", str(runner)], cwd=repo, capture_output=True)
+    assert result.returncode == 23, result.stderr
+    calls = [
+        json.loads(line)
+        for line in (repo / "docker-calls.jsonl").read_text().splitlines()
+    ]
+    assert calls[0] == ["pull", "--", "ghcr.io/lmcache/lmcache-devdax-ci:nightly"]
+    command = calls[-1]
+    assert command[command.index("--") + 1] == "sha256:verified"
+    assert command[command.index("--volume") + 1] == f"{repo}:{repo}"
+    assert ("--device" in command) == (accel == "kvm")
+    assert "--privileged" not in command

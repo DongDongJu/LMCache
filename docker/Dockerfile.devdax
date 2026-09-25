@@ -1,0 +1,27 @@
+# Build context: the prepared bundle containing qemu/, kernel/, and base.qcow2.
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates cloud-image-utils git openssh-client python3 \
+    libglib2.0-0t64 libpixman-1-0 libslirp0 \
+    && rm -rf /var/lib/apt/lists/*
+COPY qemu/ /opt/lmcache-devdax/qemu/
+COPY kernel/ /opt/lmcache-devdax/kernel/
+COPY base.qcow2 base.qcow2.sha256 /opt/lmcache-devdax/
+ENV PATH="/opt/lmcache-devdax/qemu/bin:${PATH}"
+# The checkout, runner and LMCache source come from the current CI job.
+# OpenSSH needs a passwd entry for the host UID used to own checkout/artifacts.
+RUN <<'SH'
+cat > /usr/local/bin/devdax-entrypoint <<'EOF'
+#!/bin/sh
+set -eu
+uid=${LMCACHE_CI_UID:-0}
+gid=${LMCACHE_CI_GID:-0}
+getent group "$gid" >/dev/null || groupadd --gid "$gid" lmcache-ci
+getent passwd "$uid" >/dev/null || useradd --uid "$uid" --gid "$gid" --home-dir /tmp --no-create-home lmcache-ci
+groups=$gid
+[ ! -c /dev/kvm ] || groups="$groups,$(stat -c %g /dev/kvm)"
+exec setpriv --reuid "$uid" --regid "$gid" --groups "$groups" "$@"
+EOF
+chmod 755 /usr/local/bin/devdax-entrypoint
+SH
+ENTRYPOINT ["devdax-entrypoint"]
