@@ -91,10 +91,9 @@ class Guest:
         scratch: Path,
         output: Path,
         disk: Path,
-        accel: str,
         kernel: Path | None = None,
     ) -> None:
-        """Start a VM on disk using the requested accelerator; boot() awaits SSH."""
+        """Start a KVM guest on disk; boot() awaits SSH."""
         self.scratch, self.output = scratch, output
         self.port = 0
         self.process: subprocess.Popen
@@ -142,9 +141,9 @@ class Guest:
         """)
         command += [
             "-accel",
-            accel,
+            "kvm",
             "-cpu",
-            "host" if accel == "kvm" else "max",
+            "host",
             "-m",
             f"{MANIFEST['guest_memory_mib']},maxmem=16G,slots=8",
             "-smp",
@@ -285,9 +284,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     controls_values = controls(dict(os.environ))
-    accel = controls_values["LMCACHE_DEVDAX_QEMU_ACCEL"]
     signal.signal(signal.SIGALRM, _cancel)
-    signal.alarm(3600 if args.prepare_image else (1800 if accel == "kvm" else 7200))
+    signal.alarm(3600 if args.prepare_image else 1800)
     output = ROOT / "artifacts/devdax-qemu" / f"run-{uuid.uuid4().hex[:12]}"
     output.mkdir(parents=True)
     print(f"DevDAX artifacts: {output}", flush=True)
@@ -317,9 +315,8 @@ def main() -> None:
         )
         if version.split()[3] != MANIFEST["qemu_version"]:
             raise RuntimeError(f"QEMU version differs from manifest: {version}")
-        if accel == "kvm":
-            fd = os.open("/dev/kvm", os.O_RDWR)
-            os.close(fd)
+        fd = os.open("/dev/kvm", os.O_RDWR)
+        os.close(fd)
         image = args.image.resolve()
         if args.prepare_image:
             if image.exists():
@@ -359,18 +356,9 @@ def main() -> None:
             if not args.prepare_image:
                 source["kernel_sha256"] = _sha(kernel)
             (output / "source.json").write_text(json.dumps(source, indent=2) + "\n")
-            guest = Guest(
-                scratch, output, disk, accel, None if args.prepare_image else kernel
-            )
+            guest = Guest(scratch, output, disk, None if args.prepare_image else kernel)
             try:
-                guest.boot(
-                    int(
-                        os.environ.get(
-                            "LMCACHE_DEVDAX_BOOT_TIMEOUT",
-                            "300" if accel == "kvm" else "1200",
-                        )
-                    )
-                )
+                guest.boot(int(os.environ.get("LMCACHE_DEVDAX_BOOT_TIMEOUT", "300")))
                 guest.ssh("cloud-init status --wait", timeout=300)
                 with (scratch / "source.tar.gz").open("rb") as archive:
                     guest.ssh("cat > /root/source.tar.gz", stdin=archive, timeout=120)
@@ -413,10 +401,9 @@ def main() -> None:
                         try:
                             guest.ssh(
                                 f"cd /root/source && LMCACHE_DEVDAX_SUITE={suite} "
-                                f"LMCACHE_DEVDAX_QEMU_ACCEL={accel} "
                                 "/opt/lmcache-test/bin/python "
                                 ".buildkite/k3_tests/devdax/guest_test.py",
-                                timeout=1300 if accel == "kvm" else 5400,
+                                timeout=1300,
                                 stdout=log,
                                 stderr=subprocess.STDOUT,
                             )

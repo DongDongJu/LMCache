@@ -10,7 +10,6 @@ and verifies the compiled native extension. Host DAX devices are never used.
 | --- | --- | --- |
 | `LMCACHE_DEVDAX_QEMU` | `auto` | `on`, `off`, `auto` |
 | `LMCACHE_DEVDAX_SUITE` | `both` | `l1`, `l2`, `both` |
-| `LMCACHE_DEVDAX_QEMU_ACCEL` | `kvm` | `kvm`, `tcg`; no automatic fallback |
 
 Invalid values fail. `off` disables only QEMU; `on` forces it. In `auto`, scheduled
 builds, `force-ci`, relevant changes and unknown diffs run coverage. README-only
@@ -82,8 +81,9 @@ image and its `.sha256` file to reproduce an environment. The builder refuses
 to overwrite images. Every run verifies the image/kernel checksums, creates a
 private overlay/key/socket and a QEMU-assigned SSH port, and copies the tested
 checkout after the PR-base merge. Commit/tree and source-archive hashes are saved.
-KVM has a 30-minute overall deadline; explicit TCG has 120 minutes. Override the
-300/1200-second boot deadline with `LMCACHE_DEVDAX_BOOT_TIMEOUT`.
+KVM is required; unavailable hardware acceleration fails the job. The overall
+deadline is 30 minutes. Override the 300-second boot deadline with
+`LMCACHE_DEVDAX_BOOT_TIMEOUT`.
 
 ## Tests and reports
 

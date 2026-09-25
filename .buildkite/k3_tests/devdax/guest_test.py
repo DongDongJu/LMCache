@@ -184,9 +184,7 @@ def main() -> None:
                     env=env,
                     stdout=log,
                     stderr=subprocess.STDOUT,
-                    timeout=600
-                    if env.get("LMCACHE_DEVDAX_QEMU_ACCEL") != "tcg"
-                    else 2400,
+                    timeout=600,
                 )
                 code = proc.returncode
             except subprocess.TimeoutExpired:

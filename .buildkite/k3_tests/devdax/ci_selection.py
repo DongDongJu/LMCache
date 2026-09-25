@@ -48,7 +48,6 @@ def controls(env: dict[str, str]) -> dict[str, str]:
     for key, choices in {
         "LMCACHE_DEVDAX_QEMU": ("auto", "on", "off"),
         "LMCACHE_DEVDAX_SUITE": ("both", "l1", "l2"),
-        "LMCACHE_DEVDAX_QEMU_ACCEL": ("kvm", "tcg"),
     }.items():
         value = env.get(key, choices[0])
         if value not in choices:
@@ -142,8 +141,6 @@ def pipeline(record: dict) -> dict:
     template = json.loads(Path(__file__).with_name("pipeline.yml").read_text())
     step = template["steps"][0]
     step["env"] = {k: record[k] for k in controls({})}
-    if record["LMCACHE_DEVDAX_QEMU_ACCEL"] == "tcg":
-        step["timeout_in_minutes"] = 120
     return template
 
 

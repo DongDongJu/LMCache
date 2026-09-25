@@ -82,7 +82,7 @@ def test_relevant_paths_render_cpu_job(repo: Path, path: str) -> None:
     assert record["run"] and path in record["matched_paths"]
     job = selection.pipeline(record)["steps"][0]
     assert job["env"]["LMCACHE_DEVDAX_SUITE"] == "both"
-    assert job["env"]["LMCACHE_DEVDAX_QEMU_ACCEL"] == "kvm"
+    assert job["timeout_in_minutes"] == 30
     assert job["agents"] == {"queue": "devdax-qemu"}
     assert "if_changed" not in job
     assert "gpu" not in json.dumps(job).lower()
@@ -111,19 +111,17 @@ def test_readme_precedence(repo: Path, env: dict[str, str], run: bool) -> None:
 
 
 @pytest.mark.parametrize("suite", ["l1", "l2", "both"])
-@pytest.mark.parametrize("accel", ["kvm", "tcg"])
-def test_resolved_controls_and_exact_manifests(suite: str, accel: str) -> None:
+def test_resolved_controls_and_exact_manifests(suite: str) -> None:
     """Only both includes the combined case, and controls reach uploaded env."""
     record = selection.select(
         {
             "LMCACHE_DEVDAX_QEMU": "on",
             "LMCACHE_DEVDAX_SUITE": suite,
-            "LMCACHE_DEVDAX_QEMU_ACCEL": accel,
         }
     )
     job = selection.pipeline(record)["steps"][0]
     assert job["env"]["LMCACHE_DEVDAX_SUITE"] == suite
-    assert job["env"]["LMCACHE_DEVDAX_QEMU_ACCEL"] == accel
+    assert job["env"] == {"LMCACHE_DEVDAX_QEMU": "on", "LMCACHE_DEVDAX_SUITE": suite}
     manifests = guest_test.manifests(suite)
     assert set(manifests) == ({"l1", "l2"} if suite == "both" else {suite})
     assert sum(map(len, manifests.values())) == (9 if suite == "both" else 4)
@@ -132,9 +130,7 @@ def test_resolved_controls_and_exact_manifests(suite: str, accel: str) -> None:
     ) is (suite == "both")
 
 
-@pytest.mark.parametrize(
-    "key", ["LMCACHE_DEVDAX_QEMU", "LMCACHE_DEVDAX_SUITE", "LMCACHE_DEVDAX_QEMU_ACCEL"]
-)
+@pytest.mark.parametrize("key", ["LMCACHE_DEVDAX_QEMU", "LMCACHE_DEVDAX_SUITE"])
 def test_invalid_controls_fail_before_off(key: str) -> None:
     """No invalid enum silently disables requested coverage."""
     with pytest.raises(ValueError, match=key):
@@ -381,9 +377,8 @@ def test_strict_configuration_errors(
         provider.DeviceProvider(tmp_path, "l1")
 
 
-@pytest.mark.parametrize("accel", ["kvm", "tcg"])
 def test_container_entrypoint_uses_image_id_and_propagates_failure(
-    repo: Path, monkeypatch: pytest.MonkeyPatch, accel: str
+    repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The container gets current source and required devices; failures reach CI."""
     runner = repo / ".buildkite/k3_tests/devdax/run.sh"
@@ -414,7 +409,6 @@ if args[0] == 'run':
     monkeypatch.setenv("PATH", f"{binary}:{os.environ['PATH']}")
     monkeypatch.setenv("BUILDKITE", "true")
     monkeypatch.setenv("BUILDKITE_PULL_REQUEST", "false")
-    monkeypatch.setenv("LMCACHE_DEVDAX_QEMU_ACCEL", accel)
     monkeypatch.delenv("LMCACHE_DEVDAX_CONTAINER_IMAGE", raising=False)
     result = subprocess.run(["bash", str(runner)], cwd=repo, capture_output=True)
     assert result.returncode == 23, result.stderr
@@ -426,5 +420,5 @@ if args[0] == 'run':
     command = calls[-1]
     assert command[command.index("--") + 1] == "sha256:verified"
     assert command[command.index("--volume") + 1] == f"{repo}:{repo}"
-    assert ("--device" in command) == (accel == "kvm")
+    assert command[command.index("--device") + 1] == "/dev/kvm"
     assert "--privileged" not in command

@@ -12,7 +12,7 @@ tar -xf "$archive" -C "$build" --strip-components=1
 cd "$build"
 ./configure --prefix="$prefix" --target-list=x86_64-softmmu \
     --without-default-features --enable-system --enable-tools \
-    --enable-kvm --enable-tcg --enable-slirp --enable-pixman --enable-download \
+    --enable-kvm --disable-tcg --enable-slirp --enable-pixman --enable-download \
     --disable-werror
 make -j"${LMCACHE_DEVDAX_QEMU_JOBS:-4}"
 make install

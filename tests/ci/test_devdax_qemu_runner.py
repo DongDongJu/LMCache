@@ -46,7 +46,6 @@ def test_real_vm_failure_propagation(
     runner = _load_runner(monkeypatch)
     monkeypatch.setattr(sys, "argv", ["runner.py"])
     monkeypatch.setenv("LMCACHE_DEVDAX_SUITE", "both")
-    monkeypatch.setenv("LMCACHE_DEVDAX_QEMU_ACCEL", "kvm")
     if fault == "missing-devices":
         # Physically omit emulated CXL devices from this disposable VM.
         monkeypatch.setattr(runner, "topology", lambda: [])
@@ -76,13 +75,11 @@ def test_real_vm_failure_propagation(
         return original(guest, command, timeout=timeout, **kwargs)
 
     monkeypatch.setattr(runner.Guest, "ssh", ssh)
-    before = set((ROOT / "artifacts/devdax-qemu").glob("run-*"))
     with pytest.raises(SystemExit) as error:
         runner.main()
     assert error.value.code != 0
-    created = set((ROOT / "artifacts/devdax-qemu").glob("run-*")) - before
-    assert len(created) == 1
-    output = created.pop()
+    assert guests
+    output = guests[-1].output
     summary = json.loads((output / "summary.json").read_text())
     assert summary["l1"]["state"] != "passed"
     if fault == "payload":
@@ -123,7 +120,7 @@ def test_cancellation_preserves_other_vm(
         ],
         check=True,
     )
-    other = runner.Guest(scratch, output, disk, "kvm", kernel)
+    other = runner.Guest(scratch, output, disk, kernel)
     victim = None
     victim_child = None
     try:

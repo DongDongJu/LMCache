@@ -4,7 +4,6 @@ agents:
 env:
   LMCACHE_DEVDAX_QEMU: auto
   LMCACHE_DEVDAX_SUITE: both
-  LMCACHE_DEVDAX_QEMU_ACCEL: kvm
 steps:
   - label: ":pipeline: Select DevDAX coverage"
     command: bash .buildkite/k3_tests/devdax/upload.sh
