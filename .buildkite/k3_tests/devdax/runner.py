@@ -132,10 +132,15 @@ class Guest:
                 str(scratch / "meta-data"),
             ]
         )
-        command = [
-            "qemu-system-x86_64",
-            "-M",
-            "q35,cxl=on",
+        command = shlex.split("""
+            qemu-system-x86_64 -M q35,cxl=on -display none -no-reboot
+            -smbios type=1,product=LMCache-DevDAX-QEMU
+            -netdev user,id=net0,hostfwd=tcp:127.0.0.1:0-:22
+            -device virtio-net-pci,netdev=net0,bus=pcie.0
+            -device virtio-blk-pci,drive=os,bus=pcie.0
+            -device virtio-blk-pci,drive=seed,bus=pcie.0
+        """)
+        command += [
             "-accel",
             accel,
             "-cpu",
@@ -144,23 +149,10 @@ class Guest:
             f"{MANIFEST['guest_memory_mib']},maxmem=16G,slots=8",
             "-smp",
             str(MANIFEST["vcpus"]),
-            "-display",
-            "none",
-            "-no-reboot",
-            "-smbios",
-            "type=1,product=LMCache-DevDAX-QEMU",
             "-drive",
             f"file={disk},format=qcow2,if=none,id=os",
-            "-device",
-            "virtio-blk-pci,drive=os,bus=pcie.0",
             "-drive",
             f"file={scratch}/seed.img,format=raw,if=none,id=seed",
-            "-device",
-            "virtio-blk-pci,drive=seed,bus=pcie.0",
-            "-netdev",
-            "user,id=net0,hostfwd=tcp:127.0.0.1:0-:22",
-            "-device",
-            "virtio-net-pci,netdev=net0,bus=pcie.0",
             "-serial",
             f"file:{output}/qemu-console.log",
             "-qmp",
@@ -237,22 +229,17 @@ class Guest:
     ) -> subprocess.CompletedProcess:
         """Run a bounded guest command over this VM's private SSH endpoint."""
         return _run(
-            [
-                "ssh",
+            shlex.split(
+                "ssh -o BatchMode=yes -o StrictHostKeyChecking=no "
+                "-o ConnectTimeout=5 -o LogLevel=ERROR"
+            )
+            + [
                 "-i",
                 str(self.scratch / "key"),
                 "-p",
                 str(self.port),
                 "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
                 f"UserKnownHostsFile={self.scratch}/known_hosts",
-                "-o",
-                "ConnectTimeout=5",
-                "-o",
-                "LogLevel=ERROR",
                 "root@127.0.0.1",
                 command,
             ],
@@ -341,13 +328,13 @@ def main() -> None:
                 raise ValueError("--base must match the manifest rootfs checksum")
             image.parent.mkdir(parents=True, exist_ok=True)
         else:
-            if not image.is_file():
-                raise FileNotFoundError(f"{image}: run image/build.sh first")
-            if _sha(image) != Path(str(image) + ".sha256").read_text().strip():
-                raise ValueError("prepared image checksum mismatch")
             kernel = args.kernel.resolve()
-            if _sha(kernel) != Path(str(kernel) + ".sha256").read_text().split()[0]:
-                raise ValueError("kernel checksum mismatch")
+            for asset in (image, kernel):
+                if not asset.is_file():
+                    raise FileNotFoundError(asset)
+                expected = Path(str(asset) + ".sha256").read_text().split()[0]
+                if _sha(asset) != expected:
+                    raise ValueError(f"checksum mismatch: {asset}")
         with tempfile.TemporaryDirectory(prefix="lmcache-dax-") as directory:
             scratch = Path(directory)
             disk = scratch / "overlay.qcow2"
@@ -369,10 +356,9 @@ def main() -> None:
             source = package_source(scratch / "source.tar.gz")
             source["image_manifest"] = MANIFEST
             source["image_sha256"] = _sha(args.base if args.prepare_image else image)
-            (output / "source.json").write_text(json.dumps(source, indent=2) + "\n")
             if not args.prepare_image:
                 source["kernel_sha256"] = _sha(kernel)
-                (output / "source.json").write_text(json.dumps(source, indent=2) + "\n")
+            (output / "source.json").write_text(json.dumps(source, indent=2) + "\n")
             guest = Guest(
                 scratch, output, disk, accel, None if args.prepare_image else kernel
             )
@@ -422,13 +408,6 @@ def main() -> None:
                             stdout=log,
                             stderr=subprocess.STDOUT,
                         )
-                        guest.ssh(
-                            "cd /root/source && "
-                            "bash .buildkite/k3_tests/devdax/guest-install.sh",
-                            timeout=900,
-                            stdout=log,
-                            stderr=subprocess.STDOUT,
-                        )
                     suite = shlex.quote(controls_values["LMCACHE_DEVDAX_SUITE"])
                     with (output / "guest-test.log").open("w") as log:
                         try:
@@ -436,7 +415,7 @@ def main() -> None:
                                 f"cd /root/source && LMCACHE_DEVDAX_SUITE={suite} "
                                 f"LMCACHE_DEVDAX_QEMU_ACCEL={accel} "
                                 "/opt/lmcache-test/bin/python "
-                                ".buildkite/k3_tests/devdax/guest-test.py",
+                                ".buildkite/k3_tests/devdax/guest_test.py",
                                 timeout=1300 if accel == "kvm" else 5400,
                                 stdout=log,
                                 stderr=subprocess.STDOUT,
@@ -464,8 +443,7 @@ def main() -> None:
                         tarfile.TarError,
                     ) as exc:
                         print(f"Guest log collection failed: {exc}", flush=True)
-                        if not args.prepare_image:
-                            code = code or 1
+                        code = code or 1
                 guest.close()
             if not args.prepare_image:
                 if (output / "versions.json").is_file():

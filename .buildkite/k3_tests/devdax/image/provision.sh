@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Executed only in the disposable guest by runner.py --prepare-image.
+# Runs only in the disposable image-building guest.
 set -euo pipefail
 [[ "$(cat /sys/class/dmi/id/product_name)" == LMCache-DevDAX-QEMU ]]
+cd /root/source
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-mapfile -t packages < /root/source/.buildkite/k3_tests/devdax/image/apt-packages.lock
-apt-get install -y --no-install-recommends "${packages[@]}"
-# Prevent automatic conversion to system-ram; provisioning must observe devdax.
+apt-get install -y --no-install-recommends \
+    python3-venv python3-dev build-essential pkg-config libnuma-dev \
+    ndctl=77-2ubuntu2 daxctl=77-2ubuntu2 cxl=77-2ubuntu2
 mkdir -p /etc/udev/rules.d
 ln -sf /dev/null /etc/udev/rules.d/90-daxctl-device.rules
 python3 -m venv /opt/lmcache-test
-/opt/lmcache-test/bin/pip install --extra-index-url https://download.pytorch.org/whl/cpu \
-    --require-hashes -r /root/source/.buildkite/k3_tests/devdax/image/requirements.lock
+# shellcheck source=/dev/null
+source /opt/lmcache-test/bin/activate
+python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+# ponytail: dependency resolution can change on rebuild; retain the checksummed image.
+python -m pip install -r requirements/build.txt -r requirements/common.txt \
+    -r requirements/test.txt
 mkdir -p /opt/lmcache-image
-cp /boot/config-6.8.0-139-generic /opt/lmcache-image/kernel.config
 dpkg-query -W > /opt/lmcache-image/packages.txt
-/opt/lmcache-test/bin/pip freeze > /opt/lmcache-image/python-packages.txt
-cxl --version > /opt/lmcache-image/cxl-version.txt
-# Each test overlay supplies a new key and instance ID through NoCloud.
+python -m pip freeze > /opt/lmcache-image/python-packages.txt
 cloud-init clean --logs

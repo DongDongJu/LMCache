@@ -26,7 +26,7 @@ def _module(path: Path) -> ModuleType:
 
 
 selection = _module(CI / "ci_selection.py")
-guest_test = _module(CI / "guest-test.py")
+guest_test = _module(CI / "guest_test.py")
 provider = _module(ROOT / "tests/v1/distributed/dax_test_utils.py")
 
 

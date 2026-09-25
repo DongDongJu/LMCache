@@ -4,13 +4,18 @@
 # Standard
 from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
-import importlib.util
+from typing import TYPE_CHECKING
 import json
 import os
+import platform
 import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+
+if TYPE_CHECKING:
+    # Third Party
+    import pytest
 
 HERE = Path(__file__).resolve().parent
 
@@ -19,12 +24,31 @@ def manifests(suite: str) -> dict[str, list[str]]:
     """Return exact node IDs for l1, l2 or both; invalid selections fail."""
     if suite not in ("l1", "l2", "both"):
         raise ValueError(f"invalid suite: {suite}")
-    declared = json.loads((HERE / "suites.json").read_text())
-    selected = {
-        name: declared[name] for name in ("l1", "l2") if suite in (name, "both")
+    declared = {
+        "l1": [
+            "test_runtime_add_and_drain_remove_lifecycle",
+            "test_kv_cache_drain_gates_device_removal",
+            "test_capacity_reuse_and_batch_rollback[False]",
+            "test_capacity_reuse_and_batch_rollback[True]",
+        ],
+        "l2": [
+            "test_async_capacity_locks_and_volatile_reopen",
+            "test_runtime_add_drain_migrate_and_blocked_remove",
+            "test_aligned_mapping_resize",
+            "test_storage_manager_dram_l1_roundtrip",
+        ],
     }
     if suite == "both":
-        selected["l2"].append(declared["combined"])
+        declared["l2"].append("test_storage_manager_combined_dax_roundtrip")
+    modules = {
+        "l1": "tests/v1/distributed/test_devdax_l1_reconfigure_integration.py",
+        "l2": "tests/v1/distributed/test_dax_l2_integration.py",
+    }
+    selected = {
+        name: [f"{modules[name]}::{test}" for test in tests]
+        for name, tests in declared.items()
+        if suite in (name, "both")
+    }
     return selected
 
 
@@ -70,14 +94,55 @@ def check_report(output: Path, name: str, nodes: list[str], returncode: int) -> 
     return result
 
 
+def pytest_collection_finish(session: "pytest.Session") -> None:
+    """Record exact node IDs for the selected suite's report."""
+    Path(os.environ["LMCACHE_DEVDAX_COLLECTION"]).write_text(
+        json.dumps([item.nodeid for item in session.items]) + "\n"
+    )
+
+
 def main() -> None:
     """Run CPU/native strict device tests serially, preserving both suite outcomes."""
-    selected = manifests(os.environ.get("LMCACHE_DEVDAX_SUITE", "both"))
-    spec = importlib.util.find_spec("lmcache.lmcache_native")
-    if spec is None or not any(
-        (spec.origin or "").endswith(s) for s in EXTENSION_SUFFIXES
+    os.environ.update(
+        NO_GPU_EXT="1",
+        MAX_JOBS="4",
+        SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0.dev0",
+        LMCACHE_TRACK_USAGE="false",
+    )
+    for name in ("NO_NATIVE_EXT", "LMCACHE_DEVICE_BACKEND"):
+        os.environ.pop(name, None)
+    for args in (
+        ["-m", "pip", "install", "-e", ".", "--no-deps", "--no-build-isolation"],
+        ["-m", "pip", "check"],
+        ["lmcache/v1/multiprocess/transport/grpc_impl/_proto_gen/_generate.py"],
     ):
+        subprocess.run([sys.executable, *args], check=True, timeout=900)
+    sys.path.insert(0, str(Path.cwd()))
+
+    # Third Party
+    import torch
+
+    # First Party
+    import lmcache
+    import lmcache.lmcache_native as native
+
+    if not any(native.__file__.endswith(s) for s in EXTENSION_SUFFIXES):
         raise RuntimeError("real compiled lmcache_native extension required")
+    assert Path(lmcache.__file__).is_relative_to("/root/source")
+    assert torch.version.cuda is None and lmcache.torch_device_type == "cpu"
+    versions = dict(
+        kernel=platform.release(),
+        python=platform.python_version(),
+        torch=torch.__version__,
+        lmcache=lmcache.__version__,
+        native=native.__file__,
+        cxl=subprocess.check_output(["cxl", "--version"], text=True).strip(),
+        daxctl=subprocess.check_output(["daxctl", "--version"], text=True).strip(),
+    )
+    Path("artifacts/devdax-qemu/versions.json").write_text(
+        json.dumps(versions, indent=2) + "\n"
+    )
+    selected = manifests(os.environ.get("LMCACHE_DEVDAX_SUITE", "both"))
     output = Path("artifacts/devdax-qemu").resolve()
     paths = Path("/run/lmcache-dax-paths").read_text().strip()
     env = dict(
@@ -110,7 +175,7 @@ def main() -> None:
                         "-v",
                         "-s",
                         "-p",
-                        "pytest_report",
+                        "guest_test",
                         "-o",
                         "xfail_strict=true",
                         *nodes,

@@ -64,7 +64,7 @@ def test_real_vm_failure_propagation(
 
     def ssh(guest: Any, command: str, timeout: int = 60, **kwargs: object) -> object:
         guests.append(guest)
-        if fault == "payload" and command.endswith("guest-test.py"):
+        if fault == "payload" and command.endswith("guest_test.py"):
             original(
                 guest,
                 "sed -i 's/raw_tensor == 0xAB/raw_tensor == 0xAA/' "
