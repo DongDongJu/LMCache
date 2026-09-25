@@ -22,8 +22,7 @@ if [[ -n "$image" ]]; then
         --group-add "$(stat -c %g /dev/kvm)" \
         -e "LMCACHE_CI_UID=$(id -u)" -e "LMCACHE_CI_GID=$(id -g)" \
         --volume "$PWD:$PWD" --workdir "$PWD" \
-        -e HOME -e LMCACHE_DEVDAX_SUITE \
-        -e LMCACHE_DEVDAX_QEMU -e LMCACHE_DEVDAX_BOOT_TIMEOUT \
+        -e HOME -e LMCACHE_DEVDAX_BOOT_TIMEOUT \
         -- "$image" python3 .buildkite/k3_tests/devdax/runner.py "$@"
 fi
 exec python3 .buildkite/k3_tests/devdax/runner.py "$@"

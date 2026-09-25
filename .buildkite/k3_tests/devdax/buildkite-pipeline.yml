@@ -1,9 +1,6 @@
 # Paste into a dedicated manual/nightly pipeline's Steps editor.
 agents:
   queue: k3-h200-local
-env:
-  LMCACHE_DEVDAX_QEMU: auto
-  LMCACHE_DEVDAX_SUITE: both
 steps:
   - label: ":pipeline: Select DevDAX coverage"
     command: bash .buildkite/k3_tests/devdax/upload.sh

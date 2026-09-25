@@ -19,9 +19,6 @@ import tempfile
 import time
 import uuid
 
-# Third Party
-from ci_selection import controls
-
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 MANIFEST = json.loads((HERE / "image/manifest.json").read_text())
@@ -283,20 +280,12 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
-    controls_values = controls(dict(os.environ))
     signal.signal(signal.SIGALRM, _cancel)
     signal.alarm(3600 if args.prepare_image else 1800)
     output = ROOT / "artifacts/devdax-qemu" / f"run-{uuid.uuid4().hex[:12]}"
     output.mkdir(parents=True)
     print(f"DevDAX artifacts: {output}", flush=True)
-    summary = {
-        name: {
-            "state": "infrastructure failure"
-            if controls_values["LMCACHE_DEVDAX_SUITE"] in (name, "both")
-            else "not selected"
-        }
-        for name in ("l1", "l2")
-    }
+    summary = {name: {"state": "infrastructure failure"} for name in ("l1", "l2")}
     code = 1
     guest = None
     try:
@@ -396,11 +385,10 @@ def main() -> None:
                             stdout=log,
                             stderr=subprocess.STDOUT,
                         )
-                    suite = shlex.quote(controls_values["LMCACHE_DEVDAX_SUITE"])
                     with (output / "guest-test.log").open("w") as log:
                         try:
                             guest.ssh(
-                                f"cd /root/source && LMCACHE_DEVDAX_SUITE={suite} "
+                                "cd /root/source && "
                                 "/opt/lmcache-test/bin/python "
                                 ".buildkite/k3_tests/devdax/guest_test.py",
                                 timeout=1300,
@@ -454,18 +442,17 @@ def main() -> None:
                 if (output / "summary.json").exists():
                     summary = json.loads((output / "summary.json").read_text())
                     for name in ("l1", "l2"):
-                        if controls_values["LMCACHE_DEVDAX_SUITE"] in (name, "both"):
-                            suite_reports = [
-                                f"junit-{name}.xml",
-                                f"pytest-{name}.log",
-                                f"collected-{name}.json",
-                            ]
-                            if missing or any(
-                                not (output / p).is_file() for p in suite_reports
-                            ):
-                                summary[name]["state"] = "infrastructure failure"
-                            if summary[name]["state"] != "passed":
-                                code = code or 1
+                        suite_reports = [
+                            f"junit-{name}.xml",
+                            f"pytest-{name}.log",
+                            f"collected-{name}.json",
+                        ]
+                        if missing or any(
+                            not (output / p).is_file() for p in suite_reports
+                        ):
+                            summary[name]["state"] = "infrastructure failure"
+                        if summary[name]["state"] != "passed":
+                            code = code or 1
     except (Exception, KeyboardInterrupt) as exc:
         print(f"DevDAX infrastructure failure: {exc}", flush=True)
         (output / "infrastructure-error.txt").write_text(str(exc) + "\n")
@@ -485,7 +472,7 @@ def main() -> None:
                     "devdax-qemu",
                     "--style",
                     "success" if code == 0 else "error",
-                    f"DevDAX {controls_values['LMCACHE_DEVDAX_SUITE']}: "
+                    "DevDAX L1/L2: "
                     f"{'passed' if code == 0 else 'FAILED'}. "
                     f"Artifacts: {output.relative_to(ROOT)}",
                 ],

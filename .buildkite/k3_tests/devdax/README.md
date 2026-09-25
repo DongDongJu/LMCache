@@ -4,21 +4,16 @@ CPU-only tests exercise production MP L1/L2 against three independent 256 MiB
 volatile CXL devices. The guest builds the tested source with `NO_GPU_EXT=1`
 and verifies the compiled native extension. Host DAX devices are never used.
 
-## Selection
+## Enable or disable
 
-| Variable | Default | Values |
-| --- | --- | --- |
-| `LMCACHE_DEVDAX_QEMU` | `auto` | `on`, `off`, `auto` |
-| `LMCACHE_DEVDAX_SUITE` | `both` | `l1`, `l2`, `both` |
+`LMCACHE_DEVDAX_QEMU=on|off` controls whether the Buildkite uploader adds the
+QEMU job; the default is `on`. `off` skips only this additional job and records
+that coverage was skipped. Other values, including `auto`, fail configuration.
+Enabled jobs always run both L1 and L2, regardless of changed paths. There is
+no suite selector or automatic path filtering.
 
-Invalid values fail. `off` disables only QEMU; `on` forces it. In `auto`, scheduled
-builds, `force-ci`, relevant changes and unknown diffs run coverage. README-only
-PRs skip. `ci_selection.py` contains the conservative dependency allowlist,
-including the CPU installer under `.github/`. PRs compare their full merge-base
-against the Buildkite base branch (default `dev`); pushes need the full webhook
-before SHA in `LMCACHE_DEVDAX_BEFORE_SHA`, otherwise they run. Deleted/renamed paths
-and shallow histories are covered. The independent unit bootstrap command avoids
-the generic trivial-file filter; there is no second `if_changed` gate.
+Direct `run.sh` invocations and nightly image verification always run both suites.
+The on/off control applies to Buildkite job upload, not those explicit runs.
 
 ## Nightly CI image
 
@@ -66,7 +61,7 @@ bash .buildkite/k3_tests/devdax/run.sh --prepare-image \
 
 export LMCACHE_DEVDAX_IMAGE=/var/cache/lmcache/base.qcow2
 export LMCACHE_DEVDAX_KERNEL=/var/cache/lmcache/kernel/bzImage
-LMCACHE_DEVDAX_SUITE=both bash .buildkite/k3_tests/devdax/run.sh
+bash .buildkite/k3_tests/devdax/run.sh
 ```
 
 QEMU 11.1.1 fixes noninterleaved CXL mappings under KVM; older versions can fault
@@ -88,9 +83,8 @@ deadline is 30 minutes. Override the 300-second boot deadline with
 ## Tests and reports
 
 `guest_test.py` declares exact node IDs, builds LMCache and runs L1/L2 serially.
-Both selects four L1 and five L2 cases, including a combined test on separate
-devices; each individual suite selects four. An L1 failure still produces an L2
-result. Empty suites, unexpected collection, skips/xfails, missing reports and
+Every run requires four L1 and five L2 cases, including a combined test on
+separate devices. An L1 failure still produces an L2 result. Empty suites, unexpected collection, skips/xfails, missing reports and
 failures fail the job. Payloads and layouts are checked in full.
 
 The guest discovers CXL regions and validates character-device identity, driver,
@@ -102,7 +96,7 @@ and parallel execution. Never supply devices containing useful data.
 Artifacts under `artifacts/devdax-qemu/run-<id>/` include source/image identity,
 console/kernel logs, topology, device manifest, package inventory, build/pytest
 logs, collection JSON, JUnit and `summary.json`. Summary states distinguish
-`not selected`, `passed`, `failed` and `infrastructure failure`. The uploader
+`passed`, `failed` and `infrastructure failure`. The uploader
 saves `selection.json` and labels skipped coverage. Cleanup stops only this VM.
 
 ```bash
@@ -123,11 +117,11 @@ A project administrator must provision CPU queue `devdax-qemu` with Docker and
 working KVM access. Publish the first GHCR image before enabling the queue. Paste
 `../unit/buildkite-pipeline.yml` into the active K3 unit Steps editor; Git changes
 alone do not update it. Preserve fork/runner access policy and allow eligible PR
-webhooks through, including docs-only explicit `on` builds.
+webhooks through. The additional QEMU job defaults to enabled.
 
 Use `buildkite-pipeline.yml` for manual Buildkite runs against branch `dev`.
-The GitHub nightly image workflow already runs both suites before publishing. Verify L1-only, L2-only, combined, unrelated-path and explicit-off builds;
-retain their URLs. Do not add this uploader to other test pipelines.
+The GitHub nightly image workflow runs both suites before publishing. Verify
+enabled and disabled Buildkite builds and retain their URLs. Do not add this uploader to other test pipelines.
 
 These functional checks do not establish GPU registration/DMA, physical CXL
 performance/coherence, persistence, or physical hot removal.

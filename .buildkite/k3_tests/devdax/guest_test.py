@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run each selected suite, checking exact collection and fail-closed JUnit results."""
+"""Run both suites, checking exact collection and fail-closed JUnit results."""
 
 # Standard
 from importlib.machinery import EXTENSION_SUFFIXES
@@ -20,10 +20,8 @@ if TYPE_CHECKING:
 HERE = Path(__file__).resolve().parent
 
 
-def manifests(suite: str) -> dict[str, list[str]]:
-    """Return exact node IDs for l1, l2 or both; invalid selections fail."""
-    if suite not in ("l1", "l2", "both"):
-        raise ValueError(f"invalid suite: {suite}")
+def manifests() -> dict[str, list[str]]:
+    """Return the required L1 and L2 node IDs, including the combined case."""
     declared = {
         "l1": [
             "test_runtime_add_and_drain_remove_lifecycle",
@@ -36,10 +34,9 @@ def manifests(suite: str) -> dict[str, list[str]]:
             "test_runtime_add_drain_migrate_and_blocked_remove",
             "test_aligned_mapping_resize",
             "test_storage_manager_dram_l1_roundtrip",
+            "test_storage_manager_combined_dax_roundtrip",
         ],
     }
-    if suite == "both":
-        declared["l2"].append("test_storage_manager_combined_dax_roundtrip")
     modules = {
         "l1": "tests/v1/distributed/test_devdax_l1_reconfigure_integration.py",
         "l2": "tests/v1/distributed/test_dax_l2_integration.py",
@@ -47,7 +44,6 @@ def manifests(suite: str) -> dict[str, list[str]]:
     selected = {
         name: [f"{modules[name]}::{test}" for test in tests]
         for name, tests in declared.items()
-        if suite in (name, "both")
     }
     return selected
 
@@ -142,7 +138,7 @@ def main() -> None:
     Path("artifacts/devdax-qemu/versions.json").write_text(
         json.dumps(versions, indent=2) + "\n"
     )
-    selected = manifests(os.environ.get("LMCACHE_DEVDAX_SUITE", "both"))
+    selected = manifests()
     output = Path("artifacts/devdax-qemu").resolve()
     paths = Path("/run/lmcache-dax-paths").read_text().strip()
     env = dict(
@@ -160,7 +156,7 @@ def main() -> None:
         LMCACHE_TRACK_USAGE="false",
     )
     summary: dict[str, dict] = {
-        name: {"state": "not selected"} for name in ("l1", "l2")
+        name: {"state": "infrastructure failure"} for name in ("l1", "l2")
     }
     for name, nodes in selected.items():
         start = time.monotonic()

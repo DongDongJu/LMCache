@@ -45,7 +45,6 @@ def test_real_vm_failure_propagation(
     """A real guest failure must return failure, keep diagnostics and remove QEMU."""
     runner = _load_runner(monkeypatch)
     monkeypatch.setattr(sys, "argv", ["runner.py"])
-    monkeypatch.setenv("LMCACHE_DEVDAX_SUITE", "both")
     if fault == "missing-devices":
         # Physically omit emulated CXL devices from this disposable VM.
         monkeypatch.setattr(runner, "topology", lambda: [])
