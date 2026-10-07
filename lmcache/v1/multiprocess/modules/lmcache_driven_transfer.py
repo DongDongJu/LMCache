@@ -194,6 +194,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             payload_type=L1WriteCompletion,
         )
         self._device_host_func_dispatcher.register(
+            "abort_write_by_owner",
+            self._ctx.storage_manager.abort_write_by_owner,
+            payload_type=L1WriteCompletion,
+        )
+        self._device_host_func_dispatcher.register(
             "finish_read_prefetched",
             self._ctx.storage_manager.finish_read_prefetched,
             payload_type=list[ObjectKey],
@@ -746,6 +751,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
             reserved_dict: dict[ObjectKey, MemoryObj] = {}
             all_dict: dict[ObjectKey, MemoryObj] = {}
+            # Owners captured at reservation, before any copy runs, so a failed
+            # store can always abort at the L1 that made each reservation.
+            reserved_owners: L1WriteCompletion = []
             total_bytes: int = 0
             store_succeeded = False
             try:
@@ -764,6 +772,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         keys_to_reserve, layout_desc
                     )
                     all_dict.update(reserved_dict)
+                    if reserved_dict:
+                        reserved_owners.extend(
+                            self._ctx.storage_manager.prepare_write_completion(
+                                reserved_dict
+                            )
+                        )
                     if reserved_dict:
                         total_bytes += next(
                             iter(reserved_dict.values())
@@ -810,6 +824,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     )
                 else:
                     total_bytes = 0
+                    if reserved_owners:
+                        # Abort once the partial copies drain. Waiting for the
+                        # write TTL is not enough for a remote-authority L1:
+                        # its authority would keep the keys write-locked and
+                        # refuse every later writer.
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "abort_write_by_owner",
+                            reserved_owners,
+                        )
                 num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,

@@ -438,6 +438,28 @@ class StorageManager:
 
         # TODO: global key states update
 
+    def abort_write_by_owner(self, completion: L1WriteCompletion) -> None:
+        """Discard captured reservations whose store failed.
+
+        Args:
+            completion: Owner/key groups captured before scheduling the abort.
+
+        Raises:
+            ValueError: A captured owner is no longer registered.
+
+        The caller must wait for device writes into the reserved buffers, so
+        schedule this on the same stream as the copies. An embedded L1 frees
+        the staging buffers now instead of when their write TTL expires; a
+        remote binding tells its authority, which would otherwise keep the
+        keys write-locked and refuse every later writer.
+        """
+        if any(owner not in self._l1_managers_by_id for owner, _ in completion):
+            raise ValueError("write completion requires a registered L1 owner")
+        for owner, keys in completion:
+            self._l1_managers_by_id[owner].finish_write_and_delete(
+                keys, tag=_L1_WRITE_TAG
+            )
+
     @contextmanager
     def read_prefetched_results(
         self,
