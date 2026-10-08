@@ -59,6 +59,13 @@ def _load_proto_generator() -> ModuleType:
     return module
 
 
+# Packages whose gRPC bindings are generated from the sibling ``protos`` dir.
+_GRPC_BINDING_PACKAGES = (
+    "lmcache.v1.multiprocess.transport.grpc_impl._proto_gen",
+    "lmcache.v1.memory_orchestrator._proto_gen",
+)
+
+
 class _BuildPyWithGrpcStubs(_build_py):
     """Generate ignored gRPC bindings before packaging LMCache."""
 
@@ -66,7 +73,8 @@ class _BuildPyWithGrpcStubs(_build_py):
         distribution_name = self.distribution.get_name().replace("_", "-").lower()
         if distribution_name != "lmcache-cli":
             generator = _load_proto_generator()
-            generator.generate()
+            for package in _GRPC_BINDING_PACKAGES:
+                generator.generate(package)
         super().run()
 
 
