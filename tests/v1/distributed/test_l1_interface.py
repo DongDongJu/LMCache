@@ -12,7 +12,11 @@ import torch
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import L1ManagerConfig, L1MemoryManagerConfig
 from lmcache.v1.distributed.error import L1Error
-from lmcache.v1.distributed.internal_api import L1ManagerInterface, L1ManagerListener
+from lmcache.v1.distributed.internal_api import (
+    DevDaxHotPlug,
+    L1ManagerInterface,
+    L1ManagerListener,
+)
 from lmcache.v1.distributed.l1_manager import L1Manager
 import lmcache.v1.memory_management as memory_management
 
@@ -132,3 +136,11 @@ def test_tags_are_independent_writers(l1: L1ManagerInterface) -> None:
     # Only tag "a" can finish its reservation.
     assert l1.finish_write([key(4)], tag="b") == {key(4): L1Error.KEY_NOT_EXIST}
     assert l1.finish_write([key(4)], tag="a") == {key(4): L1Error.SUCCESS}
+
+
+def test_hot_plug_is_a_capability_of_the_embedded_manager(
+    l1: L1ManagerInterface,
+) -> None:
+    # The interface does not promise hot-plug; the manager that owns its
+    # arenas offers it as DevDaxHotPlug.
+    assert isinstance(l1, DevDaxHotPlug) == isinstance(l1, L1Manager)
