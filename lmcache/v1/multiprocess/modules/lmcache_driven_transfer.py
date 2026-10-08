@@ -467,6 +467,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 GPUCacheContext for GPU KV format detection.
             engine_group_infos: Engine-neutral KV cache group metadata
                 (already msgspec-decoded by the message queue).
+
+        Raises:
+            ValueError: ``world_size`` exceeds 1 while a shared Device-DAX L1
+                is configured.
         """
         now = time.monotonic()
         # NOOP-register: an already-registered instance (e.g. a recovering
@@ -482,6 +486,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     instance_id,
                 )
                 return
+
+        if world_size > 1 and self._ctx.storage_manager.has_remote_l1():
+            raise ValueError(
+                "A shared Device-DAX L1 supports TP=1 only; "
+                f"instance {instance_id} registered world_size={world_size}"
+            )
 
         # Build the context and layout descriptor outside the lock.
         cache_context = create_cache_context(

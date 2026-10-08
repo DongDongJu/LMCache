@@ -114,14 +114,23 @@ def run_trace_replay(args: argparse.Namespace) -> None:
 
     Args:
         args: Parsed CLI arguments.
+
+    Raises:
+        ValueError: The storage configuration includes a shared L1.
     """
     # First Party
     from lmcache.cli.commands.trace._driver import StorageReplayDriver
-    from lmcache.v1.distributed.config import StorageManagerConfig, parse_args_to_config
+    from lmcache.v1.distributed.config import (
+        StorageManagerConfig,
+        parse_args_to_config,
+    )
     from lmcache.v1.mp_observability.config import parse_args_to_observability_config
     from lmcache.v1.mp_observability.trace.reader import TraceReader
 
     sm_config: StorageManagerConfig = parse_args_to_config(args)
+    if any(c.shared is not None for c in sm_config.l1_manager_configs):
+        # Replay would write recorded keys into a region other servers serve.
+        raise ValueError("trace replay does not support a shared L1")
 
     # ``--trace-level`` / ``--trace-output`` belong to the recording
     # surface.  They are still registered on the parser so the flag set

@@ -27,6 +27,7 @@ from lmcache.v1.distributed.api import (
 )
 from lmcache.v1.distributed.config import (
     EvictionConfig,
+    L1ManagerConfig,
     StorageManagerConfig,
     requires_single_l1_memory_region,
     unwrap_l2_adapter_config,
@@ -99,6 +100,26 @@ _L1_WRITE_TAG = "storage_manager"
 L1WriteCompletion = list[tuple[int, list[ObjectKey]]]
 
 
+def _create_l1_manager(config: L1ManagerConfig) -> L1ManagerInterface:
+    """Build the L1 binding a configuration asks for.
+
+    Args:
+        config: One parsed L1 configuration.
+
+    Returns:
+        A ``SharedL1Manager`` for an L1 with a ``shared`` section, else the
+        embedded ``L1Manager``.
+    """
+    if config.shared is not None:
+        # The remote binding pulls in gRPC and generated bindings; import it
+        # only when a shared L1 is configured.
+        # First Party
+        from lmcache.v1.distributed.shared_l1.manager import SharedL1Manager
+
+        return SharedL1Manager(config)
+    return L1Manager(config)
+
+
 class StorageManager:
     def __init__(
         self,
@@ -138,7 +159,7 @@ class StorageManager:
                         raise ValueError(
                             f"Device-DAX path already owned by an L1: {path}"
                         )
-                    manager: L1ManagerInterface = L1Manager(manager_config)
+                    manager = _create_l1_manager(manager_config)
                     cleanup.callback(manager.close)
                     created.append(manager)
                 managers = tuple(created)
@@ -1301,6 +1322,14 @@ class StorageManager:
     def is_multi_l1(self) -> bool:
         """Whether owner metadata is required to resolve a serving read."""
         return len(self._l1_managers_by_id) > 1
+
+    def has_remote_l1(self) -> bool:
+        """Whether any L1 is a shared region a memory orchestrator owns.
+
+        Returns:
+            True when an L1 configuration has a ``shared`` section.
+        """
+        return any(c.shared is not None for c in self._l1_configs)
 
     def report_status(self) -> dict:
         """Return per-L1 status and aggregate health; retain single-L1 field names."""
