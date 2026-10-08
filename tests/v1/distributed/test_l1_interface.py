@@ -3,6 +3,7 @@
 
 # Standard
 from collections.abc import Iterator
+from pathlib import Path
 
 # Third Party
 import pytest
@@ -18,6 +19,8 @@ from lmcache.v1.distributed.internal_api import (
     L1ManagerListener,
 )
 from lmcache.v1.distributed.l1_manager import L1Manager
+from lmcache.v1.distributed.shared_l1.manager import SharedL1Manager
+from tests.v1.distributed.shared_l1.utils import running_orchestrator, shared_config
 import lmcache.v1.memory_management as memory_management
 
 pytestmark = pytest.mark.no_shared_allocator
@@ -59,21 +62,35 @@ class RecordingListener(L1ManagerListener):
         pass
 
 
-@pytest.fixture
-def l1(monkeypatch: pytest.MonkeyPatch) -> Iterator[L1ManagerInterface]:
-    monkeypatch.setattr(
-        memory_management,
-        "_allocate_cpu_memory",
-        lambda size, *args, **kwargs: torch.empty(size, dtype=torch.uint8),
-    )
-    monkeypatch.setattr(memory_management, "_free_cpu_memory", lambda *a, **k: None)
-    embedded = L1Manager(
-        L1ManagerConfig(
-            L1MemoryManagerConfig(size_in_bytes=CAPACITY, use_lazy=False, shm_name="")
+@pytest.fixture(params=["embedded", "remote"])
+def l1(
+    request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[L1ManagerInterface]:
+    if request.param == "embedded":
+        monkeypatch.setattr(
+            memory_management,
+            "_allocate_cpu_memory",
+            lambda size, *args, **kwargs: torch.empty(size, dtype=torch.uint8),
         )
-    )
-    yield embedded
-    embedded.close()
+        monkeypatch.setattr(memory_management, "_free_cpu_memory", lambda *a, **k: None)
+        embedded = L1Manager(
+            L1ManagerConfig(
+                L1MemoryManagerConfig(
+                    size_in_bytes=CAPACITY, use_lazy=False, shm_name=""
+                )
+            )
+        )
+        yield embedded
+        embedded.close()
+        return
+    region = tmp_path / "region"
+    region.write_bytes(b"\0" * CAPACITY)
+    with running_orchestrator(tmp_path / "state", capacity_bytes=CAPACITY) as orch:
+        remote = SharedL1Manager(
+            shared_config(region, orch.endpoint, "server-a", size_bytes=CAPACITY)
+        )
+        yield remote
+        remote.close()
 
 
 def test_write_commit_read_release(l1: L1ManagerInterface) -> None:
