@@ -6,6 +6,7 @@ Overview
 
    request_transport
    multi_l1
+   shared_l1
 
 LMCache multiprocess (MP) mode runs LMCache as a **standalone service** that
 vLLM instances reach through a configurable ZMQ or gRPC request transport.
