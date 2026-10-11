@@ -455,6 +455,35 @@ verify the installation.
      - ``True``
      - Open the slab with ``O_DIRECT`` (required for the GDS DMA fast path on
        ext4). Ignored by ``ugds``, whose IO bypasses the kernel entirely.
+   * - ``--gds-l1-io-workers``
+     - ``0``
+     - Opt-in synchronous cuFile worker count per process, from 0 to 4.
+       Zero uses stream-ordered I/O. Unsupported backends retain stream I/O.
+   * - ``--gds-l1-max-inflight-bytes``
+     - ``134217728``
+     - Maximum useful object bytes held by active worker transfers across
+       devices in this process. An object larger than the budget is rejected.
+       Also limits each registered CUDA context's existing staging allocation;
+       larger layouts require increasing this value before registration.
+
+For the LMCache-driven CUDA path, try ``--gds-l1-io-workers 4`` on a dedicated
+benchmark slab. Workers reuse the context's existing four staging slots and
+registered regions; they add no GPU staging allocation. Each slot uses its own
+stream, and a worker completes and validates I/O and scatter before releasing
+that slot. Stores retain one object per gather kernel. The transport event loop
+remains available while the existing affinity handler waits for completion.
+Worker threads are bounded per process; eight ranks configured with four workers
+use at most 32 worker threads in total.
+Staging uses four times the sum of actual object-group sizes per registered
+cache context, even with one worker. The limit on staging is per context;
+multiple registered contexts still have separate allocations.
+
+The worker path does not guarantee native direct DMA: cuFile may use its
+compatibility path. Check the installed GDS diagnostics and per-process counters
+on the actual GPU/file pair. Compare useful KV-ready throughput and cache
+publication latency, including CPU use. Set ``--gds-l1-io-workers 0`` to disable
+the optimization. Both paths reject short or failed I/O before successful
+LMCache-driven publication; completion does not add an ``fsync`` requirement.
 
 L1 Manager TTLs
 ----------------

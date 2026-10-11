@@ -13,6 +13,7 @@ from __future__ import annotations
 
 # Standard
 from abc import ABC, abstractmethod
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, ClassVar
 import array
 import threading
@@ -105,6 +106,39 @@ class BaseCacheContext(ABC):
     # ------------------------------------------------------------------
     # Abstract -- subclasses MUST implement
     # ------------------------------------------------------------------
+
+    def get_gds_transfer_stream(self, slot: int) -> object:
+        """Return a persistent stream for an independently owned GDS slot.
+
+        Args:
+            slot: Index in the existing temporary staging buffer.
+
+        Returns:
+            A device stream, owned until this cache context closes.
+
+        Raises:
+            NotImplementedError: The platform has no GDS worker path.
+        """
+        raise NotImplementedError("This platform has no GDS worker streams")
+
+    def gds_transfer_scope(self) -> AbstractContextManager[None]:
+        """Keep worker staging and imported engine buffers alive until drain.
+
+        The CUDA context serializes this scope with close. Platforms without
+        worker I/O do not require a lease.
+        """
+        return nullcontext()
+
+    def record_gds_transfer_ready(self) -> object:
+        """Record the reusable worker input event while holding the GDS lease.
+
+        Returns:
+            An event recorded on the context stream for this transfer generation.
+
+        Raises:
+            NotImplementedError: The platform has no GDS worker path.
+        """
+        raise NotImplementedError("This platform has no GDS worker events")
 
     @property
     @abstractmethod

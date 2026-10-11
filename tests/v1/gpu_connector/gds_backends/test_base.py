@@ -82,6 +82,16 @@ class OtherHandle(GDSHandle):
             self._closed = True
 
 
+@pytest.mark.parametrize("operation", ["read", "write"])
+def test_sync_io_is_optional_for_existing_handles(operation: str) -> None:
+    """An async-only backend remains constructible and fails sync calls explicitly."""
+    handle = OtherBackend().open_slab("/slab", 4096, True)
+    assert handle.supports_sync_io is False
+    submit = handle.read_sync if operation == "read" else handle.write_sync
+    with pytest.raises(NotImplementedError, match="not supported"):
+        submit(0x1000, 4096, 8192, 512)
+
+
 @pytest.fixture
 def extra_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Add a real module to the scanned directory without changing the factory."""
@@ -217,6 +227,7 @@ def test_context_keeps_submission_until_completion_and_closes_in_order(
         raw_stream: int,
     ) -> Submission:
         sub = Submission(size, file_offset, buf_offset)
+        sub.result.value = size
         submissions.append(weakref.ref(sub))
         return sub
 

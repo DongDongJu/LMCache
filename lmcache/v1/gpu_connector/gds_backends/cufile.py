@@ -24,6 +24,18 @@ def _declare_signatures() -> None:
     # Third Party
     from cufile.bindings import CUfileError, libcufile
 
+    # Some Python bindings declare these as unsigned size_t, hiding errors.
+    # They must be corrected even when async signatures are already initialized.
+    for operation in (libcufile.cuFileRead, libcufile.cuFileWrite):
+        operation.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int64,
+            ctypes.c_int64,
+        ]
+        operation.restype = ctypes.c_ssize_t
+
     if getattr(libcufile.cuFileReadAsync, "argtypes", None):
         return
     libcufile.cuFileReadAsync.argtypes = [
@@ -165,9 +177,76 @@ class Backend(FileGDSBackend):
 
 
 class AsyncHandle(FDGDSHandle):
-    """An owning cufile slab handle with stream-ordered IO."""
+    """An owning cuFile slab handle with async and optional blocking operations."""
 
     _backend: Backend
+    supports_sync_io = True
+
+    def read_sync(
+        self, buf_base: int, size: int, file_offset: int, buf_offset: int
+    ) -> int:
+        """Return cuFileRead's signed result after the blocking call completes.
+
+        Args:
+            buf_base: Registered GPU base address on the caller's CUDA device.
+            size: Requested bytes; short transfers are returned unchanged.
+            file_offset: Byte offset within this handle's slab.
+            buf_offset: Byte offset relative to the registered base.
+
+        Returns:
+            Transferred bytes, -1 for a filesystem error, or a negative cuFile
+            error code. The existing binding does not capture thread-local errno.
+
+        Raises:
+            RuntimeError: The handle has already been closed.
+        """
+        if self.fd < 0:
+            raise RuntimeError("Cannot read from a closed cuFile handle")
+        # Third Party
+        from cufile.bindings import libcufile
+
+        return int(
+            libcufile.cuFileRead(
+                self._handle,
+                ctypes.c_void_p(buf_base),
+                ctypes.c_size_t(size),
+                ctypes.c_int64(file_offset),
+                ctypes.c_int64(buf_offset),
+            )
+        )
+
+    def write_sync(
+        self, buf_base: int, size: int, file_offset: int, buf_offset: int
+    ) -> int:
+        """Return cuFileWrite's signed result after the blocking call completes.
+
+        Args:
+            buf_base: Registered GPU base address; producer work must be complete.
+            size: Requested bytes; short transfers are returned unchanged.
+            file_offset: Byte offset within this handle's slab.
+            buf_offset: Byte offset relative to the registered base.
+
+        Returns:
+            Transferred bytes, -1 for a filesystem error, or a negative cuFile
+            error code. The existing binding does not capture thread-local errno.
+
+        Raises:
+            RuntimeError: The handle has already been closed.
+        """
+        if self.fd < 0:
+            raise RuntimeError("Cannot write to a closed cuFile handle")
+        # Third Party
+        from cufile.bindings import libcufile
+
+        return int(
+            libcufile.cuFileWrite(
+                self._handle,
+                ctypes.c_void_p(buf_base),
+                ctypes.c_size_t(size),
+                ctypes.c_int64(file_offset),
+                ctypes.c_int64(buf_offset),
+            )
+        )
 
     def read_async(
         self,

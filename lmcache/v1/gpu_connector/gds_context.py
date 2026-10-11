@@ -12,6 +12,8 @@ Construction fails if the requested GDS backend is unavailable.
 """
 
 # Standard
+from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Optional
 import bisect
@@ -27,15 +29,15 @@ from lmcache.logging import init_logger
 from lmcache.v1.distributed.config import GdsL1Config
 from lmcache.v1.gpu_connector._gds_backends import create_backend
 from lmcache.v1.gpu_connector.gds_backends.base import GDSBackend, GDSHandle, Submission
+from lmcache.v1.gpu_connector.gds_workers import GDSWorkerPool
 from lmcache.v1.memory_management import GDSMemoryObject
 from lmcache.v1.platform import stream as platform_stream
 
 logger = init_logger(__name__)
 
 _GDS_ALIGNMENT = 4096
-# A single GDS buffer registration / DMA is capped at 16 MiB (both cuFile and
-# hipFile); larger buffers and chunks are registered and transferred in
-# <=16 MiB regions.
+# This context registers staging buffers in 16 MiB regions. This is our
+# registration geometry, not a universal limit of the backend API.
 _MAX_GDS_REGION = 16 * 1024 * 1024
 # GDS submissions to accumulate before recording a completion event and
 # draining finished ones (keeps the live submission set bounded).
@@ -115,6 +117,28 @@ def register_gds_gpu_buffer(buffer: torch.Tensor) -> None:
         context.register_gpu_buffer(buffer)
 
 
+def validate_gds_staging_size(nbytes: int) -> None:
+    """Check an opt-in CUDA context's staging budget before allocating it.
+
+    Args:
+        nbytes: Actual four-slot allocation, including every object group.
+
+    Raises:
+        ValueError: An enabled worker context's byte budget is too small.
+
+    This is a per-cache-context allocation limit; the worker pool additionally
+    limits in-flight bytes across all contexts belonging to the slab.
+    """
+    with _owner_contexts_lock:
+        contexts = [get_gds_context(), *_owner_contexts.values()]
+    for context in contexts:
+        if context.io_workers and nbytes > context.max_inflight_bytes:
+            raise ValueError(
+                f"GDS staging needs {nbytes} bytes per cache context, exceeding "
+                f"max_inflight_bytes={context.max_inflight_bytes}"
+            )
+
+
 def deregister_gds_gpu_buffer(buffer: torch.Tensor) -> None:
     """Drain and unregister a staging buffer from every slab before freeing it.
 
@@ -180,6 +204,9 @@ class GDSContext:
         self._base_ptrs: list[int] = []
         self._nbytes: list[int] = []
         self._registered_streams: set[int] = set()  # maintained for close()
+        self._worker_pool: GDSWorkerPool | None = None
+        self._io_workers = 0
+        self._max_inflight_bytes = 0
 
     def initialize(self, config: GdsL1Config) -> None:
         """Create + clear the slab and register it with the GDS library.
@@ -207,7 +234,24 @@ class GDSContext:
             self._slab_handle = self._backend.open_slab(
                 config.file_location, self._slab_size, config.use_direct_io
             )
+            if config.io_workers and self._slab_handle.supports_sync_io:
+                self._worker_pool = GDSWorkerPool(
+                    config.io_workers, config.max_inflight_bytes
+                )
+                self._io_workers = config.io_workers
+                self._max_inflight_bytes = config.max_inflight_bytes
+            elif config.io_workers:
+                logger.warning(
+                    "GDS backend %s lacks synchronous I/O; retaining stream I/O",
+                    self.backend.name,
+                )
         except Exception:
+            if self._slab_handle is not None:
+                try:
+                    self._slab_handle.close()
+                except Exception:
+                    logger.exception("GDS slab cleanup failed during initialization")
+                self._slab_handle = None
             try:
                 self._backend.close_driver()
             except Exception as cleanup_error:
@@ -231,11 +275,121 @@ class GDSContext:
             raise RuntimeError("GDS context has no backend")
         return self._backend
 
+    @property
+    def io_workers(self) -> int:
+        """Return the enabled worker count, or zero for the existing path."""
+        return self._io_workers
+
+    @property
+    def max_inflight_bytes(self) -> int:
+        """Return the process-wide byte budget for synchronous worker I/O."""
+        return self._max_inflight_bytes
+
+    def worker_stats(self) -> dict[str, int | bool]:
+        """Return active slot-operation/byte counters, or an empty disabled view.
+
+        A slot operation includes its gather/scatter and sequential registered
+        region I/Os. These counters do not claim hardware queue occupancy.
+        """
+        return self._worker_pool.snapshot() if self._worker_pool is not None else {}
+
+    def submit_io(self, operation: Callable[[], None], nbytes: int) -> Future[None]:
+        """Submit owned slot work, applying bounded backpressure to its caller.
+
+        Args:
+            operation: Work retaining its buffers through I/O and final GPU work.
+            nbytes: Useful object bytes held by the operation.
+
+        Returns:
+            A future that completes only after the operation releases its slot.
+
+        Raises:
+            RuntimeError: Worker I/O is disabled or the pool is closed.
+            ValueError: The operation exceeds the byte budget.
+
+        Call from an MP blocking-handler thread, never the transport event loop.
+        """
+        if self._worker_pool is None:
+            raise RuntimeError("GDS worker I/O is disabled")
+        return self._worker_pool.submit(operation, nbytes)
+
+    def transfer_sync(
+        self,
+        memory_obj: GDSMemoryObject,
+        gpu_buffer: torch.Tensor,
+        direction: SlabDirection,
+    ) -> None:
+        """Complete and validate a slab transfer on an ordinary CUDA worker.
+
+        Args:
+            memory_obj: Object belonging to this slab; offsets are unchanged.
+            gpu_buffer: Registered storage, at least as large as the object.
+            direction: Read from or write to the slab.
+
+        Raises:
+            RuntimeError: Synchronous I/O is unsupported or reports short/error I/O.
+            ValueError: An offset, length, or registered range is invalid.
+
+        The caller must select the CUDA device, complete preceding buffer work,
+        and retain the buffer and handle. No CUDA stream ordering is implied.
+        """
+        handle = self._slab_handle
+        if handle is None or not handle.supports_sync_io:
+            raise RuntimeError("GDS handle does not support synchronous I/O")
+        nbytes = memory_obj.get_size()
+        if (
+            nbytes <= 0
+            or nbytes > gpu_buffer.numel() * gpu_buffer.element_size()
+            or memory_obj.slab_offset < 0
+            or memory_obj.slab_offset + nbytes > self._slab_size
+        ):
+            raise ValueError("GDS transfer exceeds its buffer or slab range")
+        buf = gpu_buffer.view(torch.uint8)
+        operation = (
+            handle.read_sync if direction is SlabDirection.READ else handle.write_sync
+        )
+        pos = 0
+        while pos < nbytes:
+            base_ptr, dev_offset, region_nbytes = self._resolve_buffer(buf[pos:])
+            length = min(nbytes - pos, region_nbytes - dev_offset)
+            completed = operation(
+                base_ptr, length, memory_obj.slab_offset + pos, dev_offset
+            )
+            if completed != length:
+                raise RuntimeError(
+                    f"GDS {direction.name} at {memory_obj.slab_offset + pos}: "
+                    f"expected {length} bytes, completed {completed}"
+                )
+            pos += length
+
+    def synchronize_and_check(self, device: object, stream: object) -> None:
+        """Drain this stream and validate every retained deferred byte count.
+
+        Args:
+            device: Device owning the submitted staging buffer.
+            stream: Issuing stream, called by its serialized affinity handler.
+
+        Raises:
+            RuntimeError: A completed I/O reports an error or short byte count.
+
+        Call before scatter or successful publication. This scoped wait must
+        not run in the MP transport event loop or in a CUDA host callback.
+        """
+        platform_stream.synchronize_stream(device, stream)
+        raw_stream = platform_stream.stream_handle(device, stream)
+        with self._submissions_lock:
+            submissions = self._submissions.pop(raw_stream, None)
+        if submissions is not None:
+            completed = submissions.uncommitted
+            for _, batch in submissions.inflight:
+                completed.extend(batch)
+            self._validate_submissions(completed)
+
     def register_gpu_buffer(self, buffer: torch.Tensor) -> None:
         """Register a staging buffer (and its stream) with the GDS library.
 
-        Registered as contiguous <=16 MiB regions (the GDS buffer-registration
-        cap); :meth:`transfer_async` splits transfers at these boundaries.
+        Registered as contiguous <=16 MiB regions; :meth:`transfer_async`
+        splits transfers at these boundaries.
 
         Args:
             buffer: Contiguous GPU staging buffer, 4 KiB-aligned in size.
@@ -354,6 +508,10 @@ class GDSContext:
 
     def close(self) -> None:
         """Sync the stream, deregister GDS state, and close the slab handle."""
+        if self._worker_pool is not None:
+            self._worker_pool.close()
+            self._worker_pool = None
+            self._io_workers = 0
         devices = {str(buffer.device): buffer.device for buffer in self._buffers}
         for device in devices.values():
             platform_stream.synchronize_device(device)
@@ -513,9 +671,25 @@ class GDSContext:
             st.inflight.append((event, st.uncommitted))
             st.uncommitted = []
         st.ops_since_checkpoint = 0
-        st.inflight = [
-            (event, subs) for (event, subs) in st.inflight if not event.is_complete()
-        ]
+        pending = []
+        completed = []
+        for event, subs in st.inflight:
+            if event.is_complete():
+                completed.extend(subs)
+            else:
+                pending.append((event, subs))
+        st.inflight = pending
+        self._validate_submissions(completed)
+
+    @staticmethod
+    def _validate_submissions(submissions: list[Submission]) -> None:
+        """Reject any deferred result other than its exact requested byte count."""
+        for submission in submissions:
+            if submission.bytes_done != submission.size.value:
+                raise RuntimeError(
+                    f"GDS I/O at {submission.file_offset.value}: expected "
+                    f"{submission.size.value} bytes, completed {submission.bytes_done}"
+                )
 
 
 @functools.cache

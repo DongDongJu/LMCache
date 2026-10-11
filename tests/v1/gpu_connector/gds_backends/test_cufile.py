@@ -3,8 +3,10 @@
 
 # Standard
 from collections.abc import Iterator
+from pathlib import Path
 from unittest.mock import Mock
 import ctypes
+import os
 import sys
 
 # Third Party
@@ -27,6 +29,8 @@ def bindings(monkeypatch: pytest.MonkeyPatch) -> Mock:
     bindings.CUfileError = _Error
     bindings.cuFileHandleRegister.return_value = 17
     for operation in (
+        "cuFileRead",
+        "cuFileWrite",
         "cuFileReadAsync",
         "cuFileWriteAsync",
         "cuFileStreamRegister",
@@ -208,3 +212,58 @@ def test_io_submission_error_propagates(bindings: Mock, backend: CuFileBackend) 
     bindings.libcufile.cuFileReadAsync.return_value = _Error(err=5, cu_err=700)
     with pytest.raises(RuntimeError, match="cuFileReadAsync"):
         handle.read_async(0x1000, 4096, 0, 0, 7)
+
+
+@pytest.mark.parametrize("operation", ["read", "write"])
+@pytest.mark.parametrize("completed", [4096, 2048, 0, -1, -5001])
+def test_sync_io_preserves_actual_signed_results(
+    bindings: Mock, backend: CuFileBackend, operation: str, completed: int
+) -> None:
+    """Short/failed transfers and 64-bit addresses survive the real ctypes ABI."""
+    observed = []
+    prototype = ctypes.CFUNCTYPE(
+        ctypes.c_ssize_t,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int64,
+        ctypes.c_int64,
+    )
+
+    @prototype
+    def native(
+        handle: int, base: int, size: int, file_offset: int, buf_offset: int
+    ) -> int:
+        observed.append((handle, base, size, file_offset, buf_offset))
+        return completed
+
+    native.restype = ctypes.c_size_t  # Installed binding's unsigned declaration.
+    setattr(
+        bindings.libcufile,
+        "cuFileRead" if operation == "read" else "cuFileWrite",
+        native,
+    )
+    # Already-initialized async bindings must not prevent correcting sync types.
+    bindings.libcufile.cuFileReadAsync.argtypes = [ctypes.c_void_p]
+    handle = backend.open_handle(7, "/slab")
+    assert handle.supports_sync_io is True
+    submit = handle.read_sync if operation == "read" else handle.write_sync
+    assert submit(0x10000001000, 4096, 1 << 40, 512) == completed
+    assert observed == [(17, 0x10000001000, 4096, 1 << 40, 512)]
+    bindings.libcufile.cuFileReadAsync.assert_not_called()
+    bindings.libcufile.cuFileWriteAsync.assert_not_called()
+
+
+@pytest.mark.parametrize("operation", ["read", "write"])
+def test_sync_io_rejects_closed_handle(
+    bindings: Mock, backend: CuFileBackend, tmp_path: Path, operation: str
+) -> None:
+    """A released native handle must never be reused by a later worker call."""
+    fd = os.open(tmp_path / "slab", os.O_CREAT | os.O_RDWR, 0o600)
+    handle = backend.open_handle(fd, "/slab")
+    handle.close()
+    submit = handle.read_sync if operation == "read" else handle.write_sync
+    with pytest.raises(RuntimeError, match="closed cuFile handle"):
+        submit(0x1000, 4096, 0, 0)
+    bindings.libcufile.cuFileRead.assert_not_called()
+    bindings.libcufile.cuFileWrite.assert_not_called()

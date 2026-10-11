@@ -70,6 +70,8 @@ TTLs must be positive integers. Unknown fields are rejected.
      - Required ``path``; the allocator checks mapping size and device alignment.
    * - ``GDS``
      - Required ``path``; ``backend`` (``auto``), ``direct_io`` (true).
+       Optional ``io_workers`` (0, maximum 4) and ``max_inflight_bytes``
+       (134217728) configure the opt-in cuFile worker path.
        See :doc:`configuration` for backend requirements and location semantics.
 
 The global eviction flags supply defaults. Override them per manager with,

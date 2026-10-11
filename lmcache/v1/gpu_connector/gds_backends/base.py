@@ -106,10 +106,15 @@ class GDSHandle(ABC):
     """Own a slab's IO resources, with path identifying its location.
 
     IO sizes and offsets are in bytes: buf_offset is relative to the registered
-    buf_base, and file_offset is relative to the slab. Operations are ordered on
-    raw_stream. Keep the buffer, stream, handle, and Submission alive until completion.
-    Submission errors raise immediately; deferred errors appear in bytes_done.
+    buf_base, and file_offset is relative to the slab. Async operations are ordered
+    on raw_stream. Keep the buffer, stream, handle, and Submission alive until
+    completion. Submission errors raise immediately; deferred errors appear in
+    bytes_done. Optional synchronous operations block the calling thread and
+    provide no CUDA stream ordering. Callers select the device/context, complete
+    producer work, validate returned byte counts and retain resources until return.
     """
+
+    supports_sync_io: ClassVar[bool] = False
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -135,6 +140,46 @@ class GDSHandle(ABC):
         raw_stream: int,
     ) -> Submission:
         """Enqueue a GPU-to-slab write and return its in-flight Submission."""
+
+    def read_sync(
+        self, buf_base: int, size: int, file_offset: int, buf_offset: int
+    ) -> int:
+        """Read into a registered GPU region, blocking the calling thread.
+
+        Args:
+            buf_base: Registered GPU buffer base address.
+            size: Requested byte count.
+            file_offset: Byte offset in this slab.
+            buf_offset: Byte offset relative to ``buf_base``.
+
+        Returns:
+            Actual signed byte count, including short counts or negative errors.
+            The caller must require the expected count before using the payload.
+
+        Raises:
+            NotImplementedError: This handle has no synchronous I/O capability.
+        """
+        raise NotImplementedError("Synchronous GDS reads are not supported")
+
+    def write_sync(
+        self, buf_base: int, size: int, file_offset: int, buf_offset: int
+    ) -> int:
+        """Write from a registered GPU region, blocking the calling thread.
+
+        Args:
+            buf_base: Registered GPU buffer base address.
+            size: Requested byte count.
+            file_offset: Byte offset in this slab.
+            buf_offset: Byte offset relative to ``buf_base``.
+
+        Returns:
+            Actual signed byte count, including short counts or negative errors.
+            The caller must require the expected count before publication.
+
+        Raises:
+            NotImplementedError: This handle has no synchronous I/O capability.
+        """
+        raise NotImplementedError("Synchronous GDS writes are not supported")
 
     @abstractmethod
     def close(self) -> None:
