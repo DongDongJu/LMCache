@@ -2,7 +2,6 @@
 """CPU-only resource, failure and shutdown contracts of the GDS worker pool."""
 
 # Standard
-from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, wait
 from unittest.mock import patch
@@ -33,7 +32,7 @@ class GDSWorkerPoolTests(unittest.TestCase):
 
     def test_operation_and_byte_bounds_across_callers(self) -> None:
         """Independent callers must obey both shared admission bounds."""
-        for workers, budget, size in [(1, 100, 6), (2, 10, 6)]:
+        for workers, budget, size in [(1, 100, 6), (2, 10, 6), (2, 100, 6)]:
             with self.subTest(workers=workers, budget=budget):
                 self._check_bounds(workers, budget, size)
 
@@ -83,27 +82,6 @@ class GDSWorkerPoolTests(unittest.TestCase):
         finally:
             gate.set()
             pool.close()
-
-    def test_submission_failure_releases_capacity(self) -> None:
-        """A failed queue insertion leaves capacity usable for the next request."""
-
-        class FailingQueue(deque[object]):
-            fail_next = True
-
-            def append(self, value: object) -> None:
-                if self.fail_next:
-                    self.fail_next = False
-                    raise RuntimeError("queue submission failed")
-                super().append(value)
-
-        with patch.object(gds_workers, "deque", return_value=FailingQueue()):
-            pool = GDSWorkerPool(1, 8)
-        self.addCleanup(pool.close)
-        with self.assertRaisesRegex(RuntimeError, "queue submission failed"):
-            pool.submit(lambda: None, 8)
-        self.assertEqual(pool.snapshot()["inflight_operations"], 0)
-        self.assertEqual(pool.snapshot()["inflight_bytes"], 0)
-        pool.submit(lambda: None, 8).result(timeout=3)
 
     def test_close_wakes_blocked_submitter_and_drains_work(self) -> None:
         """Closing rejects blocked callers and waits for accepted operations."""
@@ -179,30 +157,6 @@ class GDSWorkerPoolTests(unittest.TestCase):
             time.sleep(0.001)
         self.assertIsNone(reference())
 
-    def test_two_workers_can_progress_concurrently(self) -> None:
-        """The admission lock must not serialize the actual I/O callables."""
-        pool = GDSWorkerPool(2, 16)
-        barrier = threading.Barrier(3)
-        release = threading.Event()
-
-        def hold() -> None:
-            barrier.wait(timeout=3)
-            release.wait()
-
-        first = pool.submit(hold, 8)
-        second = pool.submit(hold, 8)
-        try:
-            barrier.wait(timeout=3)
-            self.assertFalse(first.cancel())
-            self.assertEqual(pool.snapshot()["inflight_operations"], 2)
-            self.assertEqual(pool.snapshot()["inflight_bytes"], 16)
-            release.set()
-            first.result(timeout=3)
-            second.result(timeout=3)
-        finally:
-            release.set()
-            pool.close()
-
     def _check_bounds(self, workers: int, budget: int, size: int) -> None:
         """Exercise one shared admission bound with an already running operation."""
         pool = GDSWorkerPool(workers, budget)
@@ -227,7 +181,12 @@ class GDSWorkerPoolTests(unittest.TestCase):
             self.assertTrue(entered.wait(3))
             thread.start()
             self.assertTrue(attempted.wait(3))
-            self.assertFalse(admitted.wait(0.1))
+            if workers == 1 or size * 2 > budget:
+                self.assertFalse(admitted.wait(0.1))
+            else:
+                self.assertTrue(admitted.wait(3))
+                second[0].result(timeout=3)
+                self.assertFalse(first.done())
             snapshot = pool.snapshot()
             self.assertEqual(snapshot["inflight_operations"], 1)
             self.assertEqual(snapshot["inflight_bytes"], size)

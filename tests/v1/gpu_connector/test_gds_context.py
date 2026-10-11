@@ -29,14 +29,14 @@ from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.memory_manager import GDSL1MemoryManager
 from lmcache.v1.gpu_connector import gds_context
 from lmcache.v1.gpu_connector._gds_backends import create_backend
-from lmcache.v1.gpu_connector.gds_backends.base import GDSBackend
+from lmcache.v1.gpu_connector.gds_backends.base import GDSBackend, GDSHandle, Submission
 from lmcache.v1.gpu_connector.gds_context import (
     GDSContext,
     SlabDirection,
     get_gds_context,
     initialize_gds_context,
 )
-from lmcache.v1.memory_management import GDSMemoryObject
+from lmcache.v1.memory_management import GDSMemoryObject, MemoryObjMetadata
 
 
 def _fake_stream(handle: int):
@@ -567,3 +567,139 @@ def test_l1_context_routes_by_owner_and_limits_process_slabs(monkeypatch, backen
         gds_context.get_l1_gds_context(owner)
     gds_context.initialize_l1_gds_context(owner + 1, config)
     gds_context.close_l1_gds_context(owner + 1)
+
+
+@pytest.fixture
+def registered_context(
+    monkeypatch: pytest.MonkeyPatch, backend: Mock
+) -> Iterator[tuple[GDSContext, Mock, torch.Tensor]]:
+    """Reuse the backend/stream fixtures for exact synchronous I/O checks."""
+    backend.name = "test"
+    handle = Mock(spec=GDSHandle, path="/test/slab", supports_sync_io=True)
+    handle.read_sync.side_effect = handle.write_sync.side_effect = (
+        lambda base, size, file, offset: size
+    )
+    backend.open_slab.return_value = handle
+    _use_fake_stream(monkeypatch, 1)
+    monkeypatch.setattr(
+        gds_context.platform_stream, "synchronize_device", lambda _: None
+    )
+    context = GDSContext(backend)
+    context.initialize(GdsL1Config("/test", 64 << 20, io_workers=4))
+    buffer = torch.empty(32 << 20, dtype=torch.uint8)
+    context.register_gpu_buffer(buffer)
+    yield context, handle, buffer
+    context.close()
+
+
+def _memory(size: int, offset: int = 0) -> GDSMemoryObject:
+    """Build an object whose logical bytes and slab offset are independently checked."""
+    return GDSMemoryObject(
+        MemoryObjMetadata(torch.Size([size]), torch.uint8, offset, size, 0)
+    )
+
+
+@pytest.mark.parametrize("direction", list(SlabDirection))
+def test_sync_region_boundary_and_tail(
+    registered_context: tuple[GDSContext, Mock, torch.Tensor], direction: SlabDirection
+) -> None:
+    """A crossing transfer preserves logical tail, file offset and registered base."""
+    context, handle, buffer = registered_context
+    start = (16 << 20) - 4096
+    context.transfer_sync(_memory(8193, 12288), buffer[start:], direction)
+    operation = (
+        handle.read_sync if direction is SlabDirection.READ else handle.write_sync
+    )
+    assert [call.args for call in operation.call_args_list] == [
+        (buffer.data_ptr(), 4096, 12288, start),
+        (buffer.data_ptr() + (16 << 20), 4097, 16384, 0),
+    ]
+
+
+@pytest.mark.parametrize("completed", [-5030, -1, 0, 4095, 4097, OSError("submission")])
+def test_sync_failure_stops_remaining_regions(
+    registered_context: tuple[GDSContext, Mock, torch.Tensor], completed: int | OSError
+) -> None:
+    """Immediate and non-exact results stop before accessing the next region."""
+    context, handle, buffer = registered_context
+    handle.read_sync.side_effect = [completed]
+    with pytest.raises((RuntimeError, OSError)):
+        context.transfer_sync(
+            _memory(8192), buffer[(16 << 20) - 4096 :], SlabDirection.READ
+        )
+    assert handle.read_sync.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "offset,size", [(-1, 4096), (64 << 20, 1), (0, 0), (0, 33 << 20)]
+)
+def test_sync_invalid_range_before_io(
+    registered_context: tuple[GDSContext, Mock, torch.Tensor], offset: int, size: int
+) -> None:
+    """Invalid buffer/slab ranges never reach the backend."""
+    context, handle, buffer = registered_context
+    with pytest.raises(ValueError, match="exceeds"):
+        context.transfer_sync(_memory(size, offset), buffer, SlabDirection.READ)
+    handle.read_sync.assert_not_called()
+
+
+@pytest.mark.parametrize("completed", [4096, 2048, -1])
+def test_async_validation_waits_and_retires_results(
+    registered_context: tuple[GDSContext, Mock, torch.Tensor],
+    monkeypatch: pytest.MonkeyPatch,
+    completed: int,
+) -> None:
+    """Inspect bytes after completion and retire failures before later I/O."""
+    context, handle, buffer = registered_context
+    submission = Submission(4096, 8192, 0)
+    handle.read_async.return_value = submission
+    context.transfer_async(_memory(4096, 8192), buffer, SlabDirection.READ)
+    monkeypatch.setattr(
+        gds_context.platform_stream,
+        "synchronize_stream",
+        lambda *_: setattr(submission.result, "value", completed),
+    )
+    if completed == 4096:
+        context.synchronize_and_check(buffer.device, _fake_stream(1))
+    else:
+        with pytest.raises(RuntimeError, match=f"completed {completed}"):
+            context.synchronize_and_check(buffer.device, _fake_stream(1))
+    context.synchronize_and_check(buffer.device, _fake_stream(1))
+
+
+def test_staging_budget_uses_total_allocation(
+    registered_context: tuple[GDSContext, Mock, torch.Tensor],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The configured limit covers all four slots and every object group."""
+    context, _, _ = registered_context
+    monkeypatch.setattr(gds_context, "get_gds_context", lambda: context)
+    gds_context.validate_gds_staging_size(128 << 20)
+    with pytest.raises(ValueError, match="staging needs"):
+        gds_context.validate_gds_staging_size((128 << 20) + 1)
+
+
+@pytest.mark.parametrize("supports_sync", [False, True])
+def test_worker_initialization_fallback_and_cleanup(
+    backend: Mock, monkeypatch: pytest.MonkeyPatch, supports_sync: bool
+) -> None:
+    """Unsupported handles fall back; failed worker setup releases native ownership."""
+    backend.name = "test"
+    handle = Mock(spec=GDSHandle, path="/test", supports_sync_io=supports_sync)
+    backend.open_slab.return_value = handle
+    monkeypatch.setattr(
+        gds_context, "GDSWorkerPool", Mock(side_effect=RuntimeError("thread start"))
+    )
+    context = GDSContext(backend)
+    if supports_sync:
+        with pytest.raises(RuntimeError, match="thread start"):
+            context.initialize(GdsL1Config("/test", 4096, io_workers=1))
+    else:
+        context.initialize(GdsL1Config("/test", 4096, io_workers=1))
+        assert context.io_workers == 0
+        with pytest.raises(RuntimeError, match="disabled"):
+            context.submit_io(lambda: None, 4096)
+        context.close()
+    handle.close.assert_called_once()
+    backend.close_driver.assert_called_once()
+    assert not context.initialized
