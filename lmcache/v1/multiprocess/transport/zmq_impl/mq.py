@@ -45,6 +45,10 @@ T = TypeVar("T")
 # Internal type used for the client-server communication
 RequestUID = int
 
+# A separate response frame keeps errors distinct from typed RPC payloads.
+_PROTOCOL_ERROR_FRAME = b"lmcache.protocol_error.v1"
+_TRANSIENT_ERROR_FRAME = b"lmcache.transient_error.v1"
+
 
 # Helper functions
 def encode_request_uid(uid: RequestUID) -> bytes:
@@ -56,15 +60,21 @@ def decode_request_uid(b_uid: bytes) -> RequestUID:
 
 
 def unwrap_request_payloads(
-    b_payloads: list[bytes], payload_clss: list[Any]
+    b_payloads: list[bytes],
+    payload_clss: list[Any],
+    payload_defaults: tuple[Any, ...] = (),
 ) -> list[Any]:
-    if len(b_payloads) != len(payload_clss):
+    """Decode positional fields, accepting omitted trailing RPC defaults."""
+    missing = len(payload_clss) - len(b_payloads)
+    if missing < 0 or missing > len(payload_defaults):
         raise ValueError("Payload count does not match expected count")
 
     decoded_payloads = [
         msgspec_decode(payload, cls=cls)
         for payload, cls in zip(b_payloads, payload_clss, strict=False)
     ]
+    if missing:
+        decoded_payloads.extend(payload_defaults[-missing:])
     return decoded_payloads
 
 
@@ -342,8 +352,19 @@ class MessageQueueClient:
                     rpc_spec = wrapped_request.rpc_spec
                     b_operation = encode_operation(rpc_spec.operation)
                     payload_classes = rpc_spec.payload_types
+                    supplied = len(wrapped_request.request_payloads)
+                    parameters = tuple(rpc_spec.signature.parameters.values())
+                    if supplied < len(parameters) and all(
+                        parameter.default is not inspect.Parameter.empty
+                        for parameter in parameters[supplied:]
+                    ):
+                        wrapped_request.request_payloads = list(
+                            rpc_spec.bind_payloads(
+                                tuple(wrapped_request.request_payloads), {}
+                            )
+                        )
                     if len(payload_classes) != len(wrapped_request.request_payloads):
-                        expected_classes = [cls.__name__ for cls in payload_classes]
+                        expected_classes = [str(cls) for cls in payload_classes]
                         actual_classes = [
                             type(payload).__name__
                             for payload in wrapped_request.request_payloads
@@ -417,8 +438,18 @@ class MessageQueueClient:
                     or not b_response
                 ):
                     raise ConnectionError("Event subscription ended")
-                response = msgspec_decode(b_response[0], cls=rpc_spec.response_type)
-                responses.put_nowait(response)
+                if b_response[0] in (_PROTOCOL_ERROR_FRAME, _TRANSIENT_ERROR_FRAME):
+                    error_type = (
+                        ConnectionError
+                        if b_response[0] == _TRANSIENT_ERROR_FRAME
+                        else ValueError
+                    )
+                    responses.put_nowait(
+                        error_type(msgspec_decode(b_response[1], cls=str))
+                    )
+                else:
+                    response = msgspec_decode(b_response[0], cls=rpc_spec.response_type)
+                    responses.put_nowait(response)
             except Exception:
                 stream.close()
             return
@@ -434,7 +465,17 @@ class MessageQueueClient:
                     )
                 )
                 return
-            if b_response:
+            if b_response and b_response[0] in (
+                _PROTOCOL_ERROR_FRAME,
+                _TRANSIENT_ERROR_FRAME,
+            ):
+                error_type = (
+                    ConnectionError
+                    if b_response[0] == _TRANSIENT_ERROR_FRAME
+                    else ValueError
+                )
+                future.set_exception(error_type(msgspec_decode(b_response[1], cls=str)))
+            elif b_response:
                 response = msgspec_decode(b_response[0], cls=rpc_spec.response_type)
                 future.set_result(response)
             else:
@@ -534,13 +575,17 @@ class SyncRequestHandler(RequestHandlerBase[ResponseType]):
         payload_clss: list[Any],
         response_cls: ResponseType,
         handler: Callable[..., ResponseType],
+        payload_defaults: tuple[Any, ...] = (),
     ):
+        self.payload_defaults = payload_defaults
         self.payload_clss = payload_clss
         self.response_cls = response_cls
         self.handler = handler
 
     def __call__(self, payloads: list[bytes]) -> ResponseType:
-        return self.handler(*unwrap_request_payloads(payloads, self.payload_clss))
+        return self.handler(
+            *unwrap_request_payloads(payloads, self.payload_clss, self.payload_defaults)
+        )
 
     def get_response_class(self) -> ResponseType:
         return self.response_cls
@@ -564,7 +609,9 @@ class BlockingRequestHandler(RequestHandlerBase[ResponseType]):
         payload_clss: list[Any],
         response_cls: ResponseType,
         handler: Callable[..., ResponseType],
+        payload_defaults: tuple[Any, ...] = (),
     ):
+        self.payload_defaults = payload_defaults
         self.executor: ThreadPoolExecutor | AffinityThreadPool | None = None
         self.payload_clss = payload_clss
         self.handler = handler
@@ -577,7 +624,9 @@ class BlockingRequestHandler(RequestHandlerBase[ResponseType]):
             "BlockingRequestHandler has no executor assigned. "
             "Call add_normal_thread_pool or add_affinity_thread_pool first."
         )
-        decoded_payloads = unwrap_request_payloads(payloads, self.payload_clss)
+        decoded_payloads = unwrap_request_payloads(
+            payloads, self.payload_clss, self.payload_defaults
+        )
         if isinstance(self.executor, AffinityThreadPool):
             return self.executor.submit(
                 self.handler, *decoded_payloads, affinity_key=affinity_key
@@ -734,6 +783,18 @@ class MessageQueueServer(RequestServer):
                 self.output_queue.put(frames_to_send)
                 self._output_efd.notify()
 
+            except (ConnectionError, TypeError, ValueError) as exc:
+                logger.exception("Invalid request in blocking handler")
+                self.output_queue.put(
+                    prefix_frames
+                    + [
+                        _TRANSIENT_ERROR_FRAME
+                        if isinstance(exc, ConnectionError)
+                        else _PROTOCOL_ERROR_FRAME,
+                        msgspec_encode(str(exc), str),
+                    ]
+                )
+                self._output_efd.notify()
             except Exception:
                 logger.exception("Error in blocking handler")
 
@@ -793,6 +854,19 @@ class MessageQueueServer(RequestServer):
                             handler_entry=handler_entry,
                             payloads=payloads,
                             prefix_frames=[identity, b_request_uid, b_operation],
+                        )
+                    except (ConnectionError, TypeError, ValueError) as exc:
+                        logger.exception("Invalid request for operation %s", operation)
+                        self.socket.send_multipart(
+                            [
+                                identity,
+                                b_request_uid,
+                                b_operation,
+                                _TRANSIENT_ERROR_FRAME
+                                if isinstance(exc, ConnectionError)
+                                else _PROTOCOL_ERROR_FRAME,
+                                msgspec_encode(str(exc), str),
+                            ]
                         )
                     except Exception:
                         logger.exception("Error handling operation %s", operation)
@@ -924,14 +998,28 @@ class MessageQueueServer(RequestServer):
 
     def add_sync_handler(self, rpc_spec: RpcSpec, handler: Callable[..., Any]) -> None:
         self.handlers[rpc_spec.operation] = SyncRequestHandler(
-            list(rpc_spec.payload_types), rpc_spec.response_type, handler
+            list(rpc_spec.payload_types),
+            rpc_spec.response_type,
+            handler,
+            tuple(
+                parameter.default
+                for parameter in rpc_spec.signature.parameters.values()
+                if parameter.default is not inspect.Parameter.empty
+            ),
         )
 
     def add_blocking_handler(
         self, rpc_spec: RpcSpec, handler: Callable[..., Any]
     ) -> None:
         self.handlers[rpc_spec.operation] = BlockingRequestHandler(
-            list(rpc_spec.payload_types), rpc_spec.response_type, handler
+            list(rpc_spec.payload_types),
+            rpc_spec.response_type,
+            handler,
+            tuple(
+                parameter.default
+                for parameter in rpc_spec.signature.parameters.values()
+                if parameter.default is not inspect.Parameter.empty
+            ),
         )
 
     def add_nonblocking_handler(
