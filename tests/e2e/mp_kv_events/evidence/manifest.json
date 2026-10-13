@@ -1,0 +1,41 @@
+{
+  "status": "PASS_WITH_DOCUMENTED_LIMITATIONS",
+  "report_stage": "final for inclusion in the containing commit",
+  "files": [
+    {
+      "path": "README.md",
+      "sha256": "a190a6745553b607e05b645226974f17d729d8a306d69d179b069f0c044ff49a",
+      "bytes": 16696
+    },
+    {
+      "path": "acceptance.json",
+      "sha256": "d554f44d3811111a9cb38180ec599693483c4a1ad3a0736078d8379bccb1efa7",
+      "bytes": 293600
+    },
+    {
+      "path": "cleanup.json",
+      "sha256": "2788f760adf5d888b9faaf4c5ebb165a2fc72d460b1f00c824c36fe53d29bef3",
+      "bytes": 6437
+    },
+    {
+      "path": "existing-commit-metadata-audit.json",
+      "sha256": "b94335218e535b98ffaf6544510df7e561e64c5e9c59cab3435f34d24292dc24",
+      "bytes": 3372
+    },
+    {
+      "path": "sglang-t03-compact-trace.json",
+      "sha256": "824148b727e81b3c0504b24c3199461dcaa36b595e98069dbf2f7c2abbe9a56b",
+      "bytes": 10204
+    },
+    {
+      "path": "vllm-t03-trace.json",
+      "sha256": "8826167d25f99c1050a8a1739c288c65cb80cd88dfedb21be14c0ddea9cf2cfe",
+      "bytes": 9528
+    }
+  ],
+  "completed_delivery_records": {
+    "cleanup": "cleanup.json",
+    "repository_delivery": "commit containing this report"
+  },
+  "remaining_deliverables": []
+}

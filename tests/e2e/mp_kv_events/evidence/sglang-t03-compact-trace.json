@@ -1,0 +1,341 @@
+{
+  "schema_version": 1,
+  "status": "PASS",
+  "scenario": "T03 GPU prefix plus CPU suffix",
+  "engine": "sglang",
+  "tp": 1,
+  "transport": "zmq",
+  "chunk_size": 256,
+  "native_block_size": 16,
+  "artifact_kind": "Selected original trace fields; repeated prompt tokens omitted with digest and source references",
+  "source_artifacts": [
+    {
+      "path": "/mnt/nvme1/dongjoo-mp-kv-events/sglang-acceptance-replay-tp1-zmq-c256-core/T03-a-trace.json",
+      "sha256": "1ae95f4562a84a9faac029b758c569a10fc22844bdd5a7f01aacea93b366b9a6"
+    },
+    {
+      "path": "/mnt/nvme1/dongjoo-mp-kv-events/sglang-acceptance-replay-tp1-zmq-c256-core/T03-a-competition.json",
+      "sha256": "5a7c56522ebcfcca46b24d79b6d04aed2b3d9738f9f4c3f8018deb645568da24"
+    },
+    {
+      "path": "/mnt/nvme1/dongjoo-mp-kv-events/sglang-acceptance-replay-tp1-zmq-c256-core/T03-a-before.json",
+      "sha256": "7259449395ecd17ab332f12dc6d8a686ad7c96376e6ebe1e9e760cd6237192c0"
+    },
+    {
+      "path": "/mnt/nvme1/dongjoo-mp-kv-events/sglang-acceptance-replay-tp1-zmq-c256-core/T03-a-after.json",
+      "sha256": "3344779bcedc83d3bdc20d1d7b8f93ac9cedde88c6c924c743f0ed6da1431734"
+    },
+    {
+      "path": "/mnt/nvme1/dongjoo-mp-kv-events/sglang-acceptance-replay-tp1-zmq-c256-core/worker-identities.json",
+      "sha256": "40468da01dd43e874c21c12c64aa93a34dba55e1846fbb28dce8c2d65a61cc35"
+    },
+    {
+      "path": "/mnt/nvme1/dongjoo-mp-kv-events/sglang-acceptance-replay-tp1-zmq-c256-core/deployment.json",
+      "sha256": "1a89b2b524b2582718a3af166cc5325d4a26b04fbf12cf900a1a86a1b7194159"
+    },
+    {
+      "path": "/mnt/nvme1/dongjoo-mp-kv-events/sglang-acceptance-replay-tp1-zmq-c256-core/host-harness.json",
+      "sha256": "04eaf630cce5eb39c4c3ed8799904ca1fff29581e69321a3979df1d1d46a2dcb"
+    }
+  ],
+  "request": {
+    "frontend_request_id": "kv-events-e7ccb969bcbb4ca698e72bd9ad3f194d",
+    "setup_target": null,
+    "query_only": false,
+    "selected": {
+      "prefill_worker_id": 7587898199658866598,
+      "prefill_dp_rank": 0,
+      "decode_worker_id": 7587898199658866598,
+      "decode_dp_rank": 0
+    },
+    "started_ns": 1791904767356953999,
+    "first_token_ns": 1791904767511914177,
+    "ended_ns": 1791904767512845837,
+    "response": [
+      {
+        "id": "cmpl-c723e51f-0e90-4d82-acb0-755cb02a817c",
+        "choices": [
+          {
+            "text": "YES",
+            "index": 0,
+            "finish_reason": "length"
+          }
+        ],
+        "created": 1791904767,
+        "model": "Qwen/Qwen2.5-0.5B-Instruct",
+        "system_fingerprint": null,
+        "object": "text_completion",
+        "usage": null,
+        "nvext": {
+          "worker_id": {
+            "prefill_worker_id": 7587898199658866598,
+            "prefill_dp_rank": 0,
+            "decode_worker_id": 7587898199658866598,
+            "decode_dp_rank": 0
+          },
+          "timing": {
+            "request_received_ms": 1791904767365,
+            "prefill_wait_time_ms": 0.8394159999999999,
+            "prefill_time_ms": 143.801761,
+            "ttft_ms": 144.641177,
+            "total_time_ms": 144.723457,
+            "kv_hit_rate": 0.8,
+            "router_queue_depth": 0
+          }
+        }
+      },
+      {
+        "id": "cmpl-c723e51f-0e90-4d82-acb0-755cb02a817c",
+        "choices": [],
+        "created": 1791904767,
+        "model": "Qwen/Qwen2.5-0.5B-Instruct",
+        "system_fingerprint": null,
+        "object": "text_completion",
+        "usage": {
+          "prompt_tokens": 1025,
+          "completion_tokens": 1,
+          "total_tokens": 1026,
+          "prompt_tokens_details": {
+            "audio_tokens": null,
+            "cached_tokens": 1024
+          }
+        }
+      }
+    ],
+    "saw_done": true,
+    "output": "YES",
+    "completion_tokens": 1
+  },
+  "request_token_count": 1025,
+  "request_tokens_sha256": "d36061e6cdb396955254062329276a0939bc9a4b46a61f3d4e29387fc506f287",
+  "mp_key_token_count": 1024,
+  "mp_key_tokens_sha256": "a5992a2283463bd0db67ee2351179c83e49f9cfcc5b7371edcf63529afaecd14",
+  "request_payload": {
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "max_tokens": 1,
+    "temperature": 0,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "nvext": {
+      "extra_fields": [
+        "worker_id",
+        "timing"
+      ],
+      "annotations": []
+    }
+  },
+  "worker_identities": {
+    "a": 7587898199658866598,
+    "b": 7587898199658866596
+  },
+  "pre_request_residency": {
+    "a": {
+      "gpu_prefix_tokens": 256,
+      "cpu_prefix_tokens": 1024
+    },
+    "b": {
+      "gpu_prefix_tokens": 512,
+      "cpu_prefix_tokens": 512
+    }
+  },
+  "gpu_cpu_boundary": {
+    "gpu_last_block": {
+      "hash": -507435280385862649,
+      "parent": 5370422950931929979,
+      "tokens": [
+        29058,
+        1273,
+        13,
+        220,
+        1986,
+        374,
+        264,
+        72349,
+        6500,
+        29058,
+        1273,
+        13,
+        220,
+        1986,
+        374,
+        264
+      ],
+      "block_size": 16
+    },
+    "cpu_first_suffix_block": {
+      "hash": -9005840023695521939,
+      "parent": -507435280385862649,
+      "tokens": [
+        72349,
+        6500,
+        29058,
+        1273,
+        13,
+        220,
+        1986,
+        374,
+        264,
+        72349,
+        6500,
+        29058,
+        1273,
+        13,
+        220,
+        1986
+      ],
+      "block_size": 16
+    }
+  },
+  "router_kv_hit_rates": [
+    0.8
+  ],
+  "id_mapping": {
+    "frontend": "kv-events-e7ccb969bcbb4ca698e72bd9ad3f194d",
+    "engine": "eade79c10adb47f88f97a5f87836b11f"
+  },
+  "engine_trace": [
+    {
+      "event": "lookup",
+      "request_id": "eade79c10adb47f88f97a5f87836b11f",
+      "rank": "0",
+      "gpu_hit_tokens": "256",
+      "external_hit_tokens": "1024"
+    },
+    {
+      "event": "retrieve_submitted",
+      "request_id": "eade79c10adb47f88f97a5f87836b11f",
+      "rank": "0",
+      "start": "256",
+      "end": "1024",
+      "skip": "0"
+    },
+    {
+      "event": "retrieve_consumer_wait",
+      "request_id": "eade79c10adb47f88f97a5f87836b11f",
+      "rank": "0",
+      "start": "256",
+      "end": "1024"
+    },
+    {
+      "event": "retrieve_completed",
+      "request_id": "eade79c10adb47f88f97a5f87836b11f",
+      "rank": "0",
+      "success": "True"
+    }
+  ],
+  "mp_lookup_results": [
+    {
+      "event": "mp.lookup_prefetch.end",
+      "timestamp": 1791904767.395145,
+      "received_ns": 1791904767398020733,
+      "session_id": "eade79c10adb47f88f97a5f87836b11f",
+      "metadata": {
+        "found_count": 4,
+        "requested_tokens": 1024,
+        "hit_tokens": 1024,
+        "l1_hit_tokens": 1024,
+        "l2_hit_tokens": 0,
+        "l1_hit_keys": 4,
+        "l2_hit_keys": 0,
+        "early_exit_reason": "",
+        "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+        "cache_salt": ""
+      }
+    }
+  ],
+  "mp_reads": {
+    "a": [
+      {
+        "event": "l1_read",
+        "time_ns": 1791904767441599288,
+        "request_id": "eade79c10adb47f88f97a5f87836b11f",
+        "instance_id": 2288637013288737297,
+        "worker_id": 0,
+        "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+        "world_size": 1,
+        "start": 256,
+        "end": 1024,
+        "skip_first_n_tokens": 0,
+        "requested_keys": [
+          {
+            "chunk_hash_hex": "f9bc3e1cccf8ff341e0882359e8745c913c6a9d41d3355bd708564d523ecd0c7",
+            "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+            "kv_rank": 16777472,
+            "object_group_id": 0,
+            "cache_salt": ""
+          },
+          {
+            "chunk_hash_hex": "8461800b43d6c3919d5384a63a2bb73f3a21f5a65730e83b9e927b3c58580fd0",
+            "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+            "kv_rank": 16777472,
+            "object_group_id": 0,
+            "cache_salt": ""
+          },
+          {
+            "chunk_hash_hex": "62889d11fe5f45d626343131f119362ba1bb92bfa4ae3b814f0e7c1871977b2b",
+            "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+            "kv_rank": 16777472,
+            "object_group_id": 0,
+            "cache_salt": ""
+          }
+        ],
+        "found_keys": [
+          {
+            "chunk_hash_hex": "f9bc3e1cccf8ff341e0882359e8745c913c6a9d41d3355bd708564d523ecd0c7",
+            "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+            "kv_rank": 16777472,
+            "object_group_id": 0,
+            "cache_salt": ""
+          },
+          {
+            "chunk_hash_hex": "8461800b43d6c3919d5384a63a2bb73f3a21f5a65730e83b9e927b3c58580fd0",
+            "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+            "kv_rank": 16777472,
+            "object_group_id": 0,
+            "cache_salt": ""
+          },
+          {
+            "chunk_hash_hex": "62889d11fe5f45d626343131f119362ba1bb92bfa4ae3b814f0e7c1871977b2b",
+            "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+            "kv_rank": 16777472,
+            "object_group_id": 0,
+            "cache_salt": ""
+          }
+        ],
+        "owner_ids": [
+          0,
+          0,
+          0
+        ],
+        "bytes": 9437184
+      }
+    ],
+    "b": []
+  },
+  "mp_h2d_completions": {
+    "a": [
+      {
+        "event": "mp.retrieve.end",
+        "timestamp": 1791904767.4511251,
+        "received_ns": 1791904767455274850,
+        "session_id": "eade79c10adb47f88f97a5f87836b11f",
+        "metadata": {
+          "cache_salt": "",
+          "transfer_key": "eade79c10adb47f88f97a5f87836b11f#18",
+          "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+          "device": "cuda:0",
+          "num_tokens": 768,
+          "engine_id": 2288637013288737297,
+          "total_bytes": 9437184,
+          "retrieved_count": 3
+        }
+      }
+    ],
+    "b": []
+  },
+  "isolation": "concurrency=1, no background inference; snapshots bracket only measured request",
+  "interpretation": "Untargeted Dynamo selected A with 256 GPU tokens and 1024 total CPU prefix over B with 512 GPU tokens. A completed 768 suffix tokens (9437184 bytes) of H2D; B performed no MP read. SGLang excludes the required terminal recomputation token from its page-aligned MP key. Engine consumption and ordinary SSE output were validated.",
+  "timing_scope": "Correctness trace only, not a performance measurement."
+}

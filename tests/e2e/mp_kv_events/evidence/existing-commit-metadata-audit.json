@@ -1,0 +1,95 @@
+{
+  "status": "PASS",
+  "harness_commit": "commit containing this report",
+  "commits": [
+    {
+      "repo": "LMCache",
+      "commit": "647f11dda70ff6074f307edf3ead01d85b810b29",
+      "status": "PASS",
+      "author": "DongDongJu <commisori28@gmail.com>",
+      "committer": "DongDongJu <commisori28@gmail.com>",
+      "signoffs": [
+        "Signed-off-by: DongDongJu <commisori28@gmail.com>",
+        "Signed-off-by: Dongjoo Seo <dongjoo.seo1@samsung.com>"
+      ]
+    },
+    {
+      "repo": "LMCache",
+      "commit": "ac6b4a1d253b1b01625618b4ee98c309be73aa80",
+      "status": "PASS",
+      "author": "DongDongJu <commisori28@gmail.com>",
+      "committer": "DongDongJu <commisori28@gmail.com>",
+      "signoffs": [
+        "Signed-off-by: DongDongJu <commisori28@gmail.com>",
+        "Signed-off-by: Dongjoo Seo <dongjoo.seo1@samsung.com>"
+      ]
+    },
+    {
+      "repo": "LMCache",
+      "commit": "1364a64c94dbb314afee2cc1c28f8a59cccba1eb",
+      "status": "PASS",
+      "author": "DongDongJu <commisori28@gmail.com>",
+      "committer": "DongDongJu <commisori28@gmail.com>",
+      "signoffs": [
+        "Signed-off-by: DongDongJu <commisori28@gmail.com>",
+        "Signed-off-by: Dongjoo Seo <dongjoo.seo1@samsung.com>"
+      ]
+    },
+    {
+      "repo": "vllm",
+      "commit": "84b4f71f14f8f34e4b36172de9a1e8d7dbda78f3",
+      "status": "PASS",
+      "author": "DongDongJu <commisori28@gmail.com>",
+      "committer": "DongDongJu <commisori28@gmail.com>",
+      "signoffs": [
+        "Signed-off-by: DongDongJu <commisori28@gmail.com>",
+        "Signed-off-by: Dongjoo Seo <dongjoo.seo1@samsung.com>"
+      ]
+    },
+    {
+      "repo": "sglang",
+      "commit": "14f0725d1f6848cf59cb4c8003cb553a15cf3bd8",
+      "status": "PASS",
+      "author": "DongDongJu <commisori28@gmail.com>",
+      "committer": "DongDongJu <commisori28@gmail.com>",
+      "signoffs": [
+        "Signed-off-by: DongDongJu <commisori28@gmail.com>",
+        "Signed-off-by: Dongjoo Seo <dongjoo.seo1@samsung.com>"
+      ]
+    },
+    {
+      "repo": "sglang",
+      "commit": "a3ee7a8f6a2425dc76a9e8c3ecb0e0549d349e06",
+      "status": "PASS",
+      "author": "DongDongJu <commisori28@gmail.com>",
+      "committer": "DongDongJu <commisori28@gmail.com>",
+      "signoffs": [
+        "Signed-off-by: DongDongJu <commisori28@gmail.com>",
+        "Signed-off-by: Dongjoo Seo <dongjoo.seo1@samsung.com>"
+      ]
+    },
+    {
+      "repo": "sglang",
+      "commit": "bf0a5c6f28690aa9a1cc0cc9c79c438e15571bae",
+      "status": "PASS",
+      "author": "DongDongJu <commisori28@gmail.com>",
+      "committer": "DongDongJu <commisori28@gmail.com>",
+      "signoffs": [
+        "Signed-off-by: DongDongJu <commisori28@gmail.com>",
+        "Signed-off-by: Dongjoo Seo <dongjoo.seo1@samsung.com>"
+      ]
+    },
+    {
+      "repo": "dynamo-pinned",
+      "commit": "67a38a7f039b6b0ebc8753eb851c1ce9f8017930",
+      "status": "PASS",
+      "author": "DongDongJu <commisori28@gmail.com>",
+      "committer": "DongDongJu <commisori28@gmail.com>",
+      "signoffs": [
+        "Signed-off-by: DongDongJu <commisori28@gmail.com>",
+        "Signed-off-by: Dongjoo Seo <dongjoo.seo1@samsung.com>"
+      ]
+    }
+  ],
+  "scope": "Historical verification of the eight preceding task commits. The final ninth task commit is the containing report commit; its post-commit verification is recorded externally."
+}

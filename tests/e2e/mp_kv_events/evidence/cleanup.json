@@ -1,0 +1,178 @@
+{
+  "status": "PASS",
+  "recorded_ns": 1791909514671265884,
+  "serving_run": "f1f72452ae9d",
+  "remaining_namespace_resources": [
+    {
+      "kind": "ConfigMap",
+      "name": "kube-root-ca.crt"
+    }
+  ],
+  "owned_worker_image_references_remaining": [],
+  "retained_image_references": [
+    "docker.io/rancher/local-path-provisioner:v0.0.36",
+    "docker.io/rancher/local-path-provisioner@sha256:1eba82e9c386038b4af6d69cca7519fac738c28c42735ed48ce70c882ad0d80f",
+    "docker.io/rancher/mirrored-coredns-coredns:1.14.4",
+    "docker.io/rancher/mirrored-coredns-coredns@sha256:3e98f280fd601b37411c5fb7075fd9f337833c480f1644970b727ae0af067782",
+    "docker.io/rancher/mirrored-metrics-server:v0.8.1",
+    "docker.io/rancher/mirrored-metrics-server@sha256:b2d2efaf5ac3b366ed0f839d2412a2c4279d4fc2a2a733f12c52133faed36c41",
+    "sha256:2d7e26c3f9329b4c215a021319dd53cb58addd2302295b4efa5f6e10b163d090",
+    "sha256:9254fb81aa65831cce153dfdf883805d40157b78ccec0c10fd82c499113fd1de",
+    "sha256:e76b3f3568b7f440dfd477c1d6de638d7769ba34c93eef999dee418eb72bc0e3"
+  ],
+  "retained_dependency_cache_reason": "NATS/etcd/device-plugin refs may predate task; no exhaustive initial image inventory, so retained as potentially shared",
+  "private_daemon": {
+    "pid": 462098,
+    "data_root": "/mnt/nvme1/dongjoo/mp-kv-events/docker/data",
+    "signal": "SIGTERM",
+    "exited": true,
+    "remaining_containers_before_stop": 0
+  },
+  "private_container_cleanup": {
+    "actions": [
+      {
+        "action": "stop",
+        "id": "666099e83c911f7d5d8226ecffbfcac51f01914273963717af808569f8d3defa",
+        "name": "mp-kv-sglang-rust-check",
+        "stdout": "Flag --time has been deprecated, use --timeout instead\n666099e83c911f7d5d8226ecffbfcac51f01914273963717af808569f8d3defa\n"
+      },
+      {
+        "action": "remove",
+        "id": "666099e83c911f7d5d8226ecffbfcac51f01914273963717af808569f8d3defa",
+        "name": "mp-kv-sglang-rust-check",
+        "stdout": "666099e83c911f7d5d8226ecffbfcac51f01914273963717af808569f8d3defa\n"
+      },
+      {
+        "action": "remove",
+        "id": "4e16ba737cced9b700ad0931a210a52d38e75d5f40cf84e5d429273d47c96ce7",
+        "name": "mp-kv-sglang-probe",
+        "stdout": "4e16ba737cced9b700ad0931a210a52d38e75d5f40cf84e5d429273d47c96ce7\n"
+      }
+    ],
+    "remaining": ""
+  },
+  "node_conditions": {
+    "MemoryPressure": "False",
+    "DiskPressure": "False",
+    "PIDPressure": "False",
+    "Ready": "True"
+  },
+  "node_gpu_allocatable": "0",
+  "selected_node_gpu_requests": 0,
+  "physical_gpus": [
+    {
+      "index": "0",
+      "uuid": "GPU-cbe77885-3297-1d31-41ba-16096f290fbb",
+      "name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "memory.used [MiB]": "14 MiB",
+      "utilization.gpu [%]": "0 %"
+    },
+    {
+      "index": "1",
+      "uuid": "GPU-ce04c3c1-e9b0-1e5f-7d1b-a55fc013179e",
+      "name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "memory.used [MiB]": "14 MiB",
+      "utilization.gpu [%]": "0 %"
+    },
+    {
+      "index": "2",
+      "uuid": "GPU-5ae5f7a3-d407-fb9e-5b41-07ae87ea1432",
+      "name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "memory.used [MiB]": "14 MiB",
+      "utilization.gpu [%]": "0 %"
+    },
+    {
+      "index": "3",
+      "uuid": "GPU-080a73e7-635d-6989-73d9-a628b0b1f7f5",
+      "name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "memory.used [MiB]": "14 MiB",
+      "utilization.gpu [%]": "0 %"
+    },
+    {
+      "index": "4",
+      "uuid": "GPU-af8a5f61-3602-3295-47f2-10d7b5f24629",
+      "name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "memory.used [MiB]": "14 MiB",
+      "utilization.gpu [%]": "0 %"
+    },
+    {
+      "index": "5",
+      "uuid": "GPU-3ca9a07c-08a3-ee22-fcf6-b90d7c93b770",
+      "name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "memory.used [MiB]": "14 MiB",
+      "utilization.gpu [%]": "0 %"
+    },
+    {
+      "index": "6",
+      "uuid": "GPU-476915b4-a4f3-09c1-39de-74f70c7c7c82",
+      "name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "memory.used [MiB]": "14 MiB",
+      "utilization.gpu [%]": "0 %"
+    },
+    {
+      "index": "7",
+      "uuid": "GPU-80464c61-dc3f-3557-eca7-03ec4ccffac5",
+      "name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "memory.used [MiB]": "14 MiB",
+      "utilization.gpu [%]": "0 %"
+    }
+  ],
+  "remaining_compute_applications": [],
+  "reserved_gpu_uuid": "GPU-cbe77885-3297-1d31-41ba-16096f290fbb",
+  "root_available_bytes": 72314724352,
+  "root_total_bytes": 940843102208,
+  "unrelated_identity_baseline": "/mnt/nvme1/dongjoo/mp-kv-events/cluster-restoration/before.json",
+  "unrelated_identity_baseline_ns": 1791878121980641703,
+  "unrelated_running_pods": [
+    {
+      "namespace": "kube-system",
+      "name": "coredns-5f5694d56b-fqwxx",
+      "uid": "b6df458e-05ed-4891-a775-3f5d67d17b72",
+      "containers": [
+        {
+          "name": "coredns",
+          "containerID": "containerd://fa2cbd495e497b5b9760c440deb870417c60a91b89b3c16e721f144fbd2599a6",
+          "restartCount": 20
+        }
+      ],
+      "unchanged": true
+    },
+    {
+      "namespace": "kube-system",
+      "name": "local-path-provisioner-58d557dc48-nqs8g",
+      "uid": "00c25458-c26b-4361-88b4-7c87590341b2",
+      "containers": [
+        {
+          "name": "local-path-provisioner",
+          "containerID": "containerd://3123d4ba4bc7a29b30149650a659795f61042df5cb9708a32f2bb1277d1527eb",
+          "restartCount": 20
+        }
+      ],
+      "unchanged": true
+    },
+    {
+      "namespace": "kube-system",
+      "name": "metrics-server-7c86f97b8d-28vk7",
+      "uid": "046e33af-930a-4201-b7bb-7e7559c09587",
+      "containers": [
+        {
+          "name": "metrics-server",
+          "containerID": "containerd://c75b0e7799ef65d954f43fcfdfdbb8d5dc1f71330886deea8b0d5615692e6ad1",
+          "restartCount": 20
+        }
+      ],
+      "unchanged": true
+    }
+  ],
+  "identity_scope": "Exact UID/container ID/restart proof from restoration baseline onward; initial preflight did not record identifiers",
+  "preserved": [
+    "raw artifacts",
+    "model cache",
+    "compiler caches",
+    "wheels",
+    "image archives",
+    "immutable runtime directories",
+    "source checkouts"
+  ],
+  "storage_limitation": "Earlier task-owned shared-Docker orphan build-cache layers retained because no safe scoped API cleanup was established; no shared database/cache relocation or broad prune performed"
+}

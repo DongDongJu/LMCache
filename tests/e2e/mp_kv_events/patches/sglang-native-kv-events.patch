@@ -1,0 +1,931 @@
+From 14f0725d1f6848cf59cb4c8003cb553a15cf3bd8 Mon Sep 17 00:00:00 2001
+From: DongDongJu <commisori28@gmail.com>
+Date: Tue, 13 Oct 2026 16:18:34 +0900
+Subject: [PATCH 1/3] Add native MP KV bindings and CPU event draining to
+ LMCache radix cache
+
+Prepare STORE bindings with SGLang's native page hashing and shared signed
+identity conversion. Extend hashes only for new request pages and release
+request metadata on completion, independent of the selected TreeCore backend.
+Drain committed CPU transitions through the existing scheduler publisher while
+preserving GPU events. Reject unsupported namespaces in the tokenizer process
+so invalid requests receive an error without terminating the scheduler.
+
+Co-authored-by: Dongjoo Seo <dongjoo.seo1@samsung.com>
+Signed-off-by: DongDongJu <commisori28@gmail.com>
+Signed-off-by: Dongjoo Seo <dongjoo.seo1@samsung.com>
+---
+ .../sglang/srt/managers/tokenizer_manager.py  |  26 +++
+ python/sglang/srt/mem_cache/events.py         |  17 +-
+ .../lmcache/lmcache_unified_radix_cache.py    | 125 ++++++++++++
+ .../test_tokenizer_manager_rid_cleanup.py     |  38 ++++
+ .../unit/mem_cache/test_event_descriptors.py  | 187 ++++++++++++++++++
+ 5 files changed, 386 insertions(+), 7 deletions(-)
+ create mode 100644 test/registered/unit/mem_cache/test_event_descriptors.py
+
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 023745c..0bc3c00 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -1276,6 +1276,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
+     ) -> None:
+         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
++        if (
++            get_memory().enable_lmcache
++            and get_observability().kv_events_config
++            and isinstance(obj, GenerateReqInput)
++            and (
++                obj.contains_mm_input()
++                or any(
++                    value is not None
++                    for value in (
++                        obj.cache_salt,
++                        obj.extra_key,
++                        obj.lora_path,
++                        obj.session_id,
++                        obj.session_params,
++                        obj.input_embeds,
++                        obj.positional_embed_overrides,
++                    )
++                )
++            )
++        ):
++            # Reject before dispatch: an exception in the scheduler's cache
++            # callbacks terminates the engine rather than just this request.
++            raise ValueError(
++                "LMCache MP KV events require unsalted text requests without "
++                "LoRA, multimodal inputs, embeddings, or sessions"
++            )
+         # FIXME: unify the length validation logic with the one in the scheduler.
+         if get_exec().features.enable_encoder_swa_bounded_replay:
+             if any(
+diff --git a/python/sglang/srt/mem_cache/events.py b/python/sglang/srt/mem_cache/events.py
+index cf7d8c5..9865c48 100644
+--- a/python/sglang/srt/mem_cache/events.py
++++ b/python/sglang/srt/mem_cache/events.py
+@@ -44,6 +44,13 @@ if TYPE_CHECKING:
+ _LORA_ID_LEN = 32
+ 
+ 
++def native_event_hash(hash_value: str, namespace_seed: Optional[bytes] = None) -> int:
++    """Convert a native page digest to the signed identity published by engines."""
++    return namespaced_block_hash(
++        hash_str_to_int64(hash_value), namespace_seed=namespace_seed
++    )
++
++
+ class LoRANameTable:
+     """Find the LoRA adapter name from the lora_id at the end of extra_key.
+ 
+@@ -194,9 +201,8 @@ class KVCacheEventRecorder:
+             else:
+                 page_tokens = list(raw[start:end])
+ 
+-            block_hash = namespaced_block_hash(
+-                hash_str_to_int64(event_hash_values[page_index]),
+-                namespace_seed=namespace_seed,
++            block_hash = native_event_hash(
++                event_hash_values[page_index], namespace_seed
+             )
+ 
+             self.enqueue(
+@@ -238,10 +244,7 @@ class KVCacheEventRecorder:
+                 continue
+ 
+             block_hashes.append(
+-                namespaced_block_hash(
+-                    hash_str_to_int64(event_hash_values[page_index]),
+-                    namespace_seed=namespace_seed,
+-                )
++                native_event_hash(event_hash_values[page_index], namespace_seed)
+             )
+             page_index += 1
+ 
+diff --git a/python/sglang/srt/mem_cache/storage/lmcache/lmcache_unified_radix_cache.py b/python/sglang/srt/mem_cache/storage/lmcache/lmcache_unified_radix_cache.py
+index c502e2e..3c121e6 100644
+--- a/python/sglang/srt/mem_cache/storage/lmcache/lmcache_unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/storage/lmcache/lmcache_unified_radix_cache.py
+@@ -19,6 +19,7 @@ from lmcache.integration.sglang.unified_lmcache_mp_connector import (
+     UnifiedLMCacheMPConnector,
+ )
+ 
++from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored, StorageMedium
+ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+     UnifiedSWAAllocatorBase,
+ )
+@@ -33,8 +34,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
+ from sglang.srt.mem_cache.radix_cache import RadixKey
+ from sglang.srt.mem_cache.unified_cache.components import ComponentType
+ from sglang.srt.mem_cache.unified_radix_cache import NodeId, UnifiedRadixCache
++from sglang.srt.runtime_context import get_observability, get_parallel
+ 
+ if TYPE_CHECKING:
++    from lmcache.v1.multiprocess.custom_types import EventBinding
++
+     from sglang.srt.configs.model_config import ModelConfig
+     from sglang.srt.managers.schedule_batch import Req
+     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+@@ -57,10 +61,26 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+     ) -> None:
+         # The parent constructor calls reset() before the connector exists.
+         self.lmcache_connector: Optional[UnifiedLMCacheMPConnector] = None
++        # Request-local native page hashes avoid rehashing the prompt on decode.
++        # These are discarded with the request; MP owns committed descriptors.
++        self._request_event_hashes: dict[str, list[str]] = {}
+         super().__init__(params)
+         self._mamba_component = self._find_mamba_component()
++        events_enabled = bool(get_observability().kv_events_config)
++        if events_enabled and (
++            params.attn_cp_size != 1
++            or get_parallel().dp_size != 1
++            or get_parallel().attn_dp_size != 1
++            or params.is_eagle
++            or params.enable_session_radix_cache
++        ):
++            raise ValueError(
++                "LMCache MP KV events require CP=1 without speculative or session radix caching"
++            )
+         self.lmcache_connector = UnifiedLMCacheMPConnector(
+             config_file=lmcache_config_file,
++            enable_kv_events=events_enabled,
++            dynamo_format=params.dynamo_kv_event_format,
+             model_config=model_config,
+             tp_size=tp_size,
+             tp_rank=tp_rank,
+@@ -83,6 +103,33 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+         self._lmcache_closed = False
+         atexit.register(self.shutdown)
+ 
++    def take_events(self):
++        """Drain GPU events, then committed CPU transitions on the scheduler thread."""
++        from lmcache.utils import CacheRemoveEvent, CacheStoreEvent
++
++        events = super().take_events()
++        if self.lmcache_connector is None:
++            return events
++        for event in self.lmcache_connector.get_kv_events():
++            if isinstance(event, CacheStoreEvent):
++                events.append(
++                    BlockStored(
++                        block_hashes=event.block_hashes,
++                        parent_block_hash=event.parent_block_hash,
++                        token_ids=event.token_ids,
++                        block_size=event.block_size,
++                        lora_id=None,
++                        medium=StorageMedium.CPU,
++                    )
++                )
++            elif isinstance(event, CacheRemoveEvent):
++                events.append(
++                    BlockRemoved(
++                        block_hashes=event.block_hashes, medium=StorageMedium.CPU
++                    )
++                )
++        return events
++
+     def is_backuped(self, node_id: NodeId) -> bool:
+         # LMCache rebuilds lookup keys from tokens, so any L1 node is valid.
+         return True
+@@ -102,6 +149,17 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+ 
+     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+         """Report LMCache hits through host fields until GPU slots are ready."""
++        if self.lmcache_connector.event_profile is not None:
++            req = params.req
++            if (
++                params.key.extra_key is not None
++                or params.key.cache_salt is not None
++                or params.key.is_bigram
++                or (req is not None and req.multimodal_inputs is not None)
++            ):
++                raise ValueError(
++                    "LMCache MP KV events require unsalted dense text requests without LoRA or speculation"
++                )
+         requested_key_len = len(params.key)
+         req = params.req
+         flow = self._external_flows.get(req.rid) if req is not None else None
+@@ -124,6 +182,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+         result = super().match_prefix(params)
+         if req is None:
+             return result
++        logger.debug(
++            "MP_KV_TRACE gpu_match request_id=%s rank=%d gpu_hit_tokens=%d",
++            req.rid,
++            self.lmcache_connector.kv_worker_id,
++            result.device_prefix_len,
++        )
+         if flow is None or flow.total_hit is None or flow.cancelled:
+             return result
+ 
+@@ -420,6 +484,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+             self._pending_stores.clear()
+             self._pending_store_counts.clear()
+             self._session_finish_requested.clear()
++            self._request_event_hashes.clear()
+             self.prefetch_loaded_tokens_by_reqid.clear()
+             connector.end_all_sessions()
+         super().reset()
+@@ -845,6 +910,59 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+         flow.load_req = None
+         flow.prefix_published = True
+ 
++    def _store_event_bindings(
++        self, rid: str, key: RadixKey, start: int, end: int
++    ) -> tuple[EventBinding, ...]:
++        """Prepare native identities incrementally while request tokens exist.
++
++        Both TreeCore backends use the same native page hash algorithm. The
++        native helper and recorder's conversion preserve its chain and signed
++        wire representation without touching a backend's publication queue.
++        """
++        from lmcache.v1.multiprocess.custom_types import EventBinding
++
++        from sglang.srt.mem_cache.events import native_event_hash
++        from sglang.srt.mem_cache.utils import get_storage_hash_str
++
++        profile = self.lmcache_connector.event_profile
++        if profile is None:
++            return ()
++        block_size = profile.block_size
++        chunk_size = self.lmcache_connector.chunk_size
++        if start % chunk_size or end % chunk_size or len(key) != end:
++            raise ValueError(
++                "Native SGLang STORE boundaries must align to LMCache chunks"
++            )
++        hashes = self._request_event_hashes.setdefault(rid, [])
++        hashed_tokens = len(hashes) * block_size
++        if end > hashed_tokens:
++            new_hashes = get_storage_hash_str(
++                key[hashed_tokens:end],
++                hashes[-1] if hashes else None,
++                page_size=block_size,
++            )
++            if not isinstance(new_hashes, list):
++                raise TypeError("Native page hashing did not return page descriptors")
++            hashes.extend(new_hashes)
++        tokens = key.raw_token_ids()
++        bindings = []
++        for offset in range(start, end, chunk_size):
++            first, last = offset // block_size, (offset + chunk_size) // block_size
++            bindings.append(
++                EventBinding(
++                    profile_id=profile.profile_id,
++                    block_hashes=tuple(
++                        native_event_hash(h) for h in hashes[first:last]
++                    ),
++                    parent_block_hash=native_event_hash(hashes[first - 1])
++                    if first
++                    else None,
++                    token_ids=tuple(tokens[offset : offset + chunk_size]),
++                    block_size=block_size,
++                )
++            )
++        return tuple(bindings)
++
+     def _submit_store(self, req: Req, token_ids: list[int]) -> None:
+         key = RadixKey(
+             token_ids,
+@@ -934,6 +1052,11 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+                 len(key),
+             )
+             return
++        try:
++            bindings = self._store_event_bindings(req.rid, key, store_start, len(key))
++        except (RuntimeError, TypeError, ValueError):
++            self.dec_lock_ref(matched.last_device_node, lock_params)
++            raise
+         try:
+             operation = self.lmcache_connector.submit_store(
+                 req.rid,
+@@ -943,6 +1066,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+                     mamba_value=mamba_value,
+                 ),
+                 device_indices_start=store_start,
++                event_bindings=bindings,
+                 cache_salt=self.lmcache_connector.build_cache_salt(
+                     req.cache_salt, req.extra_key
+                 ),
+@@ -973,4 +1097,5 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+         ):
+             return
+         self._session_finish_requested.remove(rid)
++        self._request_event_hashes.pop(rid, None)
+         self.lmcache_connector.finish_request(rid)
+diff --git a/test/registered/unit/managers/test_tokenizer_manager_rid_cleanup.py b/test/registered/unit/managers/test_tokenizer_manager_rid_cleanup.py
+index f5dfc10..b4b2eaf 100644
+--- a/test/registered/unit/managers/test_tokenizer_manager_rid_cleanup.py
++++ b/test/registered/unit/managers/test_tokenizer_manager_rid_cleanup.py
+@@ -1131,6 +1131,44 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
+ 
+         self.assertFalse(tm.rid_to_state)
+ 
++    def test_lmcache_event_namespace_rejection_cleans_request_before_dispatch(self):
++        for field in ("cache_salt", "extra_key", "session_id"):
++            with self.subTest(field=field):
++                tm = _make_tm_for_generate(self)
++                obj = GenerateReqInput(
++                    text="hello",
++                    rid="unsupported",
++                    sampling_params={},
++                    **{field: "tenant"},
++                )
++
++                async def tokenize(request):
++                    tm._validate_one_request(request, [1])
++                    raise AssertionError("Unsupported namespace reached token dispatch")
++
++                tm._tokenize_one_request = tokenize
++                tm._send_one_request = AsyncMock()
++
++                async def drive():
++                    await tm.generate_request(obj).__anext__()
++
++                with (
++                    patch(
++                        "sglang.srt.managers.tokenizer_manager.get_memory",
++                        return_value=SimpleNamespace(enable_lmcache=True),
++                    ),
++                    patch(
++                        "sglang.srt.managers.tokenizer_manager.get_observability",
++                        return_value=SimpleNamespace(
++                            kv_events_config='{"publisher":"zmq"}'
++                        ),
++                    ),
++                    self.assertRaisesRegex(ValueError, "LMCache MP KV events"),
++                ):
++                    asyncio.run(drive())
++                self.assertFalse(tm.rid_to_state)
++                tm._send_one_request.assert_not_called()
++
+     def test_thinking_budget_rejects_runtime_without_strict_thinking(self):
+         tm = _make_tm_for_generate(self)
+         obj = GenerateReqInput(
+diff --git a/test/registered/unit/mem_cache/test_event_descriptors.py b/test/registered/unit/mem_cache/test_event_descriptors.py
+new file mode 100644
+index 0000000..d8a814d
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_event_descriptors.py
+@@ -0,0 +1,187 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Native placement descriptors can be prepared without announcing residency."""
++
++from dataclasses import dataclass
++from types import SimpleNamespace
++
++from sglang.srt.disaggregation.kv_events import BlockRemoved, StorageMedium
++from sglang.srt.mem_cache.events import KVCacheEventRecorder, native_event_hash
++from sglang.srt.mem_cache.utils import get_storage_hash_str
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=10, suite="base-a-test-cpu")
++
++
++@dataclass
++class Key:
++    token_ids: list[int]
++    extra_key: str | None = None
++    cache_salt: str | None = None
++    is_bigram: bool = False
++
++    def __len__(self) -> int:
++        return len(self.token_ids)
++
++
++def test_prepared_descriptors_match_captured_gpu_events() -> None:
++    # Captured from unmodified 43e4e84731 KVCacheEventRecorder.record_store,
++    # using its native SHA256 extension, page_size=4 and tokens range(16).
++    captured_hashes = [
++        -4977211910723114241,
++        90435953025800507,
++        -190329471204100490,
++        -4051358142079366242,
++    ]
++    root = SimpleNamespace(parent=None, key=Key([]), hash_value=[])
++    parent = SimpleNamespace(parent=root, key=Key(list(range(8))), hash_value=None)
++    child = SimpleNamespace(parent=parent, key=Key(list(range(8, 16))), hash_value=None)
++    recorder = KVCacheEventRecorder(enabled=True, page_size=4)
++    gpu_remove = BlockRemoved(block_hashes=[42], medium=StorageMedium.GPU)
++    recorder.enqueue(gpu_remove)
++
++    hashes = get_storage_hash_str(parent.key, page_size=4)
++    hashes += get_storage_hash_str(child.key, hashes[-1], page_size=4)
++    assert [native_event_hash(h) for h in hashes] == captured_hashes
++    assert recorder.take() == [gpu_remove]
++    recorder.record_store(parent)
++    recorder.record_store(child)
++    event = recorder.take()[0]
++    assert event.block_hashes == captured_hashes
++    assert event.parent_block_hash is None
++    assert event.token_ids == list(range(16))
++    assert event.block_size == 4
++
++
++def test_nonpublisher_rank_prepares_identities_without_native_events() -> None:
++    recorder = KVCacheEventRecorder(enabled=False, page_size=4)
++    root = SimpleNamespace(parent=None, key=Key([]), hash_value=[])
++    node = SimpleNamespace(parent=root, key=Key(list(range(4))), hash_value=None)
++    hashes = get_storage_hash_str(node.key, page_size=4)
++    assert [native_event_hash(h) for h in hashes] == [-4977211910723114241]
++    recorder.record_store(node)
++    assert recorder.take() == []
++
++
++def test_lmcache_take_events_keeps_gpu_events_and_drains_cpu_on_caller_thread(
++    monkeypatch,
++):
++    import threading
++
++    from lmcache.utils import CacheRemoveEvent
++
++    from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
++        LMCacheUnifiedRadixCache,
++    )
++    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
++
++    recorder = KVCacheEventRecorder(enabled=True, page_size=4)
++    gpu_event = BlockRemoved(block_hashes=[11], medium=StorageMedium.GPU)
++    recorder.enqueue(gpu_event)
++    monkeypatch.setattr(UnifiedRadixCache, "take_events", lambda self: recorder.take())
++    owner_thread = threading.get_ident()
++    cpu_queue = [CacheRemoveEvent(block_hashes=[23], medium="CPU")]
++
++    def drain_cpu():
++        assert threading.get_ident() == owner_thread
++        events = list(cpu_queue)
++        cpu_queue.clear()
++        return events
++
++    cache = LMCacheUnifiedRadixCache.__new__(LMCacheUnifiedRadixCache)
++    cache.lmcache_connector = SimpleNamespace(get_kv_events=drain_cpu)
++
++    assert cache.take_events() == [
++        gpu_event,
++        BlockRemoved(block_hashes=[23], medium=StorageMedium.CPU),
++    ]
++    assert gpu_event.medium == StorageMedium.GPU
++    assert cache.take_events() == []
++
++
++def test_store_hashing_is_incremental_and_request_scoped(monkeypatch):
++    import torch
++    from lmcache.v1.multiprocess.custom_types import KVEventProfile
++
++    from sglang.srt.mem_cache import utils
++    from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
++    from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
++        LMCacheUnifiedRadixCache,
++    )
++    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
++
++    hashed_lengths, submitted, finished = [], [], []
++    native_hash = utils.get_storage_hash_str
++
++    def observe_hash(key, prior_hash=None, page_size=None):
++        hashed_lengths.append(len(key))
++        return native_hash(key, prior_hash, page_size)
++
++    monkeypatch.setattr(utils, "get_storage_hash_str", observe_hash)
++    monkeypatch.setattr(UnifiedRadixCache, "checkpoint", lambda *args, **kw: None)
++    monkeypatch.setattr(
++        UnifiedRadixCache,
++        "match_prefix",
++        lambda self, params: SimpleNamespace(
++            device_prefix_len=len(params.key),
++            last_device_node=1,
++            best_match_node=1,
++        ),
++    )
++    cache = LMCacheUnifiedRadixCache.__new__(LMCacheUnifiedRadixCache)
++    cache.tree_core = SimpleNamespace(is_eagle=False, page_size=4)
++    cache._request_event_hashes = {}
++    cache._mamba_component = None
++    cache._pending_store_counts = {}
++    cache._session_finish_requested = set()
++    cache._external_flows = {}
++    cache.prefetch_loaded_tokens_by_reqid = {}
++    cache.prefetch_loaded_storage_start_by_reqid = {}
++    monkeypatch.setattr(
++        cache, "_publish_external_loaded_prefix", lambda *args, **kw: None
++    )
++    monkeypatch.setattr(cache, "_retire_loaded_flow", lambda *args: None)
++    monkeypatch.setattr(cache, "path_device_indices", lambda node: torch.arange(4, 20))
++    monkeypatch.setattr(
++        cache, "inc_lock_ref", lambda node: SimpleNamespace(to_dec_params=lambda: None)
++    )
++    monkeypatch.setattr(cache, "dec_lock_ref", lambda *args: None)
++    progress = {"start": 0}
++
++    def submit(rid, tokens, indices, **kwargs):
++        submitted.append(kwargs["event_bindings"])
++        progress["start"] = len(tokens)
++        return None
++
++    cache.lmcache_connector = SimpleNamespace(
++        event_profile=KVEventProfile("sglang-native", 4),
++        chunk_size=8,
++        get_store_start=lambda rid, end: progress["start"],
++        parallel_all_reduce=lambda *args: None,
++        device_indices_by_group=lambda indices, **kwargs: [indices],
++        submit_store=submit,
++        build_cache_salt=lambda *args: "",
++        finish_request=finished.append,
++    )
++    req = SimpleNamespace(
++        rid="request",
++        extra_key=None,
++        cache_salt=None,
++        full_untruncated_fill_ids=list(range(16)),
++        finished=lambda: False,
++    )
++    cache.checkpoint(req, up_to=8)
++    cache.checkpoint(req, up_to=16)
++    assert hashed_lengths == [8, 8]
++    assert submitted[1][0].parent_block_hash == submitted[0][0].block_hashes[-1]
++    progress["start"] = 0  # Retrying failed storage reuses immutable native identities.
++    cache.checkpoint(req, up_to=16)
++    assert hashed_lengths == [8, 8]
++    assert submitted[2] == submitted[0] + submitted[1]
++
++    cache.release_aborted_request(CacheRequestHandle(req.rid, 0))
++    assert finished == [req.rid]
++    progress["start"] = 0
++    req.full_untruncated_fill_ids = list(range(16, 24))
++    cache.checkpoint(req, up_to=8)
++    assert hashed_lengths == [8, 8, 8]
++    assert submitted[-1][0].block_hashes != submitted[0][0].block_hashes
+-- 
+2.43.0
+
+
+From a3ee7a8f6a2425dc76a9e8c3ecb0e0549d349e06 Mon Sep 17 00:00:00 2001
+From: DongDongJu <commisori28@gmail.com>
+Date: Tue, 13 Oct 2026 22:30:11 +0900
+Subject: [PATCH 2/3] Restore ServerArgs model-config accessor for engine
+ launchers
+
+Launchers such as Dynamo 1.5.1 inspect the model immediately after creating
+ServerArgs from CLI arguments. Preserve get_model_config as a delegation to
+the native model_config_of helper so these callers keep the same cached
+configuration before and after argument resolution.
+
+Cover the launcher boundary with a real local model configuration without
+allocating a GPU.
+
+Co-authored-by: Dongjoo Seo <dongjoo.seo1@samsung.com>
+Signed-off-by: DongDongJu <commisori28@gmail.com>
+Signed-off-by: Dongjoo Seo <dongjoo.seo1@samsung.com>
+---
+ python/sglang/srt/server_args.py                   |  4 ++++
+ .../unit/server_args/test_model_config_cache.py    | 14 ++++++++++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index c2ac092..8647866 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -427,6 +427,10 @@ class ServerArgs:
+         attrs = [attr.name for attr in record_fields(cls) if hasattr(args, attr.name)]
+         return cls(**{attr: getattr(args, attr) for attr in attrs})
+ 
++    def get_model_config(self):
++        """Preserve the model-config accessor used by external engine launchers."""
++        return model_config_of(self)
++
+     def get_tokenizer_worker_class(self):
+         from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker
+ 
+diff --git a/test/registered/unit/server_args/test_model_config_cache.py b/test/registered/unit/server_args/test_model_config_cache.py
+index 0337e68..e697090 100644
+--- a/test/registered/unit/server_args/test_model_config_cache.py
++++ b/test/registered/unit/server_args/test_model_config_cache.py
+@@ -13,6 +13,7 @@ So the key is the path the record carried when the cache was filled, and these
+ cases pin both movements against it, on a raw record and on a resolved one.
+ """
+ 
++import argparse
+ import json
+ import os
+ import shutil
+@@ -171,6 +172,19 @@ class TestTheModelConfigCache(CustomTestCase):
+ 
+         self.assertIs(model_config_of(server_args), stand_in)
+ 
++    def test_launcher_accessor_before_and_after_resolution(self):
++        """External launchers inspect the model immediately after CLI construction."""
++        server_args = ServerArgs.from_cli_args(
++            argparse.Namespace(model_path=self._checkpoint(), device="cuda")
++        )
++        model_config = server_args.get_model_config()
++        self.assertIsInstance(model_config, ModelConfig)
++        self.assertFalse(model_config.is_multimodal)
++        self.assertIs(model_config, model_config_of(server_args))
++
++        server_args.resolve_once()
++        self.assertIs(server_args.get_model_config(), model_config_of(server_args))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+
+
+From bf0a5c6f28690aa9a1cc0cc9c79c438e15571bae Mon Sep 17 00:00:00 2001
+From: DongDongJu <commisori28@gmail.com>
+Date: Tue, 13 Oct 2026 23:40:16 +0900
+Subject: [PATCH 3/3] Fix native replay startup with an optional subscription
+ handshake
+
+A replay snapshot can complete before a late native SUB has installed its
+filter, losing batches between replay and live delivery. Add an opt-in nonce
+challenge on the existing ROUTER and XPUB sockets. The client subscribes to
+its unique nonce only after receiving the challenge; observing that filter
+proves the earlier native topic filter is installed on the same connection.
+Serve the existing replay bytes and END marker only after this proof.
+
+READY carries a stable random publisher incarnation so a persistent observer
+can distinguish reconnects from engine restarts without guessing from clocks
+or native sequence numbers. Pending challenges are bounded and expire.
+Default PUB and legacy replay behavior remain unchanged.
+
+Validate real TCP delayed consumers, duplicate ordinary subscriptions,
+cancellation capacity/expiry, exact CPU replay/live bytes, and configuration.
+The combined native publisher and observer suite passes 27 tests and 28
+subtests without GPUs. Use a scoped context in the existing port reservation
+test so asynchronous ZeroMQ close cannot race the publisher bind.
+
+Co-authored-by: Dongjoo Seo <dongjoo.seo1@samsung.com>
+Signed-off-by: DongDongJu <commisori28@gmail.com>
+Signed-off-by: Dongjoo Seo <dongjoo.seo1@samsung.com>
+---
+ python/sglang/srt/disaggregation/kv_events.py | 87 +++++++++++++++--
+ .../unit/disaggregation/test_kv_events.py     | 95 ++++++++++++++++++-
+ 2 files changed, 172 insertions(+), 10 deletions(-)
+
+diff --git a/python/sglang/srt/disaggregation/kv_events.py b/python/sglang/srt/disaggregation/kv_events.py
+index 0597c72..7e79923 100644
+--- a/python/sglang/srt/disaggregation/kv_events.py
++++ b/python/sglang/srt/disaggregation/kv_events.py
+@@ -399,6 +399,12 @@ class ZmqEventPublisher(EventPublisher):
+         Optional ROUTER address for replay requests. When given, subscribers can
+         request missed batches by sending the starting sequence number as an
+         8-byte big-endian integer.
++    replay_handshake:
++        Enable nonce subscription challenges on the existing replay endpoint.
++        A client requests [empty, start_seq, nonce], receives a READY marker,
++        subscribes to nonce on its live SUB, then receives the replay and END.
++        READY carries a stable random 16-byte publisher incarnation.
++        This closes the live-subscription/replay cutover race without a delay.
+     buffer_steps:
+         Number of past batches to keep for replay.
+     hwm:
+@@ -414,6 +420,10 @@ class ZmqEventPublisher(EventPublisher):
+ 
+     SHUTDOWN_TIMEOUT: float = 1.0
+     END_SEQ = (-1).to_bytes(8, "big", signed=True)
++    READY_SEQ = (-2).to_bytes(8, "big", signed=True)
++    READY_PREFIX = b"\xffkv-replay-ready:"
++    MAX_PENDING_REPLAYS = 128
++    REPLAY_HANDSHAKE_TIMEOUT = 10.0
+ 
+     def __init__(
+         self,
+@@ -425,7 +435,13 @@ class ZmqEventPublisher(EventPublisher):
+         max_queue_size: int = 100_000,
+         topic: str = "",
+         bind: Optional[bool] = None,
++        replay_handshake: bool = False,
+     ) -> None:
++        if replay_handshake and replay_endpoint is None:
++            raise ValueError("replay_handshake requires replay_endpoint")
++        self._replay_handshake = replay_handshake
++        self._publisher_incarnation = os.urandom(16)
++        self._pending_replays: dict[bytes, tuple[bytes, int, float]] = {}
+         # Storage
+         self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
+         self._buffer = deque[tuple[int, bytes]](maxlen=buffer_steps)
+@@ -540,7 +556,9 @@ class ZmqEventPublisher(EventPublisher):
+         https://pyzmq.readthedocs.io/en/v19.0.0/morethanbindings.html#thread-safety
+         """
+         if self._pub is None:
+-            self._pub = self._ctx.socket(zmq.PUB)
++            self._pub = self._ctx.socket(
++                zmq.XPUB if self._replay_handshake else zmq.PUB
++            )
+             self._pub.set_hwm(self._hwm)
+             # Default heuristic: bind if wildcard / * present, else connect.
+             # bind stable, connect volatile convention.
+@@ -597,6 +615,8 @@ class ZmqEventPublisher(EventPublisher):
+         assert self._pub is not None  # narrows type for mypy
+ 
+         while self._running or self._event_queue.qsize() > 0:
++            if self._replay_handshake:
++                self._service_subscriptions()
+             # --- replay (non-critical) ---------------------------------
+             if self._replay is not None and self._replay.poll(0):
+                 try:
+@@ -627,24 +647,68 @@ class ZmqEventPublisher(EventPublisher):
+                 logger.exception("Error in publisher thread: %s", e)
+                 time.sleep(0.1)
+ 
+-    def _service_replay(self) -> None:
+-        """If a replay request is waiting, send buffered batches."""
+-        assert self._replay is not None  # narrows type for mypy
++    def _service_subscriptions(self) -> None:
++        """Serve a challenge only after its live SUB filter reached this socket.
+ 
++        A client subscribes to the native topic before adding its unique nonce
++        filter on the same connection. ZMQ preserves that order. Unlike counting
++        ordinary subscription notifications, the nonce identifies one replay
++        request even when clients repeat or overlap ordinary topic filters.
++        """
++        assert self._pub is not None
++        now = time.monotonic()
++        for nonce, (_, _, expires) in list(self._pending_replays.items()):
++            if expires <= now:
++                del self._pending_replays[nonce]
++        for _ in range(self.MAX_PENDING_REPLAYS):
++            if not self._pub.poll(0):
++                break
++            notice = self._pub.recv()
++            if not notice:
++                continue
++            pending = self._pending_replays.pop(notice[1:], None)
++            if pending is not None and notice[0] == 1:
++                client_id, start_seq, _ = pending
++                self._send_replay(client_id, start_seq)
++
++    def _service_replay(self) -> None:
++        """Serve legacy replay or challenge a client to prove live readiness."""
++        assert self._replay is not None
+         frame = self._replay.recv_multipart()
+-        if len(frame) != 3:
+-            logger.warning("Invalid replay request: %s", frame)
++        if len(frame) not in (3, 4) or frame[1] != b"" or len(frame[2]) != 8:
++            logger.warning("Invalid replay request framing")
+             return
+-        client_id, _, start_seq_bytes = frame
++        client_id, _, start_seq_bytes = frame[:3]
+         start_seq = int.from_bytes(start_seq_bytes, "big")
++        if len(frame) == 3:
++            self._send_replay(client_id, start_seq)
++            return
++        nonce = frame[3]
++        if (
++            not self._replay_handshake
++            or not nonce.startswith(self.READY_PREFIX)
++            or len(nonce) != len(self.READY_PREFIX) + 16
++            or nonce in self._pending_replays
++            or len(self._pending_replays) >= self.MAX_PENDING_REPLAYS
++        ):
++            logger.warning("Invalid or excess replay readiness request")
++            return
++        self._pending_replays[nonce] = (
++            client_id,
++            start_seq,
++            time.monotonic() + self.REPLAY_HANDSHAKE_TIMEOUT,
++        )
++        self._replay.send_multipart(
++            (client_id, b"", nonce, self.READY_SEQ, self._publisher_incarnation)
++        )
+ 
++    def _send_replay(self, client_id: bytes, start_seq: int) -> None:
++        assert self._replay is not None
+         for seq, buf in self._buffer:
+             if seq >= start_seq:
+-                # Subscribers receive the same topic, sequence, and payload as live events.
+                 self._replay.send_multipart(
+                     (client_id, b"", self._topic_bytes, seq.to_bytes(8, "big"), buf)
+                 )
+-        # Send end of sequence marker
+         self._replay.send_multipart((client_id, b"", b"", self.END_SEQ, b""))
+ 
+     @staticmethod
+@@ -701,6 +765,11 @@ class KVEventsConfig(BaseModel):
+     """The zmq endpoint to use for replaying kv events.
+     """
+ 
++    replay_handshake: bool = False
++    """Require an optional replay client's nonce subscription before its snapshot.
++    Uses XPUB on the existing native endpoint; legacy replay remains supported.
++    """
++
+     buffer_steps: int = 10_000
+     """The number of steps to cache for replay endpoint. Will only save
+     events from the last N steps for the replay endpoint.
+diff --git a/test/registered/unit/disaggregation/test_kv_events.py b/test/registered/unit/disaggregation/test_kv_events.py
+index c209570..1658645 100644
+--- a/test/registered/unit/disaggregation/test_kv_events.py
++++ b/test/registered/unit/disaggregation/test_kv_events.py
+@@ -52,7 +52,7 @@ class TestLocalKvEventSource(CustomTestCase):
+     def test_advertised_source_delivers_events(self):
+         for host, bind, topic in (("*", None, "kv"), ("127.0.0.1", True, "")):
+             with self.subTest(host=host):
+-                with zmq.Context.instance().socket(zmq.PUB) as probe:
++                with zmq.Context() as context, context.socket(zmq.PUB) as probe:
+                     port = probe.bind_to_random_port("tcp://127.0.0.1")
+                 publisher = self._publisher(
+                     attn_dp_rank=4,
+@@ -417,5 +417,98 @@ class TestReplay(CustomTestCase):
+         self.assertEqual(frames[2][3], b"")
+ 
+ 
++class TestReplayHandshake(CustomTestCase):
++    def _publisher(self):
++        publisher = ZmqEventPublisher(
++            attn_dp_rank=0,
++            endpoint="tcp://127.0.0.1:0",
++            bind=True,
++            replay_endpoint="tcp://127.0.0.1:0",
++            replay_handshake=True,
++            topic="kv-events",
++        )
++        atexit.unregister(publisher.shutdown)
++        self.addCleanup(publisher.shutdown)
++        return publisher
++
++    def _socket(self, kind, endpoint):
++        socket = zmq.Context.instance().socket(kind)
++        socket.setsockopt(zmq.LINGER, 0)
++        socket.setsockopt(zmq.RCVTIMEO, 3000)
++        socket.connect(endpoint)
++        self.addCleanup(socket.close)
++        return socket
++
++    def _challenge(self, publisher):
++        dealer = self._socket(zmq.DEALER, publisher._local_replay_endpoint)
++        nonce = publisher.READY_PREFIX + uuid.uuid4().bytes
++        dealer.send_multipart([b"", bytes(8), nonce])
++        self.assertEqual(
++            dealer.recv_multipart(),
++            [b"", nonce, publisher.READY_SEQ, publisher._publisher_incarnation],
++        )
++        return dealer, nonce
++
++    def test_late_two_consumers_receive_exact_replay_and_live_bytes(self):
++        publisher = self._publisher()
++        batch = KVEventBatch(
++            ts=1.0,
++            events=[BlockRemoved(block_hashes=[123], medium=StorageMedium.CPU)],
++        )
++        publisher.publish(batch)
++        publisher._event_queue.join()
++        expected = [b"kv-events", bytes(8), msgspec.msgpack.encode(batch)]
++        first, first_nonce = self._challenge(publisher)
++        second, second_nonce = self._challenge(publisher)
++        sub1 = self._socket(zmq.SUB, publisher._local_pub_endpoint)
++        # Duplicate/overlapping ordinary filters cannot release either challenge.
++        for topic in (b"kv", b"kv", b""):
++            sub1.setsockopt(zmq.SUBSCRIBE, topic)
++        self.assertFalse(first.poll(150))
++        self.assertFalse(second.poll(150))
++        sub1.setsockopt(zmq.SUBSCRIBE, first_nonce)
++        self.assertEqual(first.recv_multipart(), [b"", *expected])
++        self.assertEqual(first.recv_multipart(), [b"", b"", publisher.END_SEQ, b""])
++        self.assertFalse(second.poll(100))
++        # The second subscriber did not even exist when its replay was requested.
++        sub2 = self._socket(zmq.SUB, publisher._local_pub_endpoint)
++        sub2.setsockopt(zmq.SUBSCRIBE, b"kv-events")
++        sub2.setsockopt(zmq.SUBSCRIBE, second_nonce)
++        self.assertEqual(second.recv_multipart(), [b"", *expected])
++        self.assertEqual(second.recv_multipart(), [b"", b"", publisher.END_SEQ, b""])
++        sub1.setsockopt(zmq.UNSUBSCRIBE, first_nonce)
++        sub2.setsockopt(zmq.UNSUBSCRIBE, second_nonce)
++        publisher.publish(batch)
++        expected[1] = (1).to_bytes(8, "big")
++        self.assertEqual(sub1.recv_multipart(), expected)
++        self.assertEqual(sub2.recv_multipart(), expected)
++        self.assertEqual(publisher._pending_replays, {})
++
++    def test_cancelled_challenge_expires_and_capacity_is_bounded(self):
++        publisher = self._publisher()
++        publisher.MAX_PENDING_REPLAYS = 1
++        publisher.REPLAY_HANDSHAKE_TIMEOUT = 0.4
++        abandoned, _ = self._challenge(publisher)
++        abandoned.close()
++        excess = self._socket(zmq.DEALER, publisher._local_replay_endpoint)
++        excess.send_multipart(
++            [b"", bytes(8), publisher.READY_PREFIX + uuid.uuid4().bytes]
++        )
++        self.assertFalse(excess.poll(150))
++        self.assertLessEqual(len(publisher._pending_replays), 1)
++        self.assertFalse(excess.poll(500))
++        self.assertEqual(publisher._pending_replays, {})
++        dealer, nonce = self._challenge(publisher)
++        sub = self._socket(zmq.SUB, publisher._local_pub_endpoint)
++        sub.setsockopt(zmq.SUBSCRIBE, b"kv-events")
++        sub.setsockopt(zmq.SUBSCRIBE, nonce)
++        self.assertEqual(dealer.recv_multipart(), [b"", b"", publisher.END_SEQ, b""])
++        sub.setsockopt(zmq.UNSUBSCRIBE, nonce)
++
++    def test_handshake_requires_replay_endpoint(self):
++        with self.assertRaisesRegex(ValueError, "requires replay_endpoint"):
++            ZmqEventPublisher(0, replay_handshake=True)
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+

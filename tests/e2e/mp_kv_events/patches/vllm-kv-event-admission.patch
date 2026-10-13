@@ -1,0 +1,361 @@
+From 84b4f71f14f8f34e4b36172de9a1e8d7dbda78f3 Mon Sep 17 00:00:00 2001
+From: DongDongJu <commisori28@gmail.com>
+Date: Tue, 13 Oct 2026 18:32:52 +0900
+Subject: [PATCH] Validate KV-event request namespaces before EngineCore
+ enqueue
+
+Add a class-level connector admission hook gated on enabled KV events, with
+MultiConnector forwarding and a default no-op for existing connectors. Apply
+it to both processed inputs and prepared requests so invalid namespaces can
+raise a per-request VLLMValidationError without terminating EngineCore.
+
+Validated with 79 focused frontend/connector tests and pre-commit. A pinned
+vLLM 0.31.0 API probe confirmed HTTP 400 plus healthy subsequent inference
+for an unsupported namespace, through direct and MultiConnector paths;
+events-disabled inference still accepts the same request.
+
+Co-authored-by: Dongjoo Seo <dongjoo.seo1@samsung.com>
+Signed-off-by: DongDongJu <commisori28@gmail.com>
+Signed-off-by: Dongjoo Seo <dongjoo.seo1@samsung.com>
+---
+ .../test_kv_event_request_validation.py       | 116 ++++++++++++++++++
+ .../kv_connector/unit/test_multi_connector.py |  47 +++++++
+ .../kv_transfer/kv_connector/v1/base.py       |  14 +++
+ .../kv_connector/v1/multi_connector.py        |  11 ++
+ vllm/v1/engine/async_llm.py                   |   1 +
+ vllm/v1/engine/input_processor.py             |  27 +++-
+ vllm/v1/engine/llm_engine.py                  |   1 +
+ 7 files changed, 215 insertions(+), 2 deletions(-)
+ create mode 100644 tests/v1/engine/test_kv_event_request_validation.py
+
+diff --git a/tests/v1/engine/test_kv_event_request_validation.py b/tests/v1/engine/test_kv_event_request_validation.py
+new file mode 100644
+index 0000000..8cef8d3
+--- /dev/null
++++ b/tests/v1/engine/test_kv_event_request_validation.py
+@@ -0,0 +1,116 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""KV-event policy errors must stay in frontend admission, before core enqueue."""
++
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from vllm import SamplingParams
++from vllm.config import KVTransferConfig
++from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
++from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
++from vllm.exceptions import VLLMValidationError
++from vllm.v1.engine import EngineCoreRequest
++from vllm.v1.engine.async_llm import AsyncLLM
++from vllm.v1.engine.input_processor import InputProcessor
++from vllm.v1.engine.llm_engine import LLMEngine
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++
++class EventPolicy(KVConnectorBase_V1):
++    @classmethod
++    def validate_kv_event_request(cls, config, request: EngineCoreRequest) -> None:
++        if request.cache_salt:
++            raise VLLMValidationError("unsupported KV-event namespace")
++
++
++def request(salt: str | None) -> EngineCoreRequest:
++    return EngineCoreRequest(
++        request_id="request",
++        prompt_token_ids=[1, 2],
++        mm_features=None,
++        sampling_params=SamplingParams(max_tokens=1),
++        pooling_params=None,
++        arrival_time=0.0,
++        lora_request=None,
++        cache_salt=salt,
++        data_parallel_rank=None,
++    )
++
++
++def processor(enabled: bool) -> InputProcessor:
++    config = MagicMock()
++    config.model_config.try_get_generation_config.return_value = {}
++    config.model_config.supports_multimodal_inputs = False
++    config.model_config.logits_processors = None
++    config.cache_config.kv_sharing_fast_prefill = False
++    config.use_v2_model_runner = False
++    config.kv_transfer_config = KVTransferConfig(
++        kv_connector="EventPolicy", kv_role="kv_both"
++    )
++    config.kv_events_config.enable_kv_cache_events = enabled
++    renderer = MagicMock()
++    renderer._executor = None
++    return InputProcessor(config, renderer)
++
++
++def test_disabled_events_do_not_resolve_or_invoke_connector_policy() -> None:
++    with patch.object(KVConnectorFactory, "get_connector_class") as resolve:
++        frontend = processor(False)
++        frontend.validate_kv_event_request(request("allowed-when-disabled"))
++        resolve.assert_not_called()
++
++
++def test_default_connector_policy_accepts_existing_event_namespaces() -> None:
++    with patch.object(
++        KVConnectorFactory, "get_connector_class", return_value=KVConnectorBase_V1
++    ):
++        frontend = processor(True)
++    frontend.validate_kv_event_request(request("existing-namespace"))
++
++
++def test_enabled_policy_resolves_once_without_constructing_a_connector() -> None:
++    with patch.object(
++        KVConnectorFactory, "get_connector_class", return_value=EventPolicy
++    ) as resolve:
++        frontend = processor(True)
++        frontend.validate_kv_event_request(request(None))
++        for _ in range(2):
++            with pytest.raises(VLLMValidationError, match="namespace"):
++                frontend.validate_kv_event_request(request("tenant"))
++        resolve.assert_called_once()
++
++
++def test_prepared_async_request_is_rejected_before_core_enqueue() -> None:
++    with patch.object(
++        KVConnectorFactory, "get_connector_class", return_value=EventPolicy
++    ):
++        frontend = processor(True)
++    engine = SimpleNamespace(
++        errored=False,
++        vllm_config=frontend.vllm_config,
++        input_processor=frontend,
++        engine_core=MagicMock(),
++    )
++    core_request = request("tenant")
++    with pytest.raises(VLLMValidationError, match="namespace"):
++        asyncio.run(
++            AsyncLLM.add_request(engine, "request", core_request, core_request.params)
++        )
++    engine.engine_core.add_request_async.assert_not_called()
++
++
++def test_prepared_sync_request_is_rejected_before_core_enqueue() -> None:
++    with patch.object(
++        KVConnectorFactory, "get_connector_class", return_value=EventPolicy
++    ):
++        frontend = processor(True)
++    engine = SimpleNamespace(input_processor=frontend, engine_core=MagicMock())
++    core_request = request("tenant")
++    with pytest.raises(VLLMValidationError, match="namespace"):
++        LLMEngine.add_request(engine, "request", core_request, core_request.params)
++    engine.engine_core.add_request.assert_not_called()
+diff --git a/tests/v1/kv_connector/unit/test_multi_connector.py b/tests/v1/kv_connector/unit/test_multi_connector.py
+index 9d04a2e..0465974 100644
+--- a/tests/v1/kv_connector/unit/test_multi_connector.py
++++ b/tests/v1/kv_connector/unit/test_multi_connector.py
+@@ -1233,3 +1233,50 @@ def test_multi_connector_mixed_hma_disables_hybrid_kv_cache(monkeypatch):
+             assert mc._all_support_hma is False
+         finally:
+             llm.llm_engine.engine_core.shutdown()
++
++
++def test_multi_connector_validates_kv_events_without_constructing_children(monkeypatch):
++    """Admission forwards child-specific configs and preserves the first rejection."""
++    from types import SimpleNamespace
++
++    from vllm.exceptions import VLLMValidationError
++    from vllm.v1.engine import EngineCoreRequest
++
++    seen = []
++
++    class Policy(MockConnector):
++        @classmethod
++        def validate_kv_event_request(cls, config, request):
++            seen.append(config.kv_transfer_config.kv_connector)
++            if seen[-1] == "reject":
++                raise VLLMValidationError("child KV-event namespace rejected")
++
++    monkeypatch.setattr(
++        KVConnectorFactory, "get_connector_class", lambda config: Policy
++    )
++    config = SimpleNamespace(
++        kv_transfer_config=KVTransferConfig(
++            kv_connector="MultiConnector",
++            kv_role="kv_both",
++            kv_connector_extra_config={
++                "connectors": [
++                    {"kv_connector": name, "kv_role": "kv_both"}
++                    for name in ("first", "reject", "last")
++                ]
++            },
++        )
++    )
++    request = EngineCoreRequest(
++        request_id="req",
++        prompt_token_ids=[1, 2],
++        mm_features=None,
++        sampling_params=SamplingParams(max_tokens=1),
++        pooling_params=None,
++        arrival_time=0.0,
++        lora_request=None,
++        cache_salt="tenant",
++        data_parallel_rank=None,
++    )
++    with pytest.raises(VLLMValidationError, match="child KV-event"):
++        MultiConnector.validate_kv_event_request(config, request)
++    assert seen == ["first", "reject"]
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/base.py b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+index 6df9d1c..8a2c0d1 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -65,6 +65,7 @@ if TYPE_CHECKING:
+     from vllm.forward_context import ForwardContext
+     from vllm.v1.core.block_pool import BlockPool
+     from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
++    from vllm.v1.engine import EngineCoreRequest
+     from vllm.v1.kv_cache_interface import KVCacheConfig
+     from vllm.v1.request import Request
+ 
+@@ -179,6 +180,19 @@ class KVConnectorWorkerMetadata(ABC):
+ class KVConnectorBase_V1(ABC):
+     """Base class for KV connectors."""
+ 
++    @classmethod
++    def validate_kv_event_request(
++        cls, vllm_config: "VllmConfig", request: "EngineCoreRequest"
++    ) -> None:
++        """Validate an event-enabled request before it enters EngineCore.
++
++        This hook must not instantiate a connector or contact workers. Raise
++        ``VLLMValidationError`` for unsupported inputs so serving rejects only
++        that request. This runs only when KV events are enabled; the default
++        accepts all requests.
++        """
++        return None
++
+     @property
+     def supports_divergent_local_hybrid_hits(self) -> bool:
+         """Whether external hits can complete divergent local hybrid hits.
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+index 73b6b0c..f0c23c4 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+@@ -38,6 +38,7 @@ if TYPE_CHECKING:
+     from vllm.forward_context import ForwardContext
+     from vllm.v1.core.block_pool import BlockPool
+     from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
++    from vllm.v1.engine import EngineCoreRequest
+     from vllm.v1.kv_cache_interface import KVCacheConfig
+     from vllm.v1.request import Request
+ 
+@@ -140,6 +141,16 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
+     - Save to all connectors.
+     """
+ 
++    @classmethod
++    def validate_kv_event_request(
++        cls, vllm_config: VllmConfig, request: "EngineCoreRequest"
++    ) -> None:
++        """Validate admission against every configured child without construction."""
++        for connector_cls, config in cls._get_connector_classes_and_configs(
++            vllm_config
++        ):
++            connector_cls.validate_kv_event_request(config, request)
++
+     @classmethod
+     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+         """MultiConnector requires PIECEWISE CUDA graph mode if any of its
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 34f65f3..ac1d461 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -437,6 +437,7 @@ class AsyncLLM(EngineClient):
+             )
+ 
+             request = prompt
++            self.input_processor.validate_kv_event_request(request)
+             if request_id != request.request_id:
+                 logger.warning_once(
+                     "AsyncLLM.add_request() was passed a request_id parameter that "
+diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
+index 33d413b..bab1654 100644
+--- a/vllm/v1/engine/input_processor.py
++++ b/vllm/v1/engine/input_processor.py
+@@ -4,7 +4,7 @@
+ import time
+ from collections.abc import Callable, Mapping
+ from functools import partial
+-from typing import Any, Literal
++from typing import TYPE_CHECKING, Any, Literal
+ 
+ import vllm.envs as envs
+ from vllm.config import VllmConfig
+@@ -35,6 +35,9 @@ from vllm.utils.jsontree import json_iter_leaves
+ from vllm.v1.engine import EngineCoreRequest
+ from vllm.v1.kv_hints import KvHintsEnvelope
+ 
++if TYPE_CHECKING:
++    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -55,6 +58,19 @@ class InputProcessor:
+         self.structured_outputs_config = vllm_config.structured_outputs_config
+         self.observability_config = vllm_config.observability_config
+         self.diffusion_config = vllm_config.diffusion_config
++        self._kv_connector_cls: type[KVConnectorBase_V1] | None = None
++        if (
++            vllm_config.kv_transfer_config is not None
++            and vllm_config.kv_events_config is not None
++            and vllm_config.kv_events_config.enable_kv_cache_events
++        ):
++            from vllm.distributed.kv_transfer.kv_connector.factory import (
++                KVConnectorFactory,
++            )
++
++            self._kv_connector_cls = KVConnectorFactory.get_connector_class(
++                vllm_config.kv_transfer_config
++            )
+         # Load the custom logits processor classes once; the returned callable
+         # runs their validate_params hooks per request at admission.
+         self.validate_logits_processors_params = (
+@@ -486,7 +502,7 @@ class InputProcessor:
+                     )
+                 )
+ 
+-        return EngineCoreRequest(
++        request = EngineCoreRequest(
+             request_id=request_id,
+             prompt_token_ids=prompt_token_ids,
+             prompt_embeds=prompt_embeds,
+@@ -504,6 +520,13 @@ class InputProcessor:
+             session_id=session_id,
+             kv_hints=kv_hints,
+         )
++        self.validate_kv_event_request(request)
++        return request
++
++    def validate_kv_event_request(self, request: EngineCoreRequest) -> None:
++        """Run the configured connector's frontend-only admission validation."""
++        if self._kv_connector_cls is not None:
++            self._kv_connector_cls.validate_kv_event_request(self.vllm_config, request)
+ 
+     def _validate_prompt_len(
+         self,
+diff --git a/vllm/v1/engine/llm_engine.py b/vllm/v1/engine/llm_engine.py
+index 73f6c18..c1a5b06 100644
+--- a/vllm/v1/engine/llm_engine.py
++++ b/vllm/v1/engine/llm_engine.py
+@@ -248,6 +248,7 @@ class LLMEngine:
+             )
+ 
+             request = prompt
++            self.input_processor.validate_kv_event_request(request)
+             if request_id != request.request_id:
+                 logger.warning_once(
+                     "LLMEngine.add_request() was passed a request_id parameter that "
+-- 
+2.43.0
+

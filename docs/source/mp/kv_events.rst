@@ -42,6 +42,11 @@ engine available for ordinary inference. An unpatched engine fails explicitly
 at event-enabled startup.
 SGLang requires the companion native descriptor and ``take_events`` bridge;
 both engines' pinned revisions and patches are included with the E2E harness.
+The pinned Dynamo/SGLang deployment also requires the native replay companion
+and SGLang's ``replay_endpoint`` and ``replay_handshake`` configuration. The
+handshake confirms that the live subscription is installed before retained
+native events are replayed, preserving warm CPU placement during engine startup.
+The harness supplies the matching publisher and consumer configuration.
 
 Delivery and recovery
 ---------------------

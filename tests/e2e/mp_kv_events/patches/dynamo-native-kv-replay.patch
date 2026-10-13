@@ -1,0 +1,1165 @@
+From 67a38a7f039b6b0ebc8753eb851c1ce9f8017930 Mon Sep 17 00:00:00 2001
+From: DongDongJu <commisori28@gmail.com>
+Date: Tue, 13 Oct 2026 23:52:49 +0900
+Subject: [PATCH] fix(kv-events): replay native events after subscriber startup
+
+A warm SGLang engine can publish retained CPU events before the native ZMQ
+subscriber connects. Add optional replay to the existing listener and pass the
+SGLang replay configuration through the Python wrapper. Preserve native medium,
+identity, and ordering through the existing normalizer and event processor.
+
+The opt-in nonce handshake proves that the live topic filter is installed before
+replay begins. Pin the publisher incarnation, deduplicate replay/live sequences,
+and repair detected gaps with bounded replay. Malformed or unavailable replay
+terminates the configured source through existing supervisor cleanup. Ordinary
+publishers keep their current transport and queue-admission behavior.
+
+Validation: 104 Rust publisher tests, including real native socket replay and
+source withdrawal after partial publication; 24 Dynamo SGLang Python tests;
+Rustfmt, focused Clippy, and Python precommit checks. Clippy retains two existing
+warnings in block-manager transfer validation. Live SGLang validation follows
+with the matching native publisher handshake companion.
+
+Co-authored-by: Dongjoo Seo <dongjoo.seo1@samsung.com>
+Signed-off-by: DongDongJu <commisori28@gmail.com>
+Signed-off-by: Dongjoo Seo <dongjoo.seo1@samsung.com>
+---
+ components/src/dynamo/sglang/publisher.py     |  13 +
+ .../sglang/tests/test_sglang_publisher.py     |  51 ++
+ lib/backend-common/src/publisher.rs           |   2 +
+ lib/bindings/python/rust/llm/kv.rs            |  20 +-
+ lib/bindings/python/src/dynamo/_core.pyi      |   6 +
+ lib/llm/src/kv_router/publisher/README.md     |  27 +
+ lib/llm/src/kv_router/publisher/mod.rs        |   8 +
+ lib/llm/src/kv_router/publisher/tests.rs      | 114 +++-
+ .../src/kv_router/publisher/zmq_listener.rs   | 623 +++++++++++++++++-
+ lib/llm/src/mocker.rs                         |   2 +
+ 10 files changed, 842 insertions(+), 24 deletions(-)
+
+diff --git a/components/src/dynamo/sglang/publisher.py b/components/src/dynamo/sglang/publisher.py
+index 54892c47f4..0c900785bb 100644
+--- a/components/src/dynamo/sglang/publisher.py
++++ b/components/src/dynamo/sglang/publisher.py
+@@ -345,6 +345,18 @@ class DynamoSglangPublisher:
+                     continue
+ 
+                 zmq_ep = format_zmq_endpoint(zmq_ep, local_ip)
++                replay_options = {}
++                if kv_events.get("replay_endpoint"):
++                    replay_ep = ZmqEventPublisher.offset_endpoint_port(
++                        kv_events["replay_endpoint"], dp_rank
++                    )
++                    if replay_ep:
++                        replay_options["zmq_replay_endpoint"] = format_zmq_endpoint(
++                            replay_ep, local_ip
++                        )
++
++                if kv_events.get("replay_handshake", False):
++                    replay_options["zmq_replay_handshake"] = True
+ 
+                 logging.info(
+                     f"Setting up ZMQ kv event subscriber for dp_rank={dp_rank} "
+@@ -359,6 +371,7 @@ class DynamoSglangPublisher:
+                     enable_local_indexer=self.dynamo_args.enable_local_indexer,
+                     dp_rank=dp_rank,
+                     kv_state_endpoint=self.dynamo_args.kv_state_endpoint,
++                    **replay_options,
+                 )
+                 self.kv_publishers.append(publisher)
+ 
+diff --git a/components/src/dynamo/sglang/tests/test_sglang_publisher.py b/components/src/dynamo/sglang/tests/test_sglang_publisher.py
+index 7b105cbd25..671ab4804f 100644
+--- a/components/src/dynamo/sglang/tests/test_sglang_publisher.py
++++ b/components/src/dynamo/sglang/tests/test_sglang_publisher.py
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import asyncio
++import json
+ from types import SimpleNamespace
+ from unittest.mock import AsyncMock, Mock
+ 
+@@ -517,6 +518,56 @@ def test_init_kv_event_publish_uses_effective_kv_event_setting():
+     assert publisher.init_kv_event_publish() == []
+ 
+ 
++@pytest.mark.parametrize(
++    "replay_enabled,handshake", [(False, False), (True, False), (True, True)]
++)
++def test_init_kv_event_publish_offsets_native_replay(
++    monkeypatch, unused_tcp_port_factory, replay_enabled, handshake
++):
++    native_port = unused_tcp_port_factory()
++    replay_port = unused_tcp_port_factory()
++    events = {"endpoint": f"tcp://*:{native_port}"}
++    if replay_enabled:
++        events["replay_endpoint"] = f"tcp://*:{replay_port}"
++        events["replay_handshake"] = handshake
++    server_args = SimpleNamespace(
++        kv_events_config=json.dumps(events),
++        page_size=16,
++        dp_size=4,
++        enable_dp_attention=True,
++        nnodes=2,
++        node_rank=1,
++    )
++    config = SimpleNamespace(
++        server_args=server_args,
++        dynamo_args=SimpleNamespace(
++            use_kv_events=True, enable_local_indexer=True, kv_state_endpoint=None
++        ),
++    )
++    calls = Mock()
++    monkeypatch.setattr(publisher_mod, "KvEventPublisher", calls)
++    monkeypatch.setattr(publisher_mod, "get_local_ip_auto", lambda: "127.0.0.1")
++    publisher = DynamoSglangPublisher(
++        engine=SimpleNamespace(),
++        config=config,
++        generate_endpoint=SimpleNamespace(),
++        component_gauges=SimpleNamespace(),
++    )
++
++    publisher.init_kv_event_publish()
++
++    assert len(calls.call_args_list) == 2
++    for rank, call in zip((2, 3), calls.call_args_list, strict=True):
++        assert call.kwargs["zmq_endpoint"] == f"tcp://127.0.0.1:{native_port + rank}"
++        if replay_enabled:
++            assert call.kwargs["zmq_replay_endpoint"] == (
++                f"tcp://127.0.0.1:{replay_port + rank}"
++            )
++        else:
++            assert "zmq_replay_endpoint" not in call.kwargs
++        assert call.kwargs.get("zmq_replay_handshake", False) == handshake
++
++
+ def test_init_kv_event_publish_allows_zero_worker_id_override(monkeypatch):
+     calls = []
+ 
+diff --git a/lib/backend-common/src/publisher.rs b/lib/backend-common/src/publisher.rs
+index 4df9c05f92..29f048a19e 100644
+--- a/lib/backend-common/src/publisher.rs
++++ b/lib/backend-common/src/publisher.rs
+@@ -77,6 +77,8 @@ fn setup_kv_publishers(
+                 Some(KvEventSourceConfig::Zmq {
+                     endpoint,
+                     topic,
++                    replay_endpoint: None,
++                    replay_handshake: false,
+                     image_token_id: None,
+                     video_token_id: None,
+                 }),
+diff --git a/lib/bindings/python/rust/llm/kv.rs b/lib/bindings/python/rust/llm/kv.rs
+index 91c86ce808..a02c37253f 100644
+--- a/lib/bindings/python/rust/llm/kv.rs
++++ b/lib/bindings/python/rust/llm/kv.rs
+@@ -1234,6 +1234,10 @@ impl KvEventPublisher {
+     ///         so that routers can recover events directly from this worker.
+     ///     zmq_endpoint: Optional ZMQ SUB endpoint to read raw engine events from.
+     ///     zmq_topic: ZMQ topic filter (default "").
++    ///     zmq_replay_endpoint: Optional native replay endpoint. Replay gaps or
++    ///         timeouts stop this publisher and withdraw its advertised source.
++    ///     zmq_replay_handshake: Require the engine nonce subscription handshake
++    ///         before replay, closing the replay/live cutover race.
+     ///     batching_timeout_ms: Maximum time (in **milliseconds**) to retain a
+     ///         compatible pending tail across input lists. ``None`` and ``0``
+     ///         disable cross-list timeout batching and flush at each input-list
+@@ -1249,7 +1253,7 @@ impl KvEventPublisher {
+     ///     video_token_id: Optional model video-placeholder token used to
+     ///         normalize vLLM KV events for exact MM routing.
+     #[new]
+-    #[pyo3(signature = (endpoint, worker_id=None, kv_block_size=0, dp_rank=0, enable_local_indexer=false, zmq_endpoint=None, zmq_topic=None, batching_timeout_ms=llm_rs::kv_router::publisher::DEFAULT_BATCHING_TIMEOUT_MS, image_token_id=None, kv_state_endpoint=None, video_token_id=None))]
++    #[pyo3(signature = (endpoint, worker_id=None, kv_block_size=0, dp_rank=0, enable_local_indexer=false, zmq_endpoint=None, zmq_topic=None, batching_timeout_ms=llm_rs::kv_router::publisher::DEFAULT_BATCHING_TIMEOUT_MS, image_token_id=None, kv_state_endpoint=None, video_token_id=None, zmq_replay_endpoint=None, zmq_replay_handshake=false))]
+     #[allow(clippy::too_many_arguments)]
+     fn new(
+         endpoint: Endpoint,
+@@ -1263,10 +1267,24 @@ impl KvEventPublisher {
+         image_token_id: Option<u32>,
+         kv_state_endpoint: Option<String>,
+         video_token_id: Option<u32>,
++        zmq_replay_endpoint: Option<String>,
++        zmq_replay_handshake: bool,
+     ) -> PyResult<Self> {
++        if zmq_replay_endpoint.is_some() && zmq_endpoint.is_none() {
++            return Err(PyValueError::new_err(
++                "zmq_replay_endpoint requires zmq_endpoint",
++            ));
++        }
++        if zmq_replay_handshake && zmq_replay_endpoint.is_none() {
++            return Err(PyValueError::new_err(
++                "zmq_replay_handshake requires zmq_replay_endpoint",
++            ));
++        }
+         let source_config = zmq_endpoint.map(|ep| KvEventSourceConfig::Zmq {
+             endpoint: ep,
+             topic: zmq_topic.unwrap_or_default(),
++            replay_endpoint: zmq_replay_endpoint,
++            replay_handshake: zmq_replay_handshake,
+             image_token_id,
+             video_token_id,
+         });
+diff --git a/lib/bindings/python/src/dynamo/_core.pyi b/lib/bindings/python/src/dynamo/_core.pyi
+index c137b89394..7cfa306571 100644
+--- a/lib/bindings/python/src/dynamo/_core.pyi
++++ b/lib/bindings/python/src/dynamo/_core.pyi
+@@ -1182,6 +1182,8 @@ class KvEventPublisher:
+         image_token_id: Optional[int] = None,
+         kv_state_endpoint: Optional[str] = None,
+         video_token_id: Optional[int] = None,
++        zmq_replay_endpoint: Optional[str] = None,
++        zmq_replay_handshake: bool = False,
+     ) -> None:
+         """
+         Create a `KvEventPublisher` object.
+@@ -1200,6 +1202,10 @@ class KvEventPublisher:
+             enable_local_indexer: Enable worker-local KV indexer
+             zmq_endpoint: Optional ZMQ endpoint for relay mode (e.g. "tcp://127.0.0.1:5557")
+             zmq_topic: ZMQ topic to subscribe to (defaults to "" when zmq_endpoint is set)
++            zmq_replay_endpoint: Optional native replay endpoint; unrecoverable
++                replay gaps or timeouts stop and withdraw this source.
++            zmq_replay_handshake: Require the engine nonce subscription handshake
++                before replay; the engine must support this optional protocol.
+             batching_timeout_ms: Cross-list batching timeout in milliseconds. None/0
+                 flushes at each submitted source-list boundary.
+             image_token_id: Optional model image-placeholder token for exact MM routing.
+diff --git a/lib/llm/src/kv_router/publisher/README.md b/lib/llm/src/kv_router/publisher/README.md
+index e60ed48599..410e3832f5 100644
+--- a/lib/llm/src/kv_router/publisher/README.md
++++ b/lib/llm/src/kv_router/publisher/README.md
+@@ -45,6 +45,33 @@ unknown removes pass through defensively.
+ `sinks.rs` applies the emitted router event to the optional local indexer before
+ publishing it externally. Both side effects receive the same `RouterEvent`.
+ 
++## Optional native replay
++
++`KvEventPublisher(zmq_replay_endpoint=...)` reads retained native engine batches
++before consuming the live SUB queue. It checks contiguous native sequence
++numbers and skips duplicate replay/live batches before normalization and outbound
++event-ID allocation. A detected live sequence gap requests the missing suffix
++from that same endpoint. Each replay request has a five-second deadline and a
++65,536-batch limit. A truncated prefix, unrepaired gap, malformed reply, or timeout
++stops the listener; its existing supervisor cancels the publisher and removes its
++source advertisement. Calls without a replay endpoint retain the existing live
++delivery behavior.
++
++`zmq_replay_handshake=True` additionally requires an engine supporting the nonce
++subscription challenge. The client sends a random, nonmatching topic over the
++replay DEALER, receives it back as a challenge, and subscribes to it on the same
++SUB socket after its native topic filter. The engine observes that subscription
++before serving replay, closing the empty-replay/live cutover race. Its challenge
++also supplies a 16-byte publisher incarnation; a change within one Dynamo source
++is terminal. The nonce is removed after replay or shutdown; it carries no KV
++event. Older engines remain compatible with the default, disabled handshake.
++
++Replay is bounded history, not a snapshot or a general lossless PUB transport.
++An undetectable final live-frame loss remains a transport limitation; this path
++does not add periodic polling, heartbeat events, or publication retries. Native
++publisher restart still requires a new Dynamo publisher identity as described
++by `KvEventPublisher`.
++
+ ## Ordering
+ 
+ ```mermaid
+diff --git a/lib/llm/src/kv_router/publisher/mod.rs b/lib/llm/src/kv_router/publisher/mod.rs
+index eeb9a60d98..33964d3642 100644
+--- a/lib/llm/src/kv_router/publisher/mod.rs
++++ b/lib/llm/src/kv_router/publisher/mod.rs
+@@ -70,6 +70,10 @@ pub enum KvEventSourceConfig {
+     Zmq {
+         endpoint: String,
+         topic: String,
++        /// Optional native engine replay endpoint. Enables ordered gap recovery.
++        replay_endpoint: Option<String>,
++        /// Prove live subscription installation using a nonce challenge.
++        replay_handshake: bool,
+         /// Model image-placeholder token id, used by the normalizer to rewrite
+         /// vLLM BlockStored events to the canonical pad_value scheme. `None`
+         /// for text-only / non-MM deployments (normalization is a no-op).
+@@ -133,6 +137,8 @@ impl KvEventSource {
+             KvEventSourceConfig::Zmq {
+                 endpoint,
+                 topic,
++                replay_endpoint,
++                replay_handshake,
+                 image_token_id,
+                 video_token_id,
+             } => {
+@@ -151,6 +157,8 @@ impl KvEventSource {
+                             next_event_id,
+                             image_token_id,
+                             video_token_id,
++                            replay_endpoint,
++                            replay_handshake,
+                         ));
+                 let listener_abort_handle = listener_handle.abort_handle();
+                 let supervisor_handle =
+diff --git a/lib/llm/src/kv_router/publisher/tests.rs b/lib/llm/src/kv_router/publisher/tests.rs
+index 8c1e7fc610..42892568d7 100644
+--- a/lib/llm/src/kv_router/publisher/tests.rs
++++ b/lib/llm/src/kv_router/publisher/tests.rs
+@@ -825,6 +825,8 @@ mod tests_startup_helpers {
+ 
+     #[tokio::test]
+     async fn unexpected_zmq_listener_exit_retracts_advertised_source() {
++        use futures::{SinkExt, StreamExt};
++
+         let discovery = Arc::new(MockDiscovery::new(Some(1), SharedMockRegistry::new()));
+         let kv_state_endpoint = EndpointId {
+             namespace: "ns".to_string(),
+@@ -837,7 +839,7 @@ mod tests_startup_helpers {
+                     endpoint: kv_state_endpoint.clone(),
+                 },
+                 topic: KV_EVENT_SUBJECT.to_string(),
+-                publisher_id: 11,
++                publisher_id: 1,
+                 metadata: serde_json::json!({}),
+             })
+             .await
+@@ -854,20 +856,95 @@ mod tests_startup_helpers {
+         let processor_token = cancellation_token.clone();
+         let (tx, rx) = mpsc::unbounded_channel();
+         let cleanup_discovery = discovery.clone();
++        let (publisher, published) = MockComponent::new();
+         let processor = tokio::spawn(async move {
+-            let (publisher, _) = MockComponent::new();
+             start_event_processor(publisher, 1, processor_token, rx, None, None).await;
+             cleanup_discovery.unregister(source_instance).await.unwrap();
+         });
+-        let listener_handle = tokio::spawn(async {});
+-
+-        let unexpected = supervise_zmq_listener(
+-            listener_handle,
+-            "ipc://events".to_string(),
++        let (ipc_dir, endpoint) = unique_ipc_endpoint();
++        let _native_publisher = bind_pub_socket(&endpoint).await.unwrap();
++        let replay_endpoint = format!("ipc://{}", ipc_dir.path().join("replay.sock").display());
++        let mut replay = tmq::router::router(&tmq::Context::new())
++            .set_linger(0)
++            .bind(&replay_endpoint)
++            .unwrap();
++        let listener_handle = tokio::spawn(start_zmq_listener(
++            endpoint.clone(),
+             String::new(),
++            1,
++            tx,
+             cancellation_token.clone(),
++            4,
++            Arc::new(AtomicU64::new(0)),
++            None,
++            None,
++            Some(replay_endpoint),
++            false,
++        ));
++        let request = tokio::time::timeout(Duration::from_secs(2), replay.next())
++            .await
++            .expect("listener did not request native replay")
++            .unwrap()
++            .unwrap();
++        let identity = request[0].to_vec();
++        let batch = KvEventBatch {
++            ts: 0.0,
++            events: vec![RawKvEvent::BlockStored {
++                block_hashes: vec![BlockHashValue::Unsigned(64)],
++                parent_block_hash: None,
++                token_ids: vec![4, 5, 6, 7],
++                block_size: 4,
++                medium: Some("CPU".to_string()),
++                lora_name: None,
++                cache_namespace: None,
++                block_mm_infos: None,
++                is_eagle: None,
++                group_idx: None,
++                kv_cache_spec_kind: None,
++                kv_cache_spec_sliding_window: None,
++                locality: None,
++                ownership: None,
++            }],
++            data_parallel_rank: Some(0),
++        };
++        replay
++            .send(vec![
++                identity.clone(),
++                Vec::new(),
++                Vec::new(),
++                0_u64.to_be_bytes().to_vec(),
++                rmps::to_vec_named(&(batch.ts, &batch.events, batch.data_parallel_rank)).unwrap(),
++            ])
++            .await
++            .unwrap();
++        tokio::time::timeout(Duration::from_secs(2), async {
++            while published.lock().unwrap().is_empty() {
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .expect("retained CPU event was not actually published");
++        assert_eq!(published.lock().unwrap().len(), 1);
++        assert_eq!(discovery.list(source_query()).await.unwrap().len(), 1);
++
++        // A malformed continuation follows an already-advertised CPU placement.
++        // The real listener must fail and retract its discovery source.
++        replay
++            .send(vec![identity, Vec::new(), b"invalid replay".to_vec()])
++            .await
++            .unwrap();
++
++        let unexpected = tokio::time::timeout(
++            Duration::from_secs(2),
++            supervise_zmq_listener(
++                listener_handle,
++                endpoint,
++                String::new(),
++                cancellation_token.clone(),
++            ),
+         )
+-        .await;
++        .await
++        .expect("malformed native replay did not terminate the listener");
+ 
+         assert!(unexpected);
+         assert!(cancellation_token.is_cancelled());
+@@ -876,7 +953,6 @@ mod tests_startup_helpers {
+             .expect("event processor did not stop after listener failure")
+             .unwrap();
+         assert!(discovery.list(source_query()).await.unwrap().is_empty());
+-        drop(tx);
+     }
+ 
+     #[tokio::test]
+@@ -1296,6 +1372,8 @@ mod tests_startup_helpers {
+                 next_event_id,
+                 None,
+                 None,
++                None,
++                false,
+             )
+         });
+ 
+@@ -1427,6 +1505,8 @@ mod tests_startup_helpers {
+                 Arc::new(AtomicU64::new(0)),
+                 None,
+                 None,
++                None,
++                false,
+             )
+         });
+ 
+@@ -1526,6 +1606,8 @@ mod tests_startup_helpers {
+                 Arc::new(AtomicU64::new(0)),
+                 None,
+                 None,
++                None,
++                false,
+             )
+         });
+ 
+@@ -1608,7 +1690,19 @@ mod tests_startup_helpers {
+         let listener_handle = tokio::spawn({
+             let token = token.clone();
+             let endpoint = endpoint.clone();
+-            start_zmq_listener(endpoint, topic, 1, tx, token, 4, next_event_id, None, None)
++            start_zmq_listener(
++                endpoint,
++                topic,
++                1,
++                tx,
++                token,
++                4,
++                next_event_id,
++                None,
++                None,
++                None,
++                false,
++            )
+         });
+ 
+         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+diff --git a/lib/llm/src/kv_router/publisher/zmq_listener.rs b/lib/llm/src/kv_router/publisher/zmq_listener.rs
+index 9084655f07..366e326510 100644
+--- a/lib/llm/src/kv_router/publisher/zmq_listener.rs
++++ b/lib/llm/src/kv_router/publisher/zmq_listener.rs
+@@ -3,10 +3,12 @@
+ 
+ use std::sync::Arc;
+ use std::sync::atomic::{AtomicU64, Ordering};
++use std::time::Duration;
+ 
+ use anyhow::{Context, Result};
+-use futures::StreamExt;
++use futures::{SinkExt, StreamExt};
+ use tokio::sync::mpsc;
++use tokio::time::{Instant, timeout_at};
+ use tokio_util::sync::CancellationToken;
+ 
+ use dynamo_kv_router::protocols::*;
+@@ -15,6 +17,214 @@ use dynamo_kv_router::zmq_wire::*;
+ use crate::kv_router::metrics::kv_publisher_metrics;
+ use crate::utils::zmq::{connect_sub_socket, multipart_message};
+ 
++const REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
++const MAX_REPLAY_BATCHES: usize = 65_536;
++const REPLAY_READY_SEQUENCE: u64 = u64::MAX - 1;
++const REPLAY_NONCE_PREFIX: &[u8] = b"\xffkv-replay-ready:";
++
++struct ReplayRequest {
++    deadline: Instant,
++    required_cursor: Option<u64>,
++    received: usize,
++    nonce: Option<Vec<u8>>,
++    subscribed: bool,
++}
++
++/// Replay and live data share the native decoder and the existing normalizer.
++/// Read replay first while the bounded SUB socket queues live frames. A later
++/// live gap is repaired from the same retained log; duplicates never reach the
++/// normalizer's Store/Remove refcounts or consume publisher event IDs.
++struct NativeZmqSource {
++    live: crate::utils::zmq::SubSocket,
++    replay: Option<tmq::dealer::Dealer>,
++    request: Option<ReplayRequest>,
++    next_sequence: u64,
++    handshake: bool,
++    topic: Vec<u8>,
++    incarnation: Option<[u8; 16]>,
++}
++
++impl NativeZmqSource {
++    async fn connect(
++        endpoint: &str,
++        topic: &str,
++        replay_endpoint: Option<&str>,
++        handshake: bool,
++    ) -> Result<Self> {
++        anyhow::ensure!(
++            !handshake || replay_endpoint.is_some(),
++            "native KV replay handshake requires a replay endpoint"
++        );
++        let live = connect_sub_socket(endpoint, Some(topic)).await?;
++        let replay = replay_endpoint
++            .map(|endpoint| {
++                tmq::dealer::dealer(&tmq::Context::new())
++                    .set_linger(0)
++                    .connect(endpoint)
++            })
++            .transpose()?;
++        let mut source = Self {
++            live,
++            replay,
++            request: None,
++            next_sequence: 0,
++            handshake,
++            topic: topic.as_bytes().to_vec(),
++            incarnation: None,
++        };
++        if source.replay.is_some() {
++            source.request_replay(None).await?;
++        }
++        Ok(source)
++    }
++
++    async fn request_replay(&mut self, required_cursor: Option<u64>) -> Result<()> {
++        let mut frames = vec![Vec::new(), self.next_sequence.to_be_bytes().to_vec()];
++        let nonce = self.handshake.then(|| {
++            let mut nonce = REPLAY_NONCE_PREFIX.to_vec();
++            nonce.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
++            frames.push(nonce.clone());
++            nonce
++        });
++        let deadline = Instant::now() + REPLAY_TIMEOUT;
++        timeout_at(
++            deadline,
++            self.replay
++                .as_mut()
++                .expect("replay is configured")
++                .send(frames),
++        )
++        .await
++        .context("native KV replay request timed out")??;
++        self.request = Some(ReplayRequest {
++            deadline,
++            required_cursor,
++            received: 0,
++            nonce,
++            subscribed: false,
++        });
++        Ok(())
++    }
++
++    async fn next(&mut self) -> Result<DecodedZmqKvBatch> {
++        loop {
++            let replaying = self.request.is_some();
++            let frames = if let Some(request) = self.request.as_mut() {
++                let frames = timeout_at(
++                    request.deadline,
++                    self.replay.as_mut().expect("replay is configured").next(),
++                )
++                .await
++                .context("native KV replay response timed out")?
++                .context("native KV replay stream ended")??;
++                let mut frames = multipart_message(frames);
++                anyhow::ensure!(
++                    frames.len() == 4 && frames[0].is_empty(),
++                    "invalid native KV replay envelope"
++                );
++                if let Some(nonce) = &request.nonce {
++                    if frames[2] == REPLAY_READY_SEQUENCE.to_be_bytes() {
++                        anyhow::ensure!(
++                            &frames[1] == nonce && !request.subscribed,
++                            "invalid native KV replay subscription challenge"
++                        );
++                        let incarnation: [u8; 16] = frames[3]
++                            .as_slice()
++                            .try_into()
++                            .context("native KV replay incarnation must contain 16 bytes")?;
++                        anyhow::ensure!(
++                            self.incarnation
++                                .is_none_or(|previous| previous == incarnation),
++                            "native KV publisher incarnation changed within one Dynamo source"
++                        );
++                        self.incarnation = Some(incarnation);
++                        // Filters from one SUB pipe reach XPUB in order. The
++                        // engine releases replay only after this nonce proves
++                        // our earlier native-topic filter is installed.
++                        self.live.subscribe(nonce)?;
++                        request.subscribed = true;
++                        continue;
++                    }
++                    anyhow::ensure!(
++                        request.subscribed,
++                        "native KV replay preceded subscription challenge"
++                    );
++                }
++                if frames[1].is_empty()
++                    && frames[2] == u64::MAX.to_be_bytes()
++                    && frames[3].is_empty()
++                {
++                    anyhow::ensure!(
++                        request
++                            .required_cursor
++                            .is_none_or(|cursor| self.next_sequence > cursor),
++                        "native KV replay did not repair cursor {}",
++                        self.next_sequence
++                    );
++                    if let Some(nonce) = &request.nonce {
++                        self.live.unsubscribe(nonce)?;
++                    }
++                    self.request = None;
++                    continue;
++                }
++                request.received += 1;
++                anyhow::ensure!(
++                    request.received <= MAX_REPLAY_BATCHES,
++                    "native KV replay exceeds batch limit"
++                );
++                anyhow::ensure!(
++                    frames[1].starts_with(&self.topic),
++                    "native KV replay topic does not match live subscription"
++                );
++                frames.remove(0);
++                frames
++            } else {
++                multipart_message(self.live.next().await.context("ZMQ stream ended")??)
++            };
++            let decoded = match decode_zmq_kv_batch(frames) {
++                Ok(decoded) => decoded,
++                Err(error) if self.replay.is_none() => {
++                    tracing::warn!(%error, "Failed to decode ZMQ KV batch");
++                    continue;
++                }
++                Err(error) => return Err(error.context("invalid native KV replay source batch")),
++            };
++            if self.replay.is_none() {
++                return Ok(decoded);
++            }
++            if decoded.source_cursor < self.next_sequence {
++                continue;
++            }
++            if decoded.source_cursor > self.next_sequence {
++                anyhow::ensure!(
++                    !replaying,
++                    "native KV replay history is truncated or discontinuous: expected {}, received {}",
++                    self.next_sequence,
++                    decoded.source_cursor
++                );
++                self.request_replay(Some(decoded.source_cursor)).await?;
++                continue;
++            }
++            self.next_sequence = self
++                .next_sequence
++                .checked_add(1)
++                .context("native KV source sequence exhausted")?;
++            return Ok(decoded);
++        }
++    }
++}
++
++impl Drop for NativeZmqSource {
++    fn drop(&mut self) {
++        if let Some(request) = &self.request
++            && request.subscribed
++            && let Some(nonce) = &request.nonce
++        {
++            let _ = self.live.unsubscribe(nonce);
++        }
++    }
++}
++
+ pub(super) struct DecodedZmqKvBatch {
+     pub(super) source_cursor: u64,
+     pub(super) batch: KvEventBatch,
+@@ -55,6 +265,8 @@ pub(super) async fn start_zmq_listener(
+     next_event_id: Arc<AtomicU64>,
+     image_token_id: Option<u32>,
+     video_token_id: Option<u32>,
++    replay_endpoint: Option<String>,
++    replay_handshake: bool,
+ ) {
+     tracing::debug!(
+         "KVEventPublisher connecting to ZMQ endpoint {} (topic '{}')",
+@@ -65,7 +277,14 @@ pub(super) async fn start_zmq_listener(
+     let mut normalizer = ZmqEventNormalizer::new(kv_block_size)
+         .with_image_token_id(image_token_id)
+         .with_video_token_id(video_token_id);
+-    let socket = match connect_sub_socket(&zmq_endpoint, Some(&zmq_topic)).await {
++    let socket = match NativeZmqSource::connect(
++        &zmq_endpoint,
++        &zmq_topic,
++        replay_endpoint.as_deref(),
++        replay_handshake,
++    )
++    .await
++    {
+         Ok(socket) => socket,
+         Err(error) => {
+             tracing::error!(endpoint = %zmq_endpoint, topic = %zmq_topic, error = %error, "ZMQ listener failed to connect");
+@@ -91,24 +310,17 @@ pub(super) async fn start_zmq_listener(
+             }
+ 
+             msg_result = socket.next() => {
+-                let frames = match msg_result {
+-                    Some(Ok(frames)) => multipart_message(frames),
+-                    Some(Err(error)) => {
++                let decoded = match msg_result {
++                    Ok(decoded) => decoded,
++                    Err(error) => {
+                         tracing::error!(endpoint = %zmq_endpoint, error = %error, "ZMQ listener recv failed");
+                         break 'main format!("ZMQ recv failed: {error}");
+                     }
+-                    None => break 'main String::from("ZMQ stream ended"),
+                 };
+                 let DecodedZmqKvBatch {
+                     source_cursor: engine_seq,
+                     batch,
+-                } = match decode_zmq_kv_batch(frames) {
+-                    Ok(decoded) => decoded,
+-                    Err(error) => {
+-                        tracing::warn!(%error, "Failed to decode ZMQ KV batch");
+-                        continue;
+-                    }
+-                };
++                } = decoded;
+ 
+                 tracing::trace!(
+                     "ZMQ listener on {} received batch with {} events (engine_seq={}, dp_rank={})",
+@@ -172,3 +384,388 @@ pub(super) async fn start_zmq_listener(
+         messages_processed
+     );
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use tokio::time::timeout;
++
++    struct NativePublisher {
++        _dir: tempfile::TempDir,
++        live: tmq::publish::Publish,
++        replay: tmq::router::Router,
++        source: NativeZmqSource,
++    }
++
++    fn batch_frames(sequence: u64) -> Vec<Vec<u8>> {
++        let event = serde_json::json!({
++            "type": "BlockRemoved", "block_hashes": [-1], "medium": "CPU_PINNED"
++        });
++        vec![
++            b"kv-events".to_vec(),
++            sequence.to_be_bytes().to_vec(),
++            rmp_serde::to_vec_named(&(0.0, vec![event], 0_i32)).unwrap(),
++        ]
++    }
++
++    async fn reply(
++        replay: &mut tmq::router::Router,
++        request: tmq::Multipart,
++        expected: u64,
++        sequences: &[u64],
++    ) {
++        let request = multipart_message(request);
++        assert_eq!(request.len(), 3);
++        assert!(request[1].is_empty());
++        assert_eq!(request[2], expected.to_be_bytes());
++        for sequence in sequences {
++            let mut frames = vec![request[0].clone(), Vec::new()];
++            frames.extend(batch_frames(*sequence));
++            replay.send(frames).await.unwrap();
++        }
++        replay
++            .send(vec![
++                request[0].clone(),
++                Vec::new(),
++                Vec::new(),
++                u64::MAX.to_be_bytes().to_vec(),
++                Vec::new(),
++            ])
++            .await
++            .unwrap();
++    }
++
++    impl NativePublisher {
++        async fn new() -> Self {
++            Self::with_handshake(false).await
++        }
++
++        async fn with_handshake(handshake: bool) -> Self {
++            let dir = tempfile::tempdir().unwrap();
++            let live_endpoint = format!("ipc://{}/live", dir.path().display());
++            let replay_endpoint = format!("ipc://{}/replay", dir.path().display());
++            let live = tmq::publish::publish(&tmq::Context::new())
++                .set_linger(0)
++                .bind(&live_endpoint)
++                .unwrap();
++            let replay = tmq::router::router(&tmq::Context::new())
++                .set_linger(0)
++                .bind(&replay_endpoint)
++                .unwrap();
++            let source = NativeZmqSource::connect(
++                &live_endpoint,
++                "kv-events",
++                Some(&replay_endpoint),
++                handshake,
++            )
++            .await
++            .unwrap();
++            Self {
++                _dir: dir,
++                live,
++                replay,
++                source,
++            }
++        }
++
++        async fn replay(&mut self, sequences: &[u64]) {
++            let request = timeout(Duration::from_secs(2), self.replay.next())
++                .await
++                .unwrap()
++                .unwrap()
++                .unwrap();
++            reply(&mut self.replay, request, 0, sequences).await;
++        }
++
++        // Repeat identical native frames until the SUB handshake completes.
++        // This both avoids a sleep-based readiness assumption and exercises
++        // duplicate delivery without advancing the native sequence.
++        async fn next_with_live(
++            &mut self,
++            sequences: &[u64],
++            mut repair: Option<(u64, &[u64])>,
++        ) -> Result<DecodedZmqKvBatch> {
++            let next = self.source.next();
++            tokio::pin!(next);
++            let mut tick = tokio::time::interval(Duration::from_millis(10));
++            let deadline = tokio::time::sleep(Duration::from_secs(2));
++            tokio::pin!(deadline);
++            loop {
++                tokio::select! {
++                    result = &mut next => return result,
++                    _ = &mut deadline => panic!("native source did not produce a result"),
++                    request = self.replay.next(), if repair.is_some() => {
++                        let (expected, replayed) = repair.take().unwrap();
++                        reply(&mut self.replay, request.unwrap().unwrap(), expected, replayed).await;
++                    }
++                    _ = tick.tick() => {
++                        for sequence in sequences {
++                            self.live.send(batch_frames(*sequence)).await.unwrap();
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    #[tokio::test]
++    async fn retained_sequence_zero_replays_before_any_live_frame() {
++        let mut native = NativePublisher::new().await;
++        native.replay(&[0]).await;
++        let batch = native.source.next().await.unwrap();
++        assert_eq!(batch.source_cursor, 0);
++        assert!(
++            matches!(&batch.batch.events[0], RawKvEvent::BlockRemoved { medium: Some(medium), block_hashes, .. }
++                if medium == "CPU_PINNED" && matches!(block_hashes.as_slice(), [BlockHashValue::Signed(-1)]))
++        );
++    }
++
++    #[tokio::test]
++    async fn replay_and_live_duplicates_are_admitted_once_in_order() {
++        let mut native = NativePublisher::new().await;
++        native.replay(&[0, 0, 1]).await;
++        assert_eq!(native.source.next().await.unwrap().source_cursor, 0);
++        assert_eq!(native.source.next().await.unwrap().source_cursor, 1);
++        assert_eq!(
++            native
++                .next_with_live(&[0, 1, 2], None)
++                .await
++                .unwrap()
++                .source_cursor,
++            2
++        );
++        assert_eq!(native.source.next_sequence, 3);
++    }
++
++    #[tokio::test]
++    async fn empty_replay_accepts_subsequent_live_sequence_zero() {
++        let mut native = NativePublisher::new().await;
++        native.replay(&[]).await;
++        assert_eq!(
++            native
++                .next_with_live(&[0], None)
++                .await
++                .unwrap()
++                .source_cursor,
++            0
++        );
++    }
++
++    #[tokio::test]
++    async fn live_gap_replays_missing_batches_before_later_batch() {
++        let mut native = NativePublisher::new().await;
++        native.replay(&[0]).await;
++        assert_eq!(native.source.next().await.unwrap().source_cursor, 0);
++        assert_eq!(
++            native
++                .next_with_live(&[3], Some((1, &[1, 2, 3])))
++                .await
++                .unwrap()
++                .source_cursor,
++            1
++        );
++        assert_eq!(native.source.next().await.unwrap().source_cursor, 2);
++        assert_eq!(native.source.next().await.unwrap().source_cursor, 3);
++        assert_eq!(
++            native
++                .next_with_live(&[3, 4], None)
++                .await
++                .unwrap()
++                .source_cursor,
++            4
++        );
++    }
++
++    #[tokio::test]
++    async fn truncated_initial_replay_is_terminal() {
++        let mut native = NativePublisher::new().await;
++        native.replay(&[2]).await;
++        assert!(
++            native
++                .source
++                .next()
++                .await
++                .err()
++                .unwrap()
++                .to_string()
++                .contains("truncated or discontinuous")
++        );
++    }
++
++    #[tokio::test]
++    async fn empty_gap_replay_is_terminal() {
++        let mut native = NativePublisher::new().await;
++        native.replay(&[0]).await;
++        native.source.next().await.unwrap();
++        assert!(
++            native
++                .next_with_live(&[3], Some((1, &[])))
++                .await
++                .err()
++                .unwrap()
++                .to_string()
++                .contains("did not repair")
++        );
++    }
++
++    #[tokio::test]
++    async fn malformed_replay_envelope_is_terminal() {
++        let mut native = NativePublisher::new().await;
++        let request = multipart_message(native.replay.next().await.unwrap().unwrap());
++        native
++            .replay
++            .send(vec![request[0].clone(), b"invalid".to_vec()])
++            .await
++            .unwrap();
++        assert!(
++            native
++                .source
++                .next()
++                .await
++                .err()
++                .unwrap()
++                .to_string()
++                .contains("invalid native KV replay envelope")
++        );
++    }
++
++    #[tokio::test]
++    async fn replay_deadline_is_bounded() {
++        let mut native = NativePublisher::new().await;
++        native.source.request.as_mut().unwrap().deadline = Instant::now();
++        assert!(
++            native
++                .source
++                .next()
++                .await
++                .err()
++                .unwrap()
++                .to_string()
++                .contains("timed out")
++        );
++    }
++
++    #[tokio::test]
++    async fn wrong_replay_topic_is_terminal() {
++        let mut native = NativePublisher::new().await;
++        let request = multipart_message(native.replay.next().await.unwrap().unwrap());
++        let mut batch = batch_frames(0);
++        batch[0] = b"another-engine".to_vec();
++        let mut frames = vec![request[0].clone(), Vec::new()];
++        frames.extend(batch);
++        native.replay.send(frames).await.unwrap();
++        assert!(
++            native
++                .source
++                .next()
++                .await
++                .err()
++                .unwrap()
++                .to_string()
++                .contains("topic does not match")
++        );
++    }
++
++    #[tokio::test]
++    async fn handshake_installs_nonce_before_replay_and_removes_it_at_end() {
++        let mut native = NativePublisher::with_handshake(true).await;
++        let mut request = multipart_message(native.replay.next().await.unwrap().unwrap());
++        assert_eq!(request.len(), 4);
++        let nonce = request.pop().unwrap();
++        assert!(nonce.starts_with(REPLAY_NONCE_PREFIX));
++        assert_eq!(nonce.len(), REPLAY_NONCE_PREFIX.len() + 16);
++        native
++            .replay
++            .send(vec![
++                request[0].clone(),
++                Vec::new(),
++                nonce,
++                REPLAY_READY_SEQUENCE.to_be_bytes().to_vec(),
++                vec![9; 16],
++            ])
++            .await
++            .unwrap();
++        reply(&mut native.replay, request.into(), 0, &[0]).await;
++        assert_eq!(native.source.next().await.unwrap().source_cursor, 0);
++        assert!(native.source.request.as_ref().unwrap().subscribed);
++        assert_eq!(native.source.incarnation, Some([9; 16]));
++        assert_eq!(
++            native
++                .next_with_live(&[1], None)
++                .await
++                .unwrap()
++                .source_cursor,
++            1
++        );
++        assert!(native.source.request.is_none());
++    }
++
++    #[tokio::test]
++    async fn handshake_rejects_wrong_nonce() {
++        let mut native = NativePublisher::with_handshake(true).await;
++        let request = multipart_message(native.replay.next().await.unwrap().unwrap());
++        native
++            .replay
++            .send(vec![
++                request[0].clone(),
++                Vec::new(),
++                b"wrong".to_vec(),
++                REPLAY_READY_SEQUENCE.to_be_bytes().to_vec(),
++                vec![9; 16],
++            ])
++            .await
++            .unwrap();
++        assert!(
++            native
++                .source
++                .next()
++                .await
++                .err()
++                .unwrap()
++                .to_string()
++                .contains("invalid native KV replay subscription challenge")
++        );
++    }
++
++    #[tokio::test]
++    async fn handshake_rejects_data_without_challenge() {
++        let mut native = NativePublisher::with_handshake(true).await;
++        let mut request = multipart_message(native.replay.next().await.unwrap().unwrap());
++        request.pop();
++        reply(&mut native.replay, request.into(), 0, &[0]).await;
++        assert!(
++            native
++                .source
++                .next()
++                .await
++                .err()
++                .unwrap()
++                .to_string()
++                .contains("preceded subscription challenge")
++        );
++    }
++
++    #[tokio::test]
++    async fn handshake_rejects_invalid_or_changed_publisher_incarnation() {
++        for incarnation in [vec![9; 15], vec![8; 16]] {
++            let mut native = NativePublisher::with_handshake(true).await;
++            // A later replay on this source must still identify the publisher
++            // whose earlier native placements were accepted.
++            native.source.incarnation = Some([9; 16]);
++            let request = multipart_message(native.replay.next().await.unwrap().unwrap());
++            native
++                .replay
++                .send(vec![
++                    request[0].clone(),
++                    Vec::new(),
++                    request[3].clone(),
++                    REPLAY_READY_SEQUENCE.to_be_bytes().to_vec(),
++                    incarnation,
++                ])
++                .await
++                .unwrap();
++            let error = native.source.next().await.err().unwrap().to_string();
++            assert!(error.contains("incarnation"), "{error}");
++        }
++    }
++}
+diff --git a/lib/llm/src/mocker.rs b/lib/llm/src/mocker.rs
+index e7b1d08122..c24decebf0 100644
+--- a/lib/llm/src/mocker.rs
++++ b/lib/llm/src/mocker.rs
+@@ -647,6 +647,8 @@ impl MockerExecutionContext {
+                             let source_config = Some(KvEventSourceConfig::Zmq {
+                                 endpoint: format!("tcp://127.0.0.1:{zmq_port}"),
+                                 topic: String::new(),
++                                replay_endpoint: None,
++                                replay_handshake: false,
+                                 image_token_id: None,
+                                 video_token_id: None,
+                             });
