@@ -43,11 +43,12 @@ from lmcache.v1.multiprocess.custom_types import (
     KVEventBatch,
     KVEventRecord,
 )
-from lmcache.v1.multiprocess.futures import MessagingFuture, MessagingStream
+from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
     expand_engine_block_ids,
 )
+from lmcache.v1.multiprocess.kv_event_subscriber import MPKVEventSubscriber
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.multiprocess.transfer_context import (
     TransferContext,
@@ -94,7 +95,6 @@ _KV_EVENT_RESYNCS = Counter(
     ["model_name", "worker_id", "reason"],
 )
 # Maximum records in each pushed batch.
-_KV_EVENT_BATCH_SIZE = 1024
 
 
 class ExtraConfigDefault(enum.Enum):
@@ -1480,9 +1480,7 @@ class LMCacheMPWorkerAdapter:
         self._kv_event_server_source = False
         self._kv_event_subscriber = False
         self._kv_event_incarnation: int | None = None
-        self._kv_event_stream: MessagingStream[KVEventBatch] | None = None
-        self._kv_event_receiver: threading.Thread | None = None
-        self._kv_event_stop = threading.Event()
+        self._kv_event_receiver: MPKVEventSubscriber | None = None
         # CPU chunks this worker has announced and not withdrawn.
         self._announced_kv_hashes: set[bytes] = set()
         if enable_kv_events:
@@ -2326,10 +2324,13 @@ class LMCacheMPWorkerAdapter:
         self._ensure_heartbeat_started()
         with self._kv_event_lock:
             if self._kv_event_subscriber and self._kv_event_receiver is None:
-                self._kv_event_receiver = threading.Thread(
-                    target=self._receive_kv_events,
-                    daemon=True,
-                    name="lmcache-kv-events",
+                self._kv_event_receiver = MPKVEventSubscriber(
+                    self.req_client,
+                    self.instance_id,
+                    self.model_name,
+                    self._receive_kv_event_batch,
+                    self._receive_kv_event_disconnect,
+                    self._receive_kv_event_error,
                 )
                 self._kv_event_receiver.start()
             events, self._kv_events = self._kv_events, []
@@ -2455,12 +2456,8 @@ class LMCacheMPWorkerAdapter:
         on the closing request client, and a straggler in-flight cycle cannot
         re-register or flip the health event after unregistration.
         """
-        self._kv_event_stop.set()
-        with self._kv_event_lock:
-            if self._kv_event_stream is not None:
-                self._kv_event_stream.close()
         if self._kv_event_receiver is not None:
-            self._kv_event_receiver.join()
+            self._kv_event_receiver.close()
 
         with self._heartbeat_lock:
             if self._heartbeat is not None:
@@ -2503,44 +2500,22 @@ class LMCacheMPWorkerAdapter:
             self._kv_events_generated.inc(len(events))
             self._kv_events_buffered.set(len(self._kv_events))
 
-    def _receive_kv_events(self) -> None:
-        """Receive pushes; reconnect after disconnect without periodic fetches."""
-        while not self._kv_event_stop.is_set():
-            stream = None
-            try:
-                stream = self.req_client.subscribe_kv_events(
-                    self.instance_id,
-                    self.model_name,
-                    0,
-                    _KV_EVENT_BATCH_SIZE,
-                )
-                with self._kv_event_lock:
-                    if self._kv_event_stop.is_set():
-                        return
-                    self._kv_event_stream = stream
-                for batch in stream:
-                    with self._kv_event_lock:
-                        if self._kv_event_stop.is_set():
-                            return
-                        self._apply_kv_event_batch(batch)
-                        if not self._kv_event_server_source:
-                            return
-                raise ConnectionError("KV event subscription ended")
-            except ConnectionError as exc:
-                if not self._kv_event_stop.is_set():
-                    with self._kv_event_lock:
-                        logger.warning("Reconnecting KV event subscription: %s", exc)
-                        self._resync_kv_events("stream_closed")
-            except Exception as exc:
-                if not self._kv_event_stop.is_set():
-                    with self._kv_event_lock:
-                        self._disable_kv_event_stream(str(exc))
-                return
-            finally:
-                if stream is not None:
-                    stream.close()
-                with self._kv_event_lock:
-                    self._kv_event_stream = None
+    def _receive_kv_event_batch(self, batch: KVEventBatch) -> bool:
+        """Apply a receiver-thread batch under the native event buffer lock."""
+        with self._kv_event_lock:
+            self._apply_kv_event_batch(batch)
+            return self._kv_event_server_source
+
+    def _receive_kv_event_disconnect(self) -> None:
+        """Withdraw buffered CPU placement before the receiver reconnects."""
+        with self._kv_event_lock:
+            logger.warning("Reconnecting KV event subscription")
+            self._resync_kv_events("stream_closed")
+
+    def _receive_kv_event_error(self, reason: str) -> None:
+        """Apply the existing engine fallback policy after a terminal error."""
+        with self._kv_event_lock:
+            self._disable_kv_event_stream(reason)
 
     def _disable_kv_event_stream(self, reason: str) -> None:
         """Withdraw placements and resume completed-store reporting after failure."""
