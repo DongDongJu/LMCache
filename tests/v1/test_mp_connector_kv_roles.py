@@ -3,6 +3,7 @@
 
 # Standard
 from collections.abc import Iterator
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock
@@ -30,6 +31,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (  # noqa: E402
     MultiConnector,
 )
+from vllm.exceptions import VLLMValidationError  # noqa: E402
 from vllm.v1.core.sched.output import SchedulerOutput  # noqa: E402
 from vllm.v1.kv_cache_interface import (  # noqa: E402
     FullAttentionSpec,
@@ -48,9 +50,12 @@ from lmcache.integration.vllm.lmcache_mp_connector import (  # noqa: E402
 )
 from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
     LMCacheMPConnectorMetadata,
+    LMCacheMPRequestMetadata,
+    LMCacheMPRequestTracker,
 )
 from lmcache.integration.vllm.vllm_multi_process_adapter import LoadStoreOp
 from lmcache.utils import CacheStoreEvent  # noqa: E402
+from lmcache.v1.multiprocess.custom_types import KV_EVENT_CAPABILITY, KVEventProfile
 
 pytestmark = pytest.mark.no_shared_allocator
 
@@ -98,17 +103,48 @@ def test_kv_event_aggregation_preserves_worker_transitions(
     assert aggregate.get_all_events() == []
 
 
+def _event_cache_config() -> KVCacheConfig:
+    return KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=4,
+                    num_kv_heads=1,
+                    head_size=8,
+                    dtype=torch.float32,
+                ),
+            )
+        ],
+    )
+
+
 def _config(transfer_config: KVTransferConfig) -> VllmConfig:
     return cast(
         VllmConfig,
         SimpleNamespace(
             model_config=SimpleNamespace(model="test-model", use_mla=False),
             parallel_config=SimpleNamespace(
-                world_size=1, rank=0, tensor_parallel_size=1, pipeline_parallel_size=1
+                world_size=1,
+                rank=0,
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+                data_parallel_size=1,
+                decode_context_parallel_size=1,
             ),
-            cache_config=SimpleNamespace(block_size=4, enable_prefix_caching=True),
+            cache_config=SimpleNamespace(
+                block_size=4,
+                enable_prefix_caching=True,
+                prefix_caching_hash_algo="sha256",
+                prefix_match_unit=None,
+            ),
+            speculative_config=None,
+            lora_config=None,
             scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=True),
             kv_transfer_config=transfer_config,
+            kv_events_config=None,
         ),
     )
 
@@ -185,7 +221,9 @@ def mock_io(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(connector_mod, "vllm_layout_hints", lambda config: {})
     monkeypatch.setattr(adapter_mod.RequestClientFactory, "create", MagicMock())
     monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", lambda *a, **kw: 4)
-    monkeypatch.setattr(adapter_mod, "get_experimental", lambda *a, **kw: set())
+    monkeypatch.setattr(
+        adapter_mod, "get_experimental", lambda *a, **kw: {KV_EVENT_CAPABILITY}
+    )
     monkeypatch.setattr(adapter_mod, "HeartbeatThread", MagicMock())
     monkeypatch.setattr(adapter_mod, "set_ipc_policy", MagicMock())
     monkeypatch.setattr(
@@ -682,8 +720,8 @@ def test_kv_events_survive_multi_connector(
         )
     )
     cast(Any, config).kv_events_config = SimpleNamespace(enable_kv_cache_events=True)
-    scheduler = MultiConnector(config, KVConnectorRole.SCHEDULER, None)
-    worker = MultiConnector(config, KVConnectorRole.WORKER, None)
+    scheduler = MultiConnector(config, KVConnectorRole.SCHEDULER, _event_cache_config())
+    worker = MultiConnector(config, KVConnectorRole.WORKER, _event_cache_config())
     scheduler.bind_gpu_block_pool(mock_io.pool)
     try:
         kv_events_queue.extend([[_kv_event(11)], [_kv_event(12)]])
@@ -715,8 +753,10 @@ def test_kv_events_standalone_use_hook_only(
         KVTransferConfig(kv_connector="LMCacheMPConnector", kv_role="kv_both")
     )
     cast(Any, config).kv_events_config = SimpleNamespace(enable_kv_cache_events=True)
-    scheduler = LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)
-    worker = LMCacheMPConnector(config, KVConnectorRole.WORKER)
+    scheduler = LMCacheMPConnector(
+        config, KVConnectorRole.SCHEDULER, _event_cache_config()
+    )
+    worker = LMCacheMPConnector(config, KVConnectorRole.WORKER, _event_cache_config())
     try:
         kv_events_queue.extend([[_kv_event(11)], [_kv_event(12)]])
         for expected in ([11], [12]):
@@ -746,8 +786,10 @@ def test_kv_events_worker_reports_merge_across_ranks(
         KVTransferConfig(kv_connector="LMCacheMPConnector", kv_role="kv_both")
     )
     cast(Any, config).kv_events_config = SimpleNamespace(enable_kv_cache_events=True)
-    scheduler = LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)
-    worker = LMCacheMPConnector(config, KVConnectorRole.WORKER)
+    scheduler = LMCacheMPConnector(
+        config, KVConnectorRole.SCHEDULER, _event_cache_config()
+    )
+    worker = LMCacheMPConnector(config, KVConnectorRole.WORKER, _event_cache_config())
     try:
         kv_events_queue.extend([[_kv_event(11), _kv_event(12)], [_kv_event(11)]])
         rank0 = worker.build_connector_worker_meta()
@@ -765,3 +807,195 @@ def test_kv_events_worker_reports_merge_across_ranks(
     finally:
         worker.shutdown()
         scheduler.shutdown()
+
+
+@pytest.mark.parametrize("chunk_size", [4, 8])
+@pytest.mark.parametrize("integer_hashes", [False, True])
+def test_store_bindings_match_native_gpu_block_pool_events(
+    monkeypatch: pytest.MonkeyPatch, chunk_size: int, integer_hashes: bool
+) -> None:
+    """Scheduler STORE metadata matches independently emitted native GPU events."""
+    # Third Party
+    from vllm.sampling_params import SamplingParams
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+
+    monkeypatch.setenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", str(int(integer_hashes)))
+    init_none_hash(sha256)
+    request = Request(
+        request_id="native-identity",
+        prompt_token_ids=list(range(2 * chunk_size + 3)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(4, sha256),
+    )
+    pool = BlockPool(
+        16, enable_caching=True, hash_block_size=4, enable_kv_cache_events=True
+    )
+    blocks = pool.get_new_blocks(2 * chunk_size // 4)
+    pool.cache_full_blocks(request, blocks, 0, len(blocks), 4, 0)
+    gpu = pool.take_events()[0]
+    tracker = LMCacheMPRequestTracker(request)
+    tracker.native_block_hashes = request.block_hashes
+    tracker.append_block_ids(([block.block_id for block in blocks],))
+    tracker.increase_num_scheduled_tokens(len(request.all_token_ids))
+    metadata = LMCacheMPRequestMetadata.GetStoreMetadata(
+        tracker,
+        chunk_size,
+        [4],
+        event_profile=KVEventProfile("vllm-test-native", 4),
+        hash_block_size=4,
+    )
+    assert metadata is not None
+    bindings = metadata.op.event_bindings
+    assert len(bindings) == 2
+    assert [h for binding in bindings for h in binding.block_hashes] == gpu.block_hashes
+    assert [t for binding in bindings for t in binding.token_ids] == gpu.token_ids
+    assert bindings[0].parent_block_hash == gpu.parent_block_hash
+    assert bindings[1].parent_block_hash == gpu.block_hashes[chunk_size // 4 - 1]
+    assert all(binding.block_size == gpu.block_size for binding in bindings)
+    assert metadata.op.end == 2 * chunk_size  # Incomplete terminal chunk omitted.
+
+
+def test_event_enabled_scheduler_rejects_salted_request(
+    mock_io: SimpleNamespace,
+) -> None:
+    """Unsupported request namespaces fail before lookup can advertise a binding."""
+    config = _config(
+        KVTransferConfig(kv_connector="LMCacheMPConnector", kv_role="kv_both")
+    )
+    cast(Any, config).kv_events_config = SimpleNamespace(enable_kv_cache_events=True)
+    connector = LMCacheMPConnector(
+        config, KVConnectorRole.SCHEDULER, _event_cache_config()
+    )
+    request = _request()
+    request.cache_salt = "tenant"
+    try:
+        with pytest.raises(VLLMValidationError, match="salted"):
+            connector.get_num_new_matched_tokens(request, 0)
+    finally:
+        connector.shutdown()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_native_event_startup_requires_frontend_admission_hook(
+    mock_io: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    """Unpatched vLLM is rejected only when the native event profile is enabled."""
+    monkeypatch.delattr(KVConnectorBase_V1, "validate_kv_event_request")
+    config = _config(
+        KVTransferConfig(kv_connector="LMCacheMPConnector", kv_role="kv_both")
+    )
+    cast(Any, config).kv_events_config = SimpleNamespace(enable_kv_cache_events=enabled)
+    if enabled:
+        with pytest.raises(ValueError, match="admission-validation hook"):
+            LMCacheMPConnector(config, KVConnectorRole.SCHEDULER, _event_cache_config())
+    else:
+        connector = LMCacheMPConnector(
+            config, KVConnectorRole.SCHEDULER, _event_cache_config()
+        )
+        connector.shutdown()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "tp4",
+        "pp2",
+        "dp2",
+        "dcp2",
+        "swa",
+        "chunked_attention",
+        "multiple_groups",
+        "missing_layout",
+        "speculation",
+        "lora",
+        "prefix_disabled",
+        "unseeded_hash",
+        "multiple_mps",
+    ],
+)
+def test_native_event_configuration_rejects_unsupported_profile(
+    mock_io: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Invalid event profiles fail before the scheduler can submit a lookup."""
+    config = _config(
+        KVTransferConfig(kv_connector="LMCacheMPConnector", kv_role="kv_both")
+    )
+    cast(Any, config).kv_events_config = SimpleNamespace(enable_kv_cache_events=True)
+    cache = _event_cache_config()
+    parallel_fields = {
+        "tp4": ("tensor_parallel_size", 4),
+        "pp2": ("pipeline_parallel_size", 2),
+        "dp2": ("data_parallel_size", 2),
+        "dcp2": ("decode_context_parallel_size", 2),
+    }
+    if case in parallel_fields:
+        field, value = parallel_fields[case]
+        setattr(config.parallel_config, field, value)
+    elif case in ("swa", "chunked_attention"):
+        group = cache.kv_cache_groups[0]
+        field = "sliding_window" if case == "swa" else "attention_chunk_size"
+        cache.kv_cache_groups[0] = replace(
+            group, kv_cache_spec=replace(group.kv_cache_spec, **{field: 16})
+        )
+    elif case == "multiple_groups":
+        cache.kv_cache_groups.append(cache.kv_cache_groups[0])
+    elif case in ("speculation", "lora"):
+        setattr(
+            config,
+            "speculative_config" if case == "speculation" else "lora_config",
+            object(),
+        )
+    elif case == "prefix_disabled":
+        config.cache_config.enable_prefix_caching = False
+    elif case == "unseeded_hash":
+        config.cache_config.prefix_caching_hash_algo = "xxhash"
+        monkeypatch.delenv("PYTHONHASHSEED", raising=False)
+    elif case == "multiple_mps":
+        config.kv_transfer_config.kv_connector_extra_config[
+            "lmcache.mp.server_urls"
+        ] = ["tcp://one:5555", "tcp://two:5555"]
+    # Naming is tested separately; this fixture contains no model weights/config.
+    monkeypatch.setattr(
+        connector_mod, "get_dcp_decorated_model_name", lambda *a: "model"
+    )
+    with pytest.raises(ValueError, match="MP KV events require"):
+        LMCacheMPConnector(
+            config,
+            KVConnectorRole.SCHEDULER,
+            None if case == "missing_layout" else cache,
+        )
+    mock_io.scheduler.maybe_submit_lookup_request.assert_not_called()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "field",
+    ["cache_salt", "lora_request", "mm_features", "prompt_embeds", "session_id"],
+)
+def test_native_namespace_policy_runs_without_connector_construction(
+    enabled: bool,
+    field: str,
+) -> None:
+    """Admission validation raises a request-level vLLM error only when enabled."""
+    config = _config(
+        KVTransferConfig(kv_connector="LMCacheMPConnector", kv_role="kv_both")
+    )
+    cast(Any, config).kv_events_config = SimpleNamespace(enable_kv_cache_events=enabled)
+    request = _request()
+    for namespace in (
+        "cache_salt",
+        "lora_request",
+        "mm_features",
+        "prompt_embeds",
+        "session_id",
+    ):
+        setattr(request, namespace, None)
+    setattr(request, field, "unsupported")
+    if enabled:
+        with pytest.raises(VLLMValidationError, match="MP KV events"):
+            LMCacheMPConnector.validate_kv_event_request(config, request)
+    else:
+        LMCacheMPConnector.validate_kv_event_request(config, request)

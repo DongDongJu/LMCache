@@ -1,0 +1,94 @@
+Native CPU KV Events
+====================
+
+MP publishes CPU placement through the serving engine's existing KV-event
+publisher. The engine attaches its native block identities to STORE metadata;
+MP emits a Stored transition only when every required KV rank and object group
+has a committed, readable L1 copy. Eviction of a required object emits Removed
+with the same native identities. Removing one of two L1 copies keeps the
+placement available.
+
+Enable native KV events in the engine and keep MP observability and a positive
+``--kv-event-log-size`` enabled. Workers require the
+``kv_event_native_bindings_v1`` capability. They validate one immutable identity
+profile on every rank's cache registration, including native block size, hash
+algorithm, seed semantics, and representation. Old chunk-hash consumers cannot
+use this stream.
+An incompatible profile or missing capability fails explicitly. The elected
+subscriber also checks the profile when opening or restoring its stream.
+
+Supported deployment
+--------------------
+
+Use dense text-only full attention with LMCache-driven device transfer, private
+CPU/L1 storage, TP=1 or TP=2, and DP=PP=1. One private MP must own the serving
+replica's complete KV-rank set. LMCache chunk size C must be an integer multiple
+of the engine's native event block size B. Complete chunks advertise all C/B
+native blocks and their original parent chain; incomplete terminal chunks do
+not advertise CPU placement.
+
+Event-enabled hybrid/SWA/Mamba, MLA, DCP, multimodal, LoRA, salted, speculative,
+and shared/L2 configurations are outside this profile. Unsupported request
+namespaces fail before publishing identities. Explicitly disabling engine KV
+events retains the ordinary inference/cache path.
+
+vLLM obtains identities from scheduler ``Request.block_hashes`` and carries
+them to workers in connector metadata. Its direct event hook and MultiConnector
+worker-metadata bridge carry each transition through one delivery path.
+Event-enabled vLLM also requires the companion ``validate_kv_event_request``
+admission hook. It rejects unsupported request namespaces before EngineCore
+enqueue, including through MultiConnector, so a rejected request leaves the
+engine available for ordinary inference. An unpatched engine fails explicitly
+at event-enabled startup.
+SGLang requires the companion native descriptor and ``take_events`` bridge;
+both engines' pinned revisions and patches are included with the E2E harness.
+
+Delivery and recovery
+---------------------
+
+Both engines use ``MPKVEventSubscriber`` over ZMQ or gRPC. One elected worker
+subscribes per engine/MP attachment. Other TP ranks remain in server-event mode.
+The subscriber owns its stream and receiver thread; the engine owns the client,
+registration, heartbeat, native publisher, and advertised CPU identity ledger.
+
+Reconnect invalidates prior CPU advertisements and replays the current retained
+log from its beginning. Log truncation, local queue overflow, and a new MP
+incarnation also invalidate CPU advertisements. Server EventBus loss clears the
+server's completeness projection before new residency can be advertised.
+These removals are CPU-scoped and leave native GPU placements intact.
+
+There is no snapshot service: a cold subscriber can miss warm entries whose
+records have left the retained log. Increasing ``--kv-event-log-size`` extends
+replay coverage but does not guarantee recovery of every warm entry. Protocol
+failures remain visible; neither engine switches to local STORE announcements,
+lookup polling, or guessed native hashes.
+
+SGLang drains events through its normal scheduler publication path. vLLM drains
+on engine steps, so an idle worker may receive an MP eviction before publishing
+its removal. Active-step convergence and request-free idle convergence are
+separate measurements. Pause behavior must also be measured separately.
+
+An MP process restart also loses its device-transfer registrations. SGLang's
+existing heartbeat only pings; it does not recreate these registrations. After
+MP restarts, allow the idle event path to withdraw old CPU advertisements, then
+restart the SGLang engine to register its transfer contexts before new inference.
+Event-stream reconnection alone does not restore the transfer path.
+vLLM's existing transfer recovery runs after its heartbeat observes an
+unhealthy-to-healthy transition. A short restart between successful pings can
+miss that transition. Keep MP down until its attached clients report degraded
+mode, then start MP and verify all GPU registrations and the subscription before
+resuming inference; otherwise restart the engine to recreate its registrations.
+
+Reproduction
+------------
+
+The focused harness lives in ``tests/e2e/mp_kv_events/``. Its version lock,
+README, run-scoped manifests, and evidence artifacts describe the exact engine,
+router, model, and cluster revisions used for a run. For example::
+
+   python tests/e2e/mp_kv_events/run.py preflight --cluster k3s --tp 1
+
+Preflight only checks prerequisites. A passing routed cache-load result must
+correlate router selection, the selected engine's GPU match, MP L1 lookup,
+completed CPU-to-GPU transfer, and the resulting generation. Consult the
+per-scenario results for executed, blocked, and unselected matrix rows.

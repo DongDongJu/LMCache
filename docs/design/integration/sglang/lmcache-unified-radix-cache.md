@@ -433,3 +433,39 @@ independent recurrent state is present.
 - All ranks complete collective-bearing operations in the same order.
 - `END_SESSION` follows every store associated with the session.
 - SWA and recurrent-state deployments use separate LMCache object groups.
+
+## Native CPU placement events
+
+The native-binding event profile requires the SGLang `native_event_hash` and
+`LMCacheUnifiedRadixCache.take_events` bridge supplied with this change. The
+bridge prepares immutable native page identities when submitting STORE, using
+SGLang's native page hashing and signed event conversion. Request-scoped hash
+state extends only new pages, supports both TreeCore backends, and is released
+when the request ends. Preparation does not enqueue a CPU store. The MP server
+announces the binding only after all required dense KV ranks and object groups
+have committed readable L1 copies; eviction removes exactly those identities.
+
+One elected connector borrows its request client to a common
+`MPKVEventSubscriber`. The connector retains registration and heartbeat
+ownership. SGLang's existing `take_events` call drains GPU events first and then
+wraps ordered MP transitions as native CPU events on the scheduler thread. A
+stream reset withdraws this connector's advertised CPU identities without an
+`AllBlocksCleared` event. Terminal protocol errors are raised after draining the
+withdrawals. No local STORE-completion event source is used.
+
+An MP-only restart loses the registered device handles. The SGLang connector's
+heartbeat refreshes liveness but does not register those handles again. Stop
+admitting requests, restart MP, and let SGLang's normal idle publisher withdraw
+the previous CPU advertisements. The event subscriber retries while the new MP
+has no registered layout. Then restart the SGLang engine so startup registers
+its tensors and negotiates the event profile before admitting requests again.
+The recovery check observes the changed MP incarnation and CPU withdrawals
+before that engine restart, then verifies a fresh routed CPU store and load.
+This procedure does not assume automatic SGLang registration recovery.
+
+Event-enabled operation requires the `kv_event_native_bindings_v1` capability,
+a compatible immutable native profile, LMCache-driven transfer, dense full
+attention, TP=1/2, and DP=PP=CP=1. The LMCache chunk size must be an integer
+multiple of the native page size. Salted, LoRA, multimodal, speculative and
+session-cache namespaces are rejected. Explicitly disabling engine KV events
+preserves the ordinary cache path, including its existing broader model support.
