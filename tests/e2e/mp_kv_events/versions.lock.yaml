@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "lmcache": {
-    "base_revision": "b9a5ce0213618cc6e6a1e8eee20c4a3a696ad58f",
-    "multiconnector_dependency": "08f0d18d48e9da45f52dfb14743c2b3613dd6987"
+    "base_revision": "65320eaa8ebc5e5039ace88d8bb39a88f6859a63",
+    "multiconnector_dependency": "4d69cdc43ac9bab9c0c1cd5cac380c480cb32224"
   },
   "vllm": {
     "revision": "db9527a46873454610df6dbedf79a36d6bf1a7f6",

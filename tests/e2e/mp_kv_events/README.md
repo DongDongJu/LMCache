@@ -11,6 +11,12 @@ See the recorded [acceptance matrix](evidence/acceptance.json),
 [vLLM mixed-prefix trace](evidence/vllm-t03-trace.json) for the measured results,
 their exact source pins, and the separately reported limitations.
 
+The recorded GPU matrix and overhead measurements predate the merge of upstream
+`dev` at `65320eaa`. Their original source pins remain in the evidence bundle.
+See [merge validation](evidence/dev-merge-validation.json) for the focused checks
+after updating the gRPC service names and ZMQ request loop. The full GPU matrix
+and overhead measurements were not repeated for that merge.
+
 `versions.lock.yaml` is JSON-compatible YAML. It pins source revisions and image
 digests; `build` additionally records every source input's SHA256 and the image
 ID. vLLM 0.31.0 retains both the native block identity helpers and the engine

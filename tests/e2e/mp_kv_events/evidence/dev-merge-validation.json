@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-10-14T15:32:34.656857+00:00",
+  "status": "PASS_WITH_DOCUMENTED_VALIDATION_SCOPE",
+  "result_revision_reference": "merge commit containing this report",
+  "pre_merge_revision": "44ec041c1085ff5a487bb571ef93c7ef6870b09d",
+  "upstream_dev_revision": "65320eaa8ebc5e5039ace88d8bb39a88f6859a63",
+  "already_merged_multiconnector": {
+    "original_dependency": "08f0d18d48e9da45f52dfb14743c2b3613dd6987",
+    "upstream_squash": "4d69cdc43ac9bab9c0c1cd5cac380c480cb32224",
+    "three_affected_files_byte_identical": true,
+    "note": "Existing history is preserved by merge; the upstream implementation contributes no duplicate PR diff."
+  },
+  "resolutions": [
+    "Keep upstream batched ZMQ request polling; preserve native transient/protocol error frames in the extracted request handler.",
+    "Use upstream KVEventService and ManagementService names; preserve native profile/identity fields and declare allocation messages only in ManagementService.",
+    "Keep native cache-layout test fixtures layered on the byte-identical upstream MultiConnector implementation.",
+    "Regenerate all protobuf outputs, removing obsolete service descriptors; tracked protobuf stubs are unchanged.",
+    "Update current build metadata to the merged upstream base and its MultiConnector squash; preserve original measured evidence pins."
+  ],
+  "checked_source_sha256": {
+    "lmcache/v1/multiprocess/transport/zmq_impl/mq.py": "f745c17b3da4588b60c2c94e2fdefe66f01da5a6e1fa580c239fb548b8fec200",
+    "lmcache/v1/multiprocess/transport/grpc_impl/protos/kv_event_service.proto": "455a02e500693cad485fdde7a39ee88aaabc7e86c8f53c049056b290a37e5d0e",
+    "tests/v1/test_mp_connector_kv_roles.py": "c9a27281004060a956d83cacd0ee7c8ce3eb57cec0a58d192100c9b66eaac5b2",
+    "tests/e2e/mp_kv_events/versions.lock.yaml": "b0ab33d2f2f424577174e0cce13a4290d6e60a7221499f9876f02b755d65898f"
+  },
+  "checks": {
+    "mq_native_subscriber": {
+      "status": "PASS",
+      "passed": 68,
+      "skipped": [
+        {
+          "test": "tests.v1.multiprocess.test_mq::test_mq_register_kv_cache",
+          "reason": "requires available CUDA runtime"
+        }
+      ],
+      "junit": {
+        "path": "/mnt/nvme1/dongjoo-mp-kv-events/dev-merge-20261015/mp-transport-native.xml",
+        "sha256": "dd00ecad9b0c73a57f9faa4a4a06a9f167c4ac400ab7236248e71f08fbd401f2"
+      },
+      "log": {
+        "path": "/mnt/nvme1/dongjoo-mp-kv-events/dev-merge-20261015/mp-transport-native.log",
+        "sha256": "703936531e422dc0f27b5c9838f1223785827b5a55856ab26d96dab28f78202a"
+      }
+    },
+    "grpc_transport": {
+      "status": "PASS",
+      "passed": 10,
+      "skipped": [],
+      "junit": {
+        "path": "/mnt/nvme1/dongjoo-mp-kv-events/dev-merge-20261015/grpc-transport.xml",
+        "sha256": "5d243f662ea294b18195eea3e9840bc3da16365e5697f22fa3a06ff8cae365e9"
+      },
+      "log": {
+        "path": "/mnt/nvme1/dongjoo-mp-kv-events/dev-merge-20261015/grpc-transport.log",
+        "sha256": "ec06caac2c2f1c0491c0c39eb2905618755c2c452afecc6765e7133a4cd9f76e"
+      }
+    },
+    "vllm_adapter_and_roles": {
+      "status": "PASS",
+      "passed": 166,
+      "skipped": [],
+      "junit": {
+        "path": "/mnt/nvme1/dongjoo-mp-kv-events/dev-merge-20261015/vllm-focused.xml",
+        "sha256": "7f7aaf7a8a199b6a0a619c283d41fe8a2e345b2eaa3f4759209c1c2440da8532"
+      },
+      "log": {
+        "path": "/mnt/nvme1/dongjoo-mp-kv-events/dev-merge-20261015/vllm-focused.log",
+        "sha256": "f20a4363a0c8c8d4d7995859552dc97514b75e9ec9c9bf10a0a8f749f117e5cf"
+      }
+    },
+    "harness_unit": {
+      "status": "PASS",
+      "passed": 42,
+      "log": {
+        "path": "/mnt/nvme1/dongjoo-mp-kv-events/dev-merge-20261015/harness-unit.log",
+        "sha256": "93fe5df5b210c75bfc6467257e9bf779b949251a7148c13a0a2979c78f44f242"
+      }
+    },
+    "merge_resolution_hooks": {
+      "status": "PASS",
+      "log": {
+        "path": "/mnt/nvme1/dongjoo-mp-kv-events/dev-merge-20261015/merge-hooks.log",
+        "sha256": "94f95a983d99b93b7b7cf24cc79f9815f17e442bf3fa61a3c93a0a8943df3fba"
+      }
+    }
+  },
+  "grpc_descriptor_audit": {
+    "path": "/mnt/nvme1/dongjoo-mp-kv-events/dev-merge-20261015/grpc-descriptor-audit.json",
+    "sha256": "2eacae95d007a832bb922a1a4eccb37591e651407ac4ad6adbc991b9e97bf711"
+  },
+  "vllm_environment": {
+    "path": "/mnt/nvme1/dongjoo-mp-kv-events/dev-merge-20261015/vllm-environment.json",
+    "sha256": "ddf2dfae8ab731f6f591e53a9a0858e3bf1ce6a8218520af32d7f138ce2587a4"
+  },
+  "vllm_command": {
+    "path": "/mnt/nvme1/dongjoo-mp-kv-events/dev-merge-20261015/vllm-focused-command.json",
+    "sha256": "10f4c7e7e6a6e7b355e6a5f397e9b07d63bfd19787b34ea32611dcc3d2d6f8a5"
+  },
+  "limits": [
+    "Focused tests run without GPUs. One CUDA-runtime-dependent registration test is skipped.",
+    "The full GPU serving matrix and overhead pair were not rerun after this merge; acceptance.json retains historical source pins and results.",
+    "Strict Sphinx build was not repeated after this merge; earlier baseline diagnostics describe the pre-merge revision.",
+    "Renamed upstream gRPC service paths require matching regenerated client and server bindings.",
+    "First vLLM invocation used an unavailable explicit CPU backend and failed during conftest setup; the passing invocation uses ordinary no-GPU fallback. Both logs are preserved in the archive."
+  ]
+}
