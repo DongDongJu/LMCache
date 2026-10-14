@@ -11,6 +11,7 @@ by SGLang; the selected transfer context moves their KV data.
 from __future__ import annotations
 
 # Standard
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 import hashlib
 import logging
@@ -27,6 +28,17 @@ from lmcache.integration.sglang.lmcache_mp_metadata import (
     LMCacheLookupOperation,
     LMCacheStoreOperation,
     SGLangKVComponentGroup,
+)
+from lmcache.utils import CacheEvent, CacheRemoveEvent
+from lmcache.v1.multiprocess.custom_types import (
+    KV_EVENT_CAPABILITY,
+    EventBinding,
+    KVEventProfile,
+)
+from lmcache.v1.multiprocess.kv_event_subscriber import (
+    KVEventReset,
+    MPKVEventSubscriber,
+    apply_kv_event_record,
 )
 
 if TYPE_CHECKING:
@@ -68,6 +80,8 @@ class UnifiedLMCacheMPConnector:
         self,
         *,
         config_file: Optional[str],
+        enable_kv_events: bool = False,
+        dynamo_format: bool = False,
         model_config: Any,
         tp_size: int,
         tp_rank: int,
@@ -313,7 +327,47 @@ class UnifiedLMCacheMPConnector:
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_lock = threading.Lock()
 
+        self.event_profile: KVEventProfile | None = None
+        self._kv_event_subscriber: MPKVEventSubscriber | None = None
+        self._announced_kv_hashes: set[bytes | int] = set()
+        self._kv_event_error: str | None = None
         self.chunk_size = self._get_chunk_size()
+        if enable_kv_events:
+            if (
+                self.mla_only
+                or tp_size not in (1, 2)
+                or pp_size != 1
+                or model_config.speculative_algorithm is not None
+                or any(
+                    group.recurrent_state or group.sliding_window_size >= 0
+                    for group in self._kv_groups
+                )
+            ):
+                raise ValueError(
+                    "MP KV events require dense full attention, TP=1/2, PP=1, "
+                    "and no speculation"
+                )
+            if self.chunk_size % self.page_size:
+                raise ValueError(
+                    "LMCache chunks must contain complete native SGLang pages"
+                )
+            capabilities = self._req_client.get_experimental().result(
+                timeout=self._mq_timeout
+            )
+            if KV_EVENT_CAPABILITY not in capabilities:
+                raise ValueError(f"MP KV events require {KV_EVENT_CAPABILITY}")
+            self.event_profile = KVEventProfile(
+                profile_id=f"sglang-native-v1:sha256:signed-int64:dynamo={int(dynamo_format)}:B={self.page_size}",
+                block_size=self.page_size,
+            )
+            if self._lookup_leader:
+                self._kv_event_subscriber = MPKVEventSubscriber(
+                    self._req_client,
+                    self.instance_id,
+                    self.model_name,
+                    world_size=self.kv_world_size,
+                    profile=self.event_profile,
+                )
         if self.chunk_size <= 0 or any(
             self.chunk_size % group.tokens_per_block for group in self._kv_groups
         ):
@@ -540,6 +594,15 @@ class UnifiedLMCacheMPConnector:
             req_client=self._req_client,
             mode=self._mp_transfer_mode,
         )
+        if self.event_profile is not None:
+            # First Party
+            from lmcache.v1.multiprocess.transfer_context import (
+                LMCacheDrivenTransferContext,
+            )
+
+            if not isinstance(transfer_ctx, LMCacheDrivenTransferContext):
+                transfer_ctx.close()
+                raise ValueError("MP KV events require LMCache-driven device transfer")
         self._transfer_ctx = transfer_ctx
         engine_group_infos = [
             EngineGroupInfo(**spec) for spec in self._engine_group_info_specs
@@ -554,7 +617,10 @@ class UnifiedLMCacheMPConnector:
                 layout_hints={"kv_list_layout": "unified"},
                 engine_group_infos=engine_group_infos,
                 engine_type=EngineType.SGLANG,
+                event_profile=self.event_profile,
             )
+            if self._kv_event_subscriber is not None:
+                self._kv_event_subscriber.start(timeout=self._mq_timeout)
         except Exception:
             try:
                 future = transfer_ctx.unregister()
@@ -632,6 +698,8 @@ class UnifiedLMCacheMPConnector:
         cache_salt: str,
     ) -> LMCacheLookupOperation:
         self._ensure_heartbeat_started()
+        if self.event_profile is not None and cache_salt:
+            raise ValueError("MP KV events do not support salted request namespaces")
 
         operation = LMCacheLookupOperation(
             request_id=request_id,
@@ -1023,8 +1091,11 @@ class UnifiedLMCacheMPConnector:
         *,
         device_indices_start: int,
         cache_salt: str,
+        event_bindings: tuple[EventBinding, ...] = (),
     ) -> Optional[LMCacheStoreOperation]:
         self._ensure_heartbeat_started()
+        if self.event_profile is not None and (cache_salt or not event_bindings):
+            raise ValueError("Event-enabled STORE requires unsalted native bindings")
 
         aligned_end = len(token_ids) // self.chunk_size * self.chunk_size
         start = self.get_store_start(request_id, aligned_end)
@@ -1108,6 +1179,12 @@ class UnifiedLMCacheMPConnector:
                 key = self._create_key(
                     lookup, start=start, end=aligned_end, worker_id=self.kv_worker_id
                 )
+                if self.event_profile is not None:
+                    key = replace(
+                        key,
+                        event_profile=self.event_profile,
+                        event_bindings=event_bindings,
+                    )
                 event = transfer_ctx.create_recorded_event()
                 future = transfer_ctx.submit_store(
                     request_id,
@@ -1221,10 +1298,43 @@ class UnifiedLMCacheMPConnector:
             success = False
         return self._sync_success(success)
 
+    def get_kv_events(self) -> list[CacheEvent]:
+        """Drain committed CPU transitions from SGLang's scheduler thread.
+
+        The subscriber never touches the native recorder or publisher. Loss
+        withdraws only CPU identities advertised by this attachment; protocol
+        errors become visible on the next drain after removals are returned.
+        """
+        if self._kv_event_error is not None:
+            raise RuntimeError(self._kv_event_error)
+        subscriber = self._kv_event_subscriber
+        if subscriber is None:
+            return []
+        self._ensure_heartbeat_started()
+        subscriber.start()
+        events: list[CacheEvent] = []
+        announced = self._announced_kv_hashes
+        for update in subscriber.drain():
+            if isinstance(update, KVEventReset):
+                if announced:
+                    events.append(
+                        CacheRemoveEvent(block_hashes=sorted(announced), medium="CPU")
+                    )
+                    announced.clear()
+                self._kv_event_error = update.error
+                continue
+            for record in update.events:
+                event = apply_kv_event_record(record, announced)
+                if event is not None:
+                    events.append(event)
+        return events
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        if self._kv_event_subscriber is not None:
+            self._kv_event_subscriber.close()
         self.end_all_sessions()
         self._flush_control_futures()
         self._heartbeat_stop.set()
