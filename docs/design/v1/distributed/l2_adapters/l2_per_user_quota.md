@@ -800,7 +800,7 @@ it through. Update serialization. No behavioral change with `cache_salt=""`.
 | `lmcache/v1/multiprocess/server.py` | No code changes — existing `ipc_key_to_object_keys(key, chunk_hashes)` calls now carry salt automatically |
 | `lmcache/integration/vllm/vllm_multi_process_adapter.py` | Scheduler + worker `_create_key()` now forward `cache_salt` to `IPCCacheServerKey` |
 | `lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py` | `_object_key_to_string()` appends trailing `@<cache_salt>` when salted; un-salted output is unchanged |
-| `lmcache/v1/distributed/l2_adapters/fs_l2_adapter.py` | `_object_key_to_filename()` / `_filename_to_object_key()` accept 3-field (unsalted) or 4-field (salted) shapes |
+| `lmcache_l2_plugins.fs` (companion package) | `_object_key_to_filename()` / `_filename_to_object_key()` accept 4-field (unsalted) or 5-field (salted) shapes |
 | `csrc/storage_backends/fs/connector.cpp` | `key_to_filename()` splits on `@` and dispatches by field count |
 
 ### PR3 — LMCache: Adapter interface refactor (LMCache repo)

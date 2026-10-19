@@ -43,7 +43,7 @@ from lmcache.v1.platform import create_event_notifier
 logger = init_logger(__name__)
 
 
-# Key separator — kept in sync with fs_l2_adapter.py and
+# Key separator — kept in sync with lmcache_l2_plugins.fs and
 # csrc/storage_backends/fs/connector.cpp. Both ``@`` in ``model_name``
 # and ``@`` in ``cache_salt`` are rejected by ObjectKey.__post_init__
 # so splitting on ``@`` is unambiguous.

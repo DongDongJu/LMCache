@@ -36,13 +36,10 @@ if not torch_dev.is_available():
         allow_module_level=True,
     )
 
-# First Party
-# Needs the native extension, which is only built alongside an
-# accelerator device — import after the module-level skip so CPU-only
-# environments can still collect this module.
-from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (  # noqa: E402
-    FSL2AdapterConfig,
-)
+FSL2AdapterConfig = pytest.importorskip(
+    "lmcache.v1.distributed.l2_adapters.fs_l2_adapter",
+    reason="requires lmcache-l2-plugins and lmcache.lmcache_native",
+).FSL2AdapterConfig
 
 SERVER_PORT = 15599
 STARTUP_TIMEOUT_SECONDS = 90.0

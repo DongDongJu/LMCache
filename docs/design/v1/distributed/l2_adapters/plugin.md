@@ -10,6 +10,30 @@ and is loaded at runtime via the `PluginL2AdapterConfig` mechanism.
 This is the recommended way to integrate external storage systems (e.g.
 NitroFS, custom distributed caches) into LMCache's MP-mode L2 pipeline.
 
+### Filesystem adapter migration
+
+The Python filesystem implementation and its config now live in the companion
+`lmcache-l2-plugins` package as `lmcache_l2_plugins.fs`. Core's
+`fs_l2_adapter.py` only re-exports the original classes and filename helpers
+and registers the legacy `fs` type and factory. Install the companion package
+to use `fs`; the other adapters remain independent of this installation.
+
+The existing plugin loader also accepts:
+
+```json
+{
+  "type": "plugin",
+  "module_path": "lmcache_l2_plugins.fs",
+  "class_name": "FSL2Adapter",
+  "adapter_params": {"base_path": "/tmp/lmcache-l2"}
+}
+```
+
+Config discovery finds `FSL2AdapterConfig` by convention. The adapter accepts
+framework keyword arguments, including `l1_memory_desc`, without using them:
+filesystem I/O accesses the supplied objects' byte buffers directly. No loader
+or on-disk format changes are required. `fs_native` remains in core for now.
+
 ---
 
 ## Key Components

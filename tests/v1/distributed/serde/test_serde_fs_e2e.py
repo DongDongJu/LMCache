@@ -31,13 +31,16 @@ from lmcache.v1.distributed.config import (
     StorageManagerConfig,
 )
 from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
-from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2AdapterConfig
 from lmcache.v1.distributed.serde import SerdeConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.platform import current_device_spec
 
 # Test helpers
 from tests.v1.distributed.utils import single_row_spec
+
+FSL2AdapterConfig = pytest.importorskip(
+    "lmcache.v1.distributed.l2_adapters.fs_l2_adapter"
+).FSL2AdapterConfig
 
 if not torch_dev.is_available():
     pytest.skip(

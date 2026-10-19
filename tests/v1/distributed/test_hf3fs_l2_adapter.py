@@ -33,9 +33,6 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
-from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
-    _object_key_to_filename,
-)
 from lmcache.v1.distributed.l2_adapters.hf3fs_l2_adapter import Hf3fsL2AdapterConfig
 from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
     _object_key_to_string,
@@ -731,6 +728,7 @@ class TestHf3fsNativeConnector:
         self, hf3fs_native_client: tuple["LMCacheHf3fsClient", str, str]
     ) -> None:
         """Concurrent writers publish one complete value without leftover files."""
+        fs = pytest.importorskip("lmcache_l2_plugins.fs")
         client, _, base_path = hf3fs_native_client
         object_key = create_object_key(1102)
         key = _object_key_to_string(object_key)
@@ -743,7 +741,7 @@ class TestHf3fsNativeConnector:
         client.submit_batch_get([key], [memoryview(result)])
         assert _wait_for_completions(client)[0][3] == [True]
         assert bytes(result) in payloads
-        path = Path(base_path) / _object_key_to_filename(object_key)
+        path = Path(base_path) / fs._object_key_to_filename(object_key)
         assert list(Path(base_path).iterdir()) == [path]
 
     def test_single_put_get_roundtrip(self, hf3fs_native_client):
@@ -947,12 +945,14 @@ class TestHf3fsNativeConnector:
         # First Party
         from lmcache.lmcache_hf3fs import LMCacheHf3fsClient
 
+        fs = pytest.importorskip("lmcache_l2_plugins.fs")
+
         def _seed_file(directory: Path, key: ObjectKey) -> None:
             """Write a key's .data file directly using the shared canonical
             filename encoding. Files are written straight into each path
             (bypassing hash-based placement) so the constructor scan must
             discover them in every base_path."""
-            (directory / _object_key_to_filename(key)).write_bytes(b"\x00")
+            (directory / fs._object_key_to_filename(key)).write_bytes(b"\x00")
 
         mp = Path(_HF3FS_MOUNT_POINT)
         n_paths = 5

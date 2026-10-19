@@ -28,8 +28,8 @@ from lmcache.v1.distributed.config import (
     StorageManagerConfig,
 )
 from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
-from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2AdapterConfig
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import MockL2AdapterConfig
+from lmcache.v1.distributed.l2_adapters.plugin_l2_adapter import PluginL2AdapterConfig
 from lmcache.v1.distributed.serde import (
     SerdeConfig,
     create_serde_processor,
@@ -554,10 +554,11 @@ def _make_turboquant_fs_storage_manager(
     base_path: str,
     preset: str,
 ) -> StorageManager:
-    adapter_cfg = FSL2AdapterConfig(
-        base_path=base_path,
-        relative_tmp_dir="tmp",
-        use_odirect=False,
+    pytest.importorskip("lmcache_l2_plugins.fs")
+    adapter_cfg = PluginL2AdapterConfig(
+        module_path="lmcache_l2_plugins.fs",
+        class_name="FSL2Adapter",
+        adapter_params={"base_path": base_path, "relative_tmp_dir": "tmp"},
     )
     adapter_cfg.serde_config = SerdeConfig(
         type="turboquant",

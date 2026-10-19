@@ -793,11 +793,10 @@ class TestMPUsage:
         assert message.lmcache_version
 
     def test_mp_server_message_serde_and_segmented_prefix(self, usage_env, tmp_path):
-        # The FS adapter needs the native storage ops extension; skip on
-        # builds without it.
+        # The FS adapter needs the companion plugin and native storage ops.
         fs_l2_adapter = pytest.importorskip(
             "lmcache.v1.distributed.l2_adapters.fs_l2_adapter",
-            reason="requires lmcache.lmcache_native",
+            reason="requires lmcache-l2-plugins and lmcache.lmcache_native",
         )
         serde = pytest.importorskip(
             "lmcache.v1.distributed.serde",
