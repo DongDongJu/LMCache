@@ -27,11 +27,12 @@ TP1/TP2 and C divisible by B are validated;
 salted keys, L2, GDS and incompatible profiles fail explicitly. Private
 CPU-addressable Device-DAX uses the same L1 commitment notifications; the DRAM
 acceptance matrix does not establish Device-DAX hardware validation. Engine
-connectors reject unsupported model, topology and request namespaces before
-STORE. vLLM uses the companion class-level `validate_kv_event_request` hook in
-frontend admission, gated on explicitly enabled KV events. MultiConnector
-forwards it to each configured child; no worker connector is constructed there.
-Unsupported requests raise `VLLMValidationError` before EngineCore enqueue.
+connectors reject unsupported model and topology configurations at startup.
+vLLM uses its existing connector hooks without an engine patch. Requests with
+salted, LoRA, multimodal, embedding or session namespaces retain ordinary caching
+without native event bindings. An absent hash source is distinct from a supported
+request's empty hash list, which still must cover every advertised chunk.
+SGLang's companion integration rejects unsupported namespaces before admission.
 
 The event module keys bindings by `(model, world_size, cache_salt, chunk_hash)`.
 `bind_store` validates conflicts synchronously. The existing EventBus joins those

@@ -953,13 +953,16 @@ def test_lazy_store_kv_events_preserve_completion_and_failure_reporting(
         adapter.shutdown()
 
 
-def test_native_event_store_requires_scheduler_binding(fake_adapter: tuple) -> None:
+def test_store_without_native_binding_keeps_ordinary_cache_path(
+    fake_adapter: tuple,
+) -> None:
     adapter, _, _ = _event_adapter(fake_adapter)
     try:
         adapter.transfer_ctx = MagicMock()
-        with pytest.raises(ValueError, match="scheduler native bindings"):
-            adapter.submit_store_request("req-1", _op([[0]]), None)
-        adapter.transfer_ctx.submit_store.assert_not_called()
+        adapter.submit_store_request("req-1", _op([[0]]), None)
+        key = adapter.transfer_ctx.submit_store.call_args.args[1]
+        assert key.event_profile is None and key.event_bindings == ()
+        assert adapter.get_kv_events() == []
     finally:
         adapter.shutdown()
 

@@ -30,7 +30,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (  # noqa: E402
     MultiConnector,
 )
-from vllm.exceptions import VLLMValidationError  # noqa: E402
 from vllm.v1.core.sched.output import SchedulerOutput  # noqa: E402
 from vllm.v1.kv_cache_interface import (  # noqa: E402
     FullAttentionSpec,
@@ -159,6 +158,11 @@ def _request(request_id: str = "request") -> Request:
             status=RequestStatus.WAITING,
             num_computed_tokens=0,
             kv_transfer_params=None,
+            lora_request=None,
+            mm_features=[],
+            prompt_embeds=None,
+            prompt_token_ids=list(range(12)),
+            block_hashes=[],
         ),
     )
 
@@ -204,9 +208,6 @@ def lazy_offload(request: pytest.FixtureRequest) -> bool:
 @pytest.fixture
 def mock_io(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     """Stub transport, telemetry and GPU resources, keeping worker logic real."""
-    monkeypatch.setattr(
-        KVConnectorBase_V1, "validate_kv_event_request", MagicMock(), raising=False
-    )
     scheduler = MagicMock(lmcache_tokens_per_chunk=4)
     scheduler.check_lookup_result.return_value = 0
     transfer = MagicMock()
@@ -861,51 +862,64 @@ def test_store_bindings_match_native_gpu_block_pool_events(
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_native_event_startup_requires_frontend_admission_hook(
+def test_native_event_startup_uses_stock_connector_hooks(
     mock_io: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, enabled: bool
 ) -> None:
-    """Unpatched vLLM is rejected only when the native event profile is enabled."""
-    monkeypatch.delattr(KVConnectorBase_V1, "validate_kv_event_request")
+    """Native CPU events require no companion vLLM admission hook."""
+    monkeypatch.delattr(KVConnectorBase_V1, "validate_kv_event_request", raising=False)
     config = _config(
         KVTransferConfig(kv_connector="LMCacheMPConnector", kv_role="kv_both")
     )
     cast(Any, config).kv_events_config = SimpleNamespace(enable_kv_cache_events=enabled)
-    if enabled:
-        with pytest.raises(ValueError, match="admission-validation hook"):
-            LMCacheMPConnector(config, KVConnectorRole.SCHEDULER, _event_cache_config())
-    else:
-        connector = LMCacheMPConnector(
-            config, KVConnectorRole.SCHEDULER, _event_cache_config()
-        )
-        connector.shutdown()
+    connector = LMCacheMPConnector(
+        config, KVConnectorRole.SCHEDULER, _event_cache_config()
+    )
+    connector.shutdown()
 
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize(
     "field",
-    ["cache_salt", "lora_request", "mm_features", "prompt_embeds", "session_id"],
+    [None, "cache_salt", "lora_request", "mm_features", "prompt_embeds", "session_id"],
 )
-def test_native_namespace_policy_runs_without_connector_construction(
+def test_request_namespaces_preserve_caching_and_scope_native_bindings(
+    mock_io: SimpleNamespace,
     enabled: bool,
-    field: str,
+    field: str | None,
 ) -> None:
-    """Admission validation raises a request-level vLLM error only when enabled."""
+    """Requests outside the event profile retain ordinary lookup and STORE."""
     config = _config(
         KVTransferConfig(kv_connector="LMCacheMPConnector", kv_role="kv_both")
     )
     cast(Any, config).kv_events_config = SimpleNamespace(enable_kv_cache_events=enabled)
     request = _request()
-    for namespace in (
-        "cache_salt",
-        "lora_request",
-        "mm_features",
-        "prompt_embeds",
-        "session_id",
-    ):
-        setattr(request, namespace, None)
-    setattr(request, field, "unsupported")
-    if enabled:
-        with pytest.raises(VLLMValidationError, match="MP KV events"):
-            LMCacheMPConnector.validate_kv_event_request(config, request)
-    else:
-        LMCacheMPConnector.validate_kv_event_request(config, request)
+    request.block_hashes.extend([b"a" * 32, b"b" * 32, b"c" * 32])
+    if field is not None:
+        setattr(
+            request,
+            field,
+            [
+                SimpleNamespace(
+                    identifier="a" * 64, mm_position=SimpleNamespace(offset=0, length=4)
+                )
+            ]
+            if field == "mm_features"
+            else "unsupported",
+        )
+    scheduler = LMCacheMPConnector(
+        config, KVConnectorRole.SCHEDULER, _event_cache_config()
+    )
+    try:
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+        scheduler.update_state_after_alloc(
+            request, MagicMock(get_block_ids=lambda: ([1, 2, 3],)), 0
+        )
+        for new in (True, False):
+            metadata = scheduler.build_connector_meta(_schedule(num_tokens=4, new=new))
+            assert len(metadata.requests) == 1
+            assert bool(metadata.requests[0].op.event_bindings) == (
+                enabled and field is None
+            )
+            assert metadata.requests[0].cache_salt == request.cache_salt
+    finally:
+        scheduler.shutdown()

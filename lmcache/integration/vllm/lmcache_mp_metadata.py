@@ -91,7 +91,8 @@ class LMCacheMPRequestTracker:
     pending_free_ranges: list[tuple[int, int]] = field(default_factory=list)
 
     mm_adjusted_prompt_ids: list[int] = field(default_factory=list)
-    native_block_hashes: list[bytes] = field(default_factory=list)
+    native_block_hashes: list[bytes] | None = None
+    """Live engine hashes; None keeps requests outside the native event profile."""
 
     def __init__(self, request: "Request"):
         self.request_id = request.request_id
@@ -112,7 +113,7 @@ class LMCacheMPRequestTracker:
         self.pending_free_ranges = []
         self.state = LMCacheMPRequestState.PREFETCHING
         self.mm_adjusted_prompt_ids = []
-        self.native_block_hashes = []
+        self.native_block_hashes = None
         mm_hashes, mm_positions = extract_mm_features(request)
         if mm_hashes and mm_positions:
             prompt_ids = torch.tensor(request.prompt_token_ids)
@@ -264,6 +265,7 @@ class LMCacheMPRequestMetadata:
                 tokens. Defaults to storing only complete chunks within the
                 initial prompt, including when decode fills its partial tail.
             event_profile: Negotiated native identity profile, or disabled.
+                Bindings are omitted when the tracker has no native hash source.
             hash_block_size: Granularity of the scheduler Request.block_hashes.
 
         Returns:
@@ -338,7 +340,7 @@ class LMCacheMPRequestMetadata:
                 end=end_token_idx,
             )
 
-            if event_profile is not None:
+            if event_profile is not None and tracker.native_block_hashes is not None:
                 # Third Party
                 from vllm.v1.core.kv_cache_utils import (
                     maybe_convert_block_hash,

@@ -128,7 +128,6 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-    from vllm.v1.engine import EngineCoreRequest
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -554,40 +553,6 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     # appends. The scheduler role sets it from the vLLM config.
     _mamba_relocation_window: int = 0
 
-    @classmethod
-    def validate_kv_event_request(
-        cls, vllm_config: VllmConfig, request: "EngineCoreRequest | Request"
-    ) -> None:
-        """Reject unsupported native-event namespaces before engine admission.
-
-        Args:
-            vllm_config: The configured engine and KV event settings.
-            request: A frontend request, or its scheduler-side safety check.
-
-        Raises:
-            VLLMValidationError: A native-event request uses a salt, LoRA,
-                multimodal data, embeddings or a session namespace.
-        """
-        events = vllm_config.kv_events_config
-        if (
-            events is not None
-            and events.enable_kv_cache_events
-            and (
-                request.cache_salt
-                or request.lora_request is not None
-                or request.mm_features
-                or request.prompt_embeds is not None
-                or request.session_id is not None
-            )
-        ):
-            # Third Party
-            from vllm.exceptions import VLLMValidationError
-
-            raise VLLMValidationError(
-                "MP KV events do not support salted, LoRA, multimodal, "
-                "embedding or session requests"
-            )
-
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -649,10 +614,6 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self._event_profile: KVEventProfile | None = None
         self._event_hash_block_size = 0
         if self._enable_kv_events:
-            if not hasattr(KVConnectorBase_V1, "validate_kv_event_request"):
-                raise ValueError(
-                    "MP KV events require the vLLM connector admission-validation hook"
-                )
             # Third Party
             from vllm import envs
             from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
@@ -2020,7 +1981,6 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self, request: "Request"
     ) -> LMCacheMPRequestTracker:
         request_id = request.request_id
-        self.validate_kv_event_request(self._vllm_config, request)
         # Remove the old trackers that is created before the preemption
         if (
             request.status == RequestStatus.PREEMPTED
@@ -2046,7 +2006,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 for session_id in actions.sessions_to_end:
                     self.scheduler_adapter.end_session(session_id)
             new_tracker = LMCacheMPRequestTracker(request)
-            if self._enable_kv_events:
+            if self._enable_kv_events and not (
+                request.cache_salt
+                or request.lora_request is not None
+                or request.mm_features
+                or request.prompt_embeds is not None
+                or getattr(request, "session_id", None) is not None
+            ):
                 # Request appends native hashes as decode progresses; retaining
                 # its list avoids rebuilding the prompt hash on every step.
                 new_tracker.native_block_hashes = request.block_hashes

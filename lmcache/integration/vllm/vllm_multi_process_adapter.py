@@ -681,7 +681,7 @@ class LoadStoreOp:
     range. Used to avoid overwriting APC-shared GPU blocks during retrieve."""
 
     event_bindings: tuple[EventBinding, ...] = ()
-    """Native identities prepared by the scheduler for each STORE chunk."""
+    """Native identities for each STORE chunk; empty means ordinary caching."""
 
     @property
     def flat_block_ids(self) -> list[int]:
@@ -1934,11 +1934,7 @@ class LMCacheMPWorkerAdapter:
             cache_salt=cache_salt,
             request_configs=request_configs,
         )
-        if self._kv_events_enabled:
-            if not op.event_bindings:
-                raise ValueError(
-                    "Event-enabled STORE requires scheduler native bindings"
-                )
+        if self._kv_events_enabled and op.event_bindings:
             key = replace(
                 key, event_profile=self._event_profile, event_bindings=op.event_bindings
             )
