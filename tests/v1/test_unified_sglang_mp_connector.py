@@ -2,6 +2,7 @@
 """Small, server-free tests for the unified SGLang MP connector contracts."""
 
 # Standard
+from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 import unittest
@@ -77,6 +78,17 @@ class _IPCCacheServerKey:
         self.__dict__.update(kwargs)
 
 
+def _connector_without_io() -> UnifiedLMCacheMPConnector:
+    """Set event defaults when a test supplies its own transfer/client state."""
+    connector = object.__new__(UnifiedLMCacheMPConnector)
+    connector.kv_worker_id = 0
+    connector.event_profile = None
+    connector._kv_event_subscriber = None
+    connector._kv_event_error = None
+    connector._announced_kv_hashes = set()
+    return connector
+
+
 class TestUnifiedLMCacheMPConnector(unittest.TestCase):
     def setUp(self):
         heartbeat_patcher = patch.object(
@@ -84,7 +96,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         )
         heartbeat_patcher.start()
         self.addCleanup(heartbeat_patcher.stop)
-        self.connector = object.__new__(UnifiedLMCacheMPConnector)
+        self.connector = _connector_without_io()
         self.connector.page_size = 4
 
     def test_init_converts_chunk_tokens_to_sglang_blocks(self) -> None:
@@ -217,7 +229,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         )
 
     def test_readiness_polling_failure_still_reaches_collective(self) -> None:
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector._store_submitted_tokens = {"request": 8}
         future = Mock()
         future.query.side_effect = RuntimeError("injected query failure")
@@ -243,7 +255,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
             self.assertEqual(connector._store_submitted_tokens["request"], 0)
 
     def test_register_kv_cache_uses_context_owned_identity_and_client(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector._registered = False
         connector._transfer_ctx = None
         connector._kv_caches = {"kv_0": torch.empty(1)}
@@ -279,6 +291,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
             layout_hints={"kv_list_layout": "unified"},
             engine_group_infos=[],
             engine_type=EngineType.SGLANG,
+            event_profile=None,
         )
         self.assertIs(connector._transfer_ctx, transfer_ctx)
         self.assertTrue(connector._registered)
@@ -457,7 +470,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertEqual(wire.data_ptr(), tensor.data_ptr())
 
     def test_group_info_specs_preserve_component_address_spaces(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector.page_size = 4
         connector._kv_groups = (
             SGLangKVComponentGroup(
@@ -490,7 +503,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertEqual([spec["sw_size_tokens"] for spec in specs], [-1, 8, 8])
 
     def test_group_info_specs_mark_mamba_as_recurrent_one_block_window(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector._kv_groups = (
             SGLangKVComponentGroup(
                 "mamba",
@@ -510,7 +523,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertTrue(specs[0]["recurrent_state"])
 
     def test_group_info_specs_keep_dsa_sidecar_in_full_address_space(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector._kv_groups = (
             SGLangKVComponentGroup(
                 "full",
@@ -583,7 +596,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertTrue(torch.equal(tensors[6].reshape(-1), c2_index[:6].reshape(-1)))
 
     def test_submit_store_passes_list_of_block_ids_per_group(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector.page_size = 4
         connector.chunk_size = 8
         connector.blocks_in_chunk = 2
@@ -623,8 +636,47 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         )
         self.assertEqual(connector._create_key.call_args.kwargs["worker_id"], 0)
 
+    def test_native_store_carries_exact_binding_and_ignores_partial_tail(self):
+        # First Party
+        from lmcache.v1.multiprocess.custom_types import EventBinding, KVEventProfile
+
+        connector = _connector_without_io()
+        connector.page_size = 4
+        connector.chunk_size = 8
+        connector.blocks_in_chunk = 2
+        connector.model_name = "native-model"
+        connector.kv_world_size = 1
+        connector.num_kv_readers = 1
+        connector.event_profile = KVEventProfile("sglang-native", 4)
+        connector._kv_groups = (
+            SGLangKVComponentGroup("full", (), tokens_per_block=4, slots_per_block=4),
+        )
+        connector._kernel_group_to_engine_group = (0,)
+        connector._store_submitted_tokens = {}
+        connector._active_sessions = set()
+        connector._kv_caches = {}
+        connector._transfer_ctx = _TransferContext()
+        connector._is_kv_writer = True
+        connector._sync_success = lambda success: success
+        connector._sync_leader_int = lambda value: value
+        binding = EventBinding("sglang-native", (-1, 23), None, tuple(range(8)), 4)
+        operation = connector.submit_store(
+            "native-request",
+            list(range(11)),
+            [torch.arange(4, 12)],
+            device_indices_start=0,
+            cache_salt="",
+            event_bindings=(binding,),
+        )
+        self.assertEqual(operation.end, 8)
+        key = connector._transfer_ctx.store_args[1]
+        self.assertEqual(key.event_bindings, (binding,))
+        self.assertEqual(key.event_profile, connector.event_profile)
+        self.assertEqual((key.start, key.end), (0, 8))
+        self.assertEqual(connector.get_kv_events(), [])
+
     def test_get_store_start_uses_remote_progress(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector.chunk_size = 8
         connector._store_submitted_tokens = {"request": 12}
 
@@ -633,7 +685,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertEqual(connector.get_store_start("request", 4), 0)
 
     def test_submit_store_accepts_suffix_indices_after_cached_prefix(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector.page_size = 4
         connector.chunk_size = 8
         connector.blocks_in_chunk = 2
@@ -676,7 +728,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         )
 
     def test_mla_non_writer_uses_collective_placeholder(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector.page_size = 4
         connector.chunk_size = 8
         connector.blocks_in_chunk = 2
@@ -711,7 +763,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertIn("request", connector._active_sessions)
 
     def test_submit_store_accepts_all_null_historical_swa_chunk(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector.page_size = 4
         connector.chunk_size = 8
         connector.blocks_in_chunk = 2
@@ -756,7 +808,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         )
 
     def test_submit_store_defers_partly_unmapped_retained_swa_chunk(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector.page_size = 4
         connector.chunk_size = 8
         connector._kv_groups = (
@@ -791,7 +843,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertNotIn("request", connector._store_submitted_tokens)
 
     def test_submit_store_accepts_dummy_mamba_blocks(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector.page_size = 1
         connector.chunk_size = 8
         connector.blocks_in_chunk = 8
@@ -834,7 +886,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         )
 
     def test_submit_load_uses_compressed_mamba_block_ids(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector.page_size = 1
         connector.chunk_size = 8
         connector.blocks_in_chunk = 8
@@ -886,7 +938,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertEqual(operation.end, 8)
 
     def test_prepare_load_orders_forward_stream_without_completing_future(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector._mq_timeout = 10
         connector._sync_success = lambda success: success
         lookup = LMCacheLookupOperation(
@@ -915,7 +967,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertTrue(lookup.locks_held)
 
     def test_prepare_load_drains_failed_retrieve_before_releasing_slots(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector._mq_timeout = 10
         connector._sync_success = lambda success: success
         lookup = LMCacheLookupOperation(
@@ -949,7 +1001,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertFalse(operation.result)
 
     def test_free_lookup_locks_sends_one_leader_prefix_range(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector._lookup_leader = True
         connector.kv_world_size = 2
         connector._req_client = Mock()
@@ -976,7 +1028,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.assertIs(connector._lookups["request"], lookup)
 
     def test_complete_load_relies_on_retrieve_to_release_read_locks(self):
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector._sync_success = lambda success: success
         connector._free_lookup_locks = Mock()
         lookup = LMCacheLookupOperation(
@@ -1054,3 +1106,58 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
 
         self.assertEqual(key.num_kv_readers, 4)
         self.assertEqual(key.world_size, 1)
+
+
+class TestNativeCPUEvents(unittest.TestCase):
+    """Committed CPU transitions are drained and invalidated on the caller."""
+
+    def test_order_exact_descriptors_and_terminal_withdrawal(self):
+        # First Party
+        from lmcache.utils import CacheRemoveEvent, CacheStoreEvent
+        from lmcache.v1.multiprocess.custom_types import KVEventBatch, KVEventRecord
+        from lmcache.v1.multiprocess.kv_event_subscriber import KVEventReset
+
+        connector = _connector_without_io()
+        connector._ensure_heartbeat_started = Mock()
+        connector._kv_event_subscriber = subscriber = Mock()
+        stored = KVEventRecord(
+            1,
+            "stored",
+            "CPU",
+            "test",
+            (-1, 23),
+            -7,
+            tuple(range(8)),
+            4,
+            "sglang-native",
+            1,
+        )
+        subscriber.drain.return_value = [
+            KVEventBatch(
+                True,
+                1,
+                3,
+                False,
+                [
+                    stored,
+                    replace(stored, seq=2, kind="removed"),
+                    replace(stored, seq=3),
+                ],
+            )
+        ]
+        events = connector.get_kv_events()
+        self.assertEqual(
+            [type(e) for e in events],
+            [CacheStoreEvent, CacheRemoveEvent, CacheStoreEvent],
+        )
+        self.assertEqual(
+            (events[0].block_size, events[0].parent_block_hash, events[0].token_ids),
+            (4, -7, list(range(8))),
+        )
+        subscriber.drain.return_value = [
+            KVEventReset("protocol_error", "profile mismatch")
+        ]
+        (removed,) = connector.get_kv_events()
+        self.assertEqual((set(removed.block_hashes), removed.medium), ({-1, 23}, "CPU"))
+        with self.assertRaisesRegex(RuntimeError, "profile mismatch"):
+            connector.get_kv_events()
