@@ -208,6 +208,8 @@ BUILD_MOONCAKE=0 \
 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE=0.0.0+ci \
     "${INSTALL_CMD[@]}" --no-deps -e . --no-build-isolation
 
+"${PYTHON_BIN}" tools/run_l2_plugin_tests.py
+
 "${FREEZE_CMD[@]}" > "${ARTIFACT_DIR}/pip-freeze.txt"
 
 log "Verifying LMCache selected the MUSA backend and built native support"

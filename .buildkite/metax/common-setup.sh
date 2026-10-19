@@ -73,6 +73,7 @@ uv pip install "mcpy==3.5.3.3" "triton==3.6.0+metax3.8.2.2" \
     --index-url https://repos.metax-tech.com/r/maca-pypi/simple
 
 BUILD_WITH_MACA=1 uv pip install -e . --no-build-isolation
+python tools/run_l2_plugin_tests.py
 uv pip freeze
 
 # Keep uv's package cache from growing unbounded across builds (pruned here,

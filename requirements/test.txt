@@ -1,5 +1,8 @@
 -r proto.txt
 
+# Install companion L2 plugins after LMCache with tools/run_l2_plugin_tests.py;
+# its --no-deps install preserves the LMCache and device runtime under test.
+
 buildkite-test-collector
 pytest>=7.0,<9.1  # avoid some plugins breaking in 8.x
 pytest-asyncio

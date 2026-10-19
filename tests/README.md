@@ -2,6 +2,34 @@
 
 This document describes the current test layout under `tests/` and the baseline rules for adding new tests.
 
+## Companion L2 plugin tests
+
+Install LMCache and `requirements/test.txt` first, then run:
+
+```bash
+python tools/run_l2_plugin_tests.py
+python -m pytest -q tests/v1/distributed/test_fs_plugin.py
+```
+
+The helper checks out a pinned companion revision, installs it into the current
+Python environment with `--no-deps`, and runs its own tests. This preserves the
+LMCache checkout and device libraries under test. GitHub's main test job and the
+Buildkite unit and MP setup scripts run it automatically before core tests.
+Installation or plugin test failures fail the job.
+
+For changes spanning both repositories, use the local companion checkout:
+
+```bash
+LMCACHE_L2_PLUGINS_PATH=../lmcache_l2_plugins python tools/run_l2_plugin_tests.py
+python -m pytest -q tests/v1/distributed/test_fs_plugin.py
+```
+
+The core integration test imports the plugin directly, so an absent package is
+a collection error. It covers real controller I/O, FP8 serde, fault-injection
+wrapping, runtime removal/re-addition, accounting, and direct-I/O behavior.
+See [the L2 plugin testing guide](../docs/source/developer_guide/testing_l2_plugins.rst)
+for the coverage matrix, prerequisites, and CI pin updates.
+
 ## Current Structure
 
 Top-level test areas:

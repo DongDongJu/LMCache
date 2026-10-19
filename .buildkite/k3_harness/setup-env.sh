@@ -285,6 +285,8 @@ uv pip install -r requirements/proto.txt
 echo "--- :gear: Generating LMCache gRPC bindings"
 python "${REPO_ROOT}/lmcache/v1/multiprocess/transport/grpc_impl/_proto_gen/_generate.py"
 
+python "${REPO_ROOT}/tools/run_l2_plugin_tests.py"
+
 uv pip freeze | sort > /tmp/env-after-lmcache.txt
 if ! diff -q /tmp/env-before-lmcache.txt /tmp/env-after-lmcache.txt >/dev/null; then
     echo "--- :warning: Packages changed during LMCache install"

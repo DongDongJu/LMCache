@@ -18,7 +18,11 @@ conversion. The adapter can also be loaded through the standard plugin loader:
 
 .. code-block:: bash
 
-    --l2-adapter '{"type":"plugin","module_path":"lmcache_l2_plugins.fs","class_name":"FSL2Adapter","adapter_params":{"base_path":"/data/lmcache/l2"}}'
+    lmcache server --l1-size-gb 1 --eviction-policy LRU \
+        --l2-adapter '{"type":"plugin","module_path":"lmcache_l2_plugins.fs","class_name":"FSL2Adapter","adapter_params":{"base_path":"/data/lmcache/l2"}}'
+
+See :doc:`/developer_guide/testing_l2_plugins` for automatic test installation,
+the migration coverage matrix, and validation against a local plugin checkout.
 
 **Required fields:**
 

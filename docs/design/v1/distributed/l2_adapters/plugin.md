@@ -34,6 +34,22 @@ framework keyword arguments, including `l1_memory_desc`, without using them:
 filesystem I/O accesses the supplied objects' byte buffers directly. No loader
 or on-disk format changes are required. `fs_native` remains in core for now.
 
+#### Cross-repository validation
+
+`tools/run_l2_plugin_tests.py` installs a pinned companion checkout with
+`--no-deps` and runs its tests against the installed LMCache. CI invokes it
+before core tests. `LMCACHE_L2_PLUGINS_PATH` selects a local companion checkout
+for paired changes. Publish a new companion revision before updating the CI
+pin; the initial pin uses the migration fork until the implementation lands
+upstream.
+
+Core's `tests/v1/distributed/test_fs_plugin.py` requires the plugin and exercises
+both configuration paths with real tensors and storage controllers. It covers
+plain and FP8 disk round trips, fault-injection wrapping, L1 affinity, shared
+configuration, byte accounting, dynamic removal/re-addition, aligned direct I/O,
+unaligned-length fallback, and truncated files. The companion owns filename,
+validation, persistence, and adapter notification unit tests.
+
 ---
 
 ## Key Components

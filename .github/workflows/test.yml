@@ -111,6 +111,9 @@ jobs:
           python -m pip install -r requirements/common.txt
           NO_GPU_EXT=1 python -m pip install -e . --no-build-isolation
 
+      - name: Install and test companion L2 plugins
+        run: python tools/run_l2_plugin_tests.py
+
       - name: "CPU only unit tests"
         run: |
           pytest -m "not (cuda or musa or xpu or npu or neuron or rbln)"

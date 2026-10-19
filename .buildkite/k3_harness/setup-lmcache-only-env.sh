@@ -42,5 +42,7 @@ else
     python "${REPO_ROOT}/lmcache/v1/multiprocess/transport/grpc_impl/_proto_gen/_generate.py"
 fi
 
+python "${REPO_ROOT}/tools/run_l2_plugin_tests.py"
+
 echo "--- :white_check_mark: Environment ready (LMCache only, no vLLM)"
 python -c "import lmcache; print('LMCache installed')"

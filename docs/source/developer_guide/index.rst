@@ -8,6 +8,7 @@ commands, and HTTP endpoints.
    :maxdepth: 1
 
    contributing
+   testing_l2_plugins
    extending_lmcache/native_connectors
    extending_lmcache/adding_a_new_device_backend
    extending_lmcache/server_modules

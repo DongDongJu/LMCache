@@ -21,6 +21,8 @@ BUILD_MOONCAKE=0 \
 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE=0.0.0+ci \
     "${PYTHON}" -m pip install --no-cache-dir --no-deps --no-build-isolation -e .
 
+"${PYTHON}" tools/run_l2_plugin_tests.py
+
 echo "--- :mag: RBLN preflight"
 "${PYTHON}" "${SCRIPT_DIR}/preflight.py"
 
