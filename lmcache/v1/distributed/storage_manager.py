@@ -54,6 +54,7 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
 from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
 from lmcache.v1.distributed.quota_manager import QuotaManager
 from lmcache.v1.distributed.serde import create_serde_processor
+from lmcache.v1.distributed.shared_l1.manager import SharedL1Manager
 from lmcache.v1.distributed.storage_controllers import (
     L1EvictionController,
     L2AdapterEvictionState,
@@ -133,12 +134,20 @@ class StorageManager:
             else:
                 created: list[L1ManagerInterface] = []
                 for manager_config in config.l1_manager_configs:
-                    path = manager_config.memory_config.devdax_path
+                    path = (
+                        manager_config.shared.path
+                        if manager_config.shared is not None
+                        else manager_config.memory_config.devdax_path
+                    )
                     if path and any(m.owns_device(path) for m in created):
                         raise ValueError(
                             f"Device-DAX path already owned by an L1: {path}"
                         )
-                    manager: L1ManagerInterface = L1Manager(manager_config)
+                    manager: L1ManagerInterface = (
+                        SharedL1Manager(manager_config)
+                        if manager_config.shared is not None
+                        else L1Manager(manager_config)
+                    )
                     cleanup.callback(manager.close)
                     created.append(manager)
                 managers = tuple(created)
@@ -438,6 +447,28 @@ class StorageManager:
         )
 
         # TODO: global key states update
+
+    def abort_write_by_owner(self, completion: L1WriteCompletion) -> None:
+        """Discard captured reservations whose store failed.
+
+        Args:
+            completion: Owner/key groups captured before scheduling the abort.
+
+        Raises:
+            ValueError: A captured owner is no longer registered.
+
+        The caller must wait for device writes into the reserved buffers, so
+        schedule this on the same stream as the copies. An embedded L1 frees
+        the staging buffers now instead of when their write TTL expires; a
+        remote binding tells its authority, which would otherwise keep the
+        keys write-locked and refuse every later writer.
+        """
+        if any(owner not in self._l1_managers_by_id for owner, _ in completion):
+            raise ValueError("write completion requires a registered L1 owner")
+        for owner, keys in completion:
+            self._l1_managers_by_id[owner].finish_write_and_delete(
+                keys, tag=_L1_WRITE_TAG
+            )
 
     @contextmanager
     def read_prefetched_results(

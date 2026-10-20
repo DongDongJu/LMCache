@@ -1,4 +1,4 @@
-# Shared-region data path
+# Shared L1
 
 `RegionMedium` owns one mapping, its GPU registration and tensor views.
 DRAM uses a regular file on tmpfs/hugetlbfs; DEVDAX requires a character device
@@ -23,8 +23,7 @@ read grant -> acquire fence -> H2D -> release read
 
 The operator establishes that peer paths map the same physical region.
 Allocation, write publication and read leases belong to the memory orchestrator;
-these primitives do not own them. The manager binding and serving/CLI integration
-are the next steps in the series.
+these primitives do not own them.
 
 Tests cover view aliasing, extent bounds, backing types, failed registration
 cleanup, and native/cache-visibility operations. The private Device-DAX allocator
@@ -34,8 +33,8 @@ continues using the same mapping behavior after the helper extraction.
 
 `SharedL1Manager` implements L1ManagerInterface using SharedL1Config and the
 orchestrator's canonical ObjectKey, layouts and tokens. DRAM/DEVDAX configuration
-subclasses select the medium. The binding is available as a Python component;
-CLI/factory and serving integration follow in the next patch.
+subclasses select the medium. The binding uses the same L1 interface as private
+pools.
 
 ReserveWrite returns private write tokens/views. After D2H completes, FinishWrite
 publishes visibility and commits metadata. Failed publication aborts its tokens.
@@ -57,3 +56,24 @@ it, and the storage-manager API rejects unsupported reconfiguration.
 
 Shared placement events are excluded from the per-server fleet directory, since
 several bindings refer to the same region-owned copy.
+
+## Serving integration
+
+The `shared` section of `--l1-manager` selects SharedL1Manager. One shared region
+per MP process is supported, with explicit client identity, `noop` eviction and
+`lmcache_driven` transfer. Shared GDS, L2 affinity, hot-plug, CacheBlend, P2P and
+runtime plugins are rejected. P/D proxy/readiness changes are a separate follow-up.
+
+Writes follow configured L1 order and overflow privately when the region is full.
+Local hits avoid shared lookups. Shared peer layout mismatches release every
+acquired read before the lookup fails. Store failures abort through each memory
+object's owner on the copy stream, after partial transfers drain.
+
+Existing key/rank/group encoding and grouped prefix rules support equal
+TP1/2/4/8 peers, including hybrid windows. A missing rank truncates the prefix;
+overlapping reads retain independent leases. Two-server GPU tests exercise
+rank-specific payloads, late shards and read cleanup for each TP size.
+
+User configuration, compatibility requirements, status/metrics and reset
+instructions are in `docs/source/mp/shared_l1.rst`. Shared allocation/capacity
+are region-wide and must not be summed across attached servers.

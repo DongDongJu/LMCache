@@ -1,18 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Configurations for standalone shared-manager tests."""
+"""Shared L1 configurations for tests; the orchestrator harness is in
+``tests.v1.memory_orchestrator.harness``."""
 
 # Standard
 from pathlib import Path
+import json
 
 # First Party
-from lmcache.v1.distributed.config import (
-    DevDaxL1ManagerConfig,
-    DRAML1ManagerConfig,
-    EvictionConfig,
-    L1ManagerConfig,
-    L1MemoryManagerConfig,
-    SharedL1Config,
-)
+from lmcache.v1.distributed.config import L1ManagerConfig, parse_args
 from tests.v1.memory_orchestrator.harness import REGION_ID
 
 
@@ -27,18 +22,28 @@ def shared_config(
     region_id: str = REGION_ID,
     l1_type: str = "DRAM",
 ) -> L1ManagerConfig:
-    """Build a shared-manager configuration without the serving CLI."""
-    cls = {"DRAM": DRAML1ManagerConfig, "DEVDAX": DevDaxL1ManagerConfig}[l1_type]
-    return cls(
-        memory_config=L1MemoryManagerConfig(
-            size_bytes,
-            use_lazy=False,
-            shm_name="",
-            devdax_path=str(region_path) if l1_type == "DEVDAX" else "",
-        ),
-        tag=tag,
-        eviction=EvictionConfig("noop"),
-        shared=SharedL1Config(
-            endpoint, region_id, str(region_path), client_id, rpc_timeout_seconds
-        ),
+    """Parse a shared L1 config the way ``--l1-manager`` does.
+
+    The default maps ``region_path`` as a file (the DRAM medium); pass
+    ``l1_type="DEVDAX"`` for a Device-DAX device.
+    """
+    return parse_l1_manager_spec(
+        {
+            "type": l1_type,
+            "tag": tag,
+            "size_gb": size_bytes / (1 << 30),
+            "path": str(region_path),
+            "shared": {
+                "orchestrator": endpoint,
+                "region_id": region_id,
+                "client_id": client_id,
+                "rpc_timeout_seconds": rpc_timeout_seconds,
+            },
+        }
     )
+
+
+def parse_l1_manager_spec(spec: dict[str, object]) -> L1ManagerConfig:
+    """Parse one ``--l1-manager`` JSON object through the CLI parser."""
+    config = parse_args(["--eviction-policy", "noop", "--l1-manager", json.dumps(spec)])
+    return config.l1_manager_configs[0]
