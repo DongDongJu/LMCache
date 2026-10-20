@@ -60,6 +60,83 @@ def _l1_path(values: dict[str, object]) -> str:
     return path
 
 
+def _parse_shared_l1(raw: object, path: str) -> "SharedL1Config":
+    """Validate the ``shared`` section of an ``--l1-manager`` object.
+
+    Args:
+        raw: The JSON value of ``shared``.
+        path: The L1's ``path``: the device or file this server maps.
+
+    Returns:
+        The parsed section.
+
+    Raises:
+        ValueError: A field is missing, unknown or malformed.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("shared must be a JSON object")
+    fields = {"orchestrator", "region_id", "client_id", "rpc_timeout_seconds"}
+    if unknown := set(raw) - fields:
+        raise ValueError(f"Unknown shared L1 fields: {sorted(unknown)}")
+
+    def text(name: str) -> str:
+        value = raw.get(name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"shared.{name} must be a non-empty string")
+        return value.strip()
+
+    return SharedL1Config(
+        orchestrator=text("orchestrator"),
+        region_id=text("region_id"),
+        path=path,
+        client_id=text("client_id") if raw.get("client_id") is not None else None,
+        rpc_timeout_seconds=_l1_number(raw, "rpc_timeout_seconds", 5.0),
+    )
+
+
+def _shared_l1_values(
+    values: dict[str, object],
+) -> tuple[dict[str, object], "SharedL1Config | None"]:
+    """Parse an L1 object's ``shared`` section before the backend fields.
+
+    A shared L1 maps the device or file at its ``path`` and never evicts, so
+    ``noop`` is filled in as its eviction policy when it names none.
+
+    Args:
+        values: JSON fields of one ``--l1-manager`` object.
+
+    Returns:
+        The values, with ``noop`` eviction filled in for a shared L1 that
+        names no policy, and the parsed section or None.
+
+    Raises:
+        ValueError: The section is malformed or ``path`` is missing.
+    """
+    if "shared" not in values:
+        return values, None
+    if "path" not in values:
+        raise ValueError("A shared L1 needs path: the device or file this server maps")
+    shared = _parse_shared_l1(values["shared"], _l1_path(values))
+    if "eviction" not in values:
+        values = {**values, "eviction": {"eviction_policy": "noop"}}
+    return values, shared
+
+
+def _attach_shared_l1(
+    config: "L1ManagerConfig", shared: "SharedL1Config | None"
+) -> None:
+    """Record a parsed ``shared`` section on its L1 configuration.
+
+    Raises:
+        ValueError: The L1 names an eviction policy other than ``noop``.
+    """
+    if shared is None:
+        return
+    if config.eviction is None or config.eviction.eviction_policy != "noop":
+        raise ValueError("A shared L1 requires eviction_policy noop")
+    config.shared = shared
+
+
 def _parse_l1_common(
     cls: type[_L1ConfigT],
     values: dict[str, object],
@@ -407,6 +484,34 @@ class GdsL1Config:
     """Allocation alignment; cuFile/hipFile and O_DIRECT require 4 KiB."""
 
 
+@dataclass(frozen=True)
+class SharedL1Config:
+    """The ``shared`` section of an L1: bind it to a memory orchestrator.
+
+    The orchestrator (``lmcache memory``) owns allocation and readiness for a
+    region several MP servers map; this server maps it through the device or
+    file at ``path`` (``DEVDAX`` maps a device, ``DRAM`` a file) and moves KV
+    bytes.
+    """
+
+    orchestrator: str
+    """ ``host:port`` of the region's ``lmcache memory`` process. """
+
+    region_id: str
+    """ Must equal the orchestrator's ``--region-id``. """
+
+    path: str
+    """ The device or file this server maps for the region: the L1's ``path``. """
+
+    client_id: str | None = None
+    """ This server's identity across restarts, distinct per server; a restart
+    under the same id retires the previous run's unfinished writes. The MP
+    server fills ``<hostname>-<machine id>:<port>`` when unset. """
+
+    rpc_timeout_seconds: float = 5.0
+    """ Deadline of each orchestrator RPC attempt. """
+
+
 @dataclass
 class L1ManagerConfig:
     """
@@ -431,6 +536,9 @@ class L1ManagerConfig:
 
     eviction: "EvictionConfig | None" = None
     """Per-L1 eviction settings; None inherits StorageManagerConfig defaults."""
+
+    shared: "SharedL1Config | None" = None
+    """ Set when a memory orchestrator owns the L1's objects (remote binding). """
 
 
 def get_configured_capacity_bytes(
@@ -529,14 +637,32 @@ class DRAML1ManagerConfig(L1ManagerConfig):
             ValueError: A field is unknown, malformed, or incompatible.
             RuntimeError: The requested hugepage pool is unavailable, or
                 mlock is requested and the node allows compacting mlocked pages.
+
+        Notes:
+            A ``shared`` object binds the pool to a memory orchestrator; the
+            pool is then the file at ``path`` (tmpfs or hugetlbfs for a DRAM
+            region) and ``size_gb`` caps how much of it this server may map.
+            ``use_lazy``, ``init_size_gb``, ``shm_name`` and ``use_hugepages``
+            describe the private pool and are ignored for a shared L1.
         """
+        values, shared = _shared_l1_values(values)
+        if shared is None and "path" in values:
+            raise ValueError("path on a DRAM L1 is only used with a shared section")
         config = _parse_l1_common(
             cls,
             values,
             defaults,
             read_ttl,
             write_ttl,
-            {"use_lazy", "init_size_gb", "shm_name", "use_hugepages", "mlock"},
+            {
+                "use_lazy",
+                "init_size_gb",
+                "shm_name",
+                "use_hugepages",
+                "mlock",
+                "path",
+                "shared",
+            },
         )
         use_lazy = _l1_bool(values, "use_lazy", True)
         hugepages = _l1_bool(values, "use_hugepages", False)
@@ -553,8 +679,9 @@ class DRAML1ManagerConfig(L1ManagerConfig):
             use_hugepages=hugepages,
             mlock=_l1_bool(values, "mlock", False),
         )
-        if hugepages:
+        if hugepages and shared is None:
             _check_hugepage_availability(config.memory_config.size_in_bytes)
+        _attach_shared_l1(config, shared)
         return config
 
 
@@ -574,6 +701,9 @@ class DevDaxL1ManagerConfig(L1ManagerConfig):
 
         Args:
             values: JSON fields for this backend, including tag and size_gb.
+                An optional ``shared`` object binds the pool to a memory
+                orchestrator; ``size_gb`` then caps how much of the device
+                this server may map.
             defaults: Global eviction settings, or None to require a local policy.
             read_ttl: Default read-lock lifetime in seconds.
             write_ttl: Default write-lock lifetime in seconds.
@@ -584,10 +714,14 @@ class DevDaxL1ManagerConfig(L1ManagerConfig):
         Raises:
             ValueError: A field is unknown, malformed, or incompatible.
         """
-        config = _parse_l1_common(cls, values, defaults, read_ttl, write_ttl, {"path"})
+        values, shared = _shared_l1_values(values)
+        config = _parse_l1_common(
+            cls, values, defaults, read_ttl, write_ttl, {"path", "shared"}
+        )
         config.memory_config = replace(
             config.memory_config, devdax_path=_l1_path(values)
         )
+        _attach_shared_l1(config, shared)
         return config
 
 
@@ -615,8 +749,14 @@ class GDSL1ManagerConfig(L1ManagerConfig):
             A validated GDSL1ManagerConfig.
 
         Raises:
-            ValueError: A field is unknown, malformed, or incompatible.
+            ValueError: A field is unknown, malformed, or incompatible, or a
+                ``shared`` section is present: a GDS slab cannot be shared
+                through the memory orchestrator.
         """
+        if "shared" in values:
+            raise ValueError(
+                "A GDS L1 cannot be shared through the memory orchestrator"
+            )
         config = _parse_l1_common(
             cls, values, defaults, read_ttl, write_ttl, {"path", "backend", "direct_io"}
         )
@@ -726,8 +866,9 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
         None.
 
     Raises:
-        ValueError: If mutually exclusive L1 tiers are both configured, or
-            hybrid L1 is paired with incompatible L2 adapters.
+        ValueError: If mutually exclusive L1 tiers are both configured,
+            hybrid L1 is paired with incompatible L2 adapters, more than one
+            L1 is shared, or an L2 adapter binds to the shared L1.
     """
     by_tag = {c.tag: c for c in config.l1_manager_configs}
     shm_names = [
@@ -742,10 +883,18 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
     for l1 in by_tag.values():
         if l1.gds_l1_config is not None and l1.memory_config.devdax_path:
             raise ValueError("gds-l1-path cannot be used with l1-devdax-path")
+    shared_tags = {tag for tag, l1 in by_tag.items() if l1.shared is not None}
+    if len(shared_tags) > 1:
+        raise ValueError("Only one shared L1 is supported per process")
     for adapter_config in config.l2_adapter_config.adapters:
         if adapter_config.affinity_tag not in by_tag:
             raise ValueError(
                 f"Unknown L1 affinity_tag: {adapter_config.affinity_tag!r}"
+            )
+        if adapter_config.affinity_tag in shared_tags:
+            raise ValueError(
+                "L2 adapters cannot bind to the shared L1 "
+                f"{adapter_config.affinity_tag!r}; bind them to a private L1"
             )
         l1 = by_tag[adapter_config.affinity_tag]
         if l1.gds_l1_config is not None:

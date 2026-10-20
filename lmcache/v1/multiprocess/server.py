@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 import argparse
 import shutil
 import signal
+import socket
 import sys
 import time
 
@@ -252,6 +254,67 @@ def _build_server_components(
     return ServerBuildComponents(modules=modules)
 
 
+def default_shared_l1_client_id(port: int) -> str:
+    """Name an MP server for its shared L1, stable across its restarts.
+
+    Hostnames repeat across hosts, so the first eight characters of
+    ``/etc/machine-id`` follow the hostname when that file is readable.
+
+    Args:
+        port: The MP server's port.
+
+    Returns:
+        ``<hostname>-<machine id prefix>:<port>``, or ``<hostname>:<port>``.
+    """
+    try:
+        machine_id = Path("/etc/machine-id").read_text().strip()
+    except OSError:
+        machine_id = ""
+    host = socket.gethostname()
+    if machine_id:
+        host = f"{host}-{machine_id[:8]}"
+    return f"{host}:{port}"
+
+
+def prepare_shared_l1(
+    mp_config: MPServerConfig, storage_manager_config: StorageManagerConfig
+) -> None:
+    """Check MP settings against a shared L1 and fill its default ``client_id``.
+
+    Args:
+        mp_config: MP server configuration.
+        storage_manager_config: Storage configuration; edited in place.
+
+    Raises:
+        ValueError: A shared L1 is configured together with engine-driven or
+            auto transfer, CacheBlend, P2P or a runtime plugin.
+    """
+    shared_configs = [
+        c for c in storage_manager_config.l1_manager_configs if c.shared is not None
+    ]
+    if not shared_configs:
+        return
+    if mp_config.supported_transfer_mode != "lmcache_driven":
+        raise ValueError(
+            "A shared L1 requires --supported-transfer-mode lmcache_driven, "
+            f"got {mp_config.supported_transfer_mode!r}"
+        )
+    if mp_config.engine_type == "blend":
+        raise ValueError("A shared L1 does not support CacheBlend")
+    if mp_config.p2p_config.enabled:
+        raise ValueError("A shared L1 does not support P2P")
+    if mp_config.runtime_plugin_config.locations:
+        raise ValueError(
+            "A shared L1 does not support runtime plugins: "
+            f"{mp_config.runtime_plugin_config.locations}"
+        )
+    for config in shared_configs:
+        shared = config.shared
+        if shared is not None and shared.client_id is None:
+            client_id = default_shared_l1_client_id(mp_config.port)
+            config.shared = replace(shared, client_id=client_id)
+
+
 def run_cache_server(
     mp_config: MPServerConfig,
     storage_manager_config: StorageManagerConfig,
@@ -279,6 +342,8 @@ def run_cache_server(
         If return_engine is True: tuple of (request server, MPCacheServer).
         If return_engine is False: None (blocks until interrupted).
     """
+    prepare_shared_l1(mp_config, storage_manager_config)
+
     # Before any event IPC backend is resolved (KV-cache registration), so
     # the setting is observed by every resolver in this process.
     set_isolated_ipc(mp_config.isolated_ipc)
