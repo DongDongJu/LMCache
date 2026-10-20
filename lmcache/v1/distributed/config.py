@@ -407,6 +407,32 @@ class GdsL1Config:
     """Allocation alignment; cuFile/hipFile and O_DIRECT require 4 KiB."""
 
 
+@dataclass(frozen=True)
+class SharedL1Config:
+    """The ``shared`` section of an L1: bind it to a memory orchestrator.
+
+    The orchestrator (``lmcache memory``) owns allocation and readiness for a
+    region several MP servers map; this server maps it through the device or
+    file at ``path`` (``DEVDAX`` maps a device, ``DRAM`` a file) and moves KV
+    bytes.
+    """
+
+    orchestrator: str
+    """ ``host:port`` of the region's ``lmcache memory`` process. """
+
+    region_id: str
+    """ Must equal the orchestrator's ``--region-id``. """
+
+    path: str
+    """ The device or file this server maps for the region: the L1's ``path``. """
+
+    client_id: str
+    """Stable, unique server identity; re-registration retires its previous run."""
+
+    rpc_timeout_seconds: float = 5.0
+    """ Deadline of each orchestrator RPC attempt. """
+
+
 @dataclass
 class L1ManagerConfig:
     """
@@ -431,6 +457,9 @@ class L1ManagerConfig:
 
     eviction: "EvictionConfig | None" = None
     """Per-L1 eviction settings; None inherits StorageManagerConfig defaults."""
+
+    shared: "SharedL1Config | None" = None
+    """Set when a memory orchestrator owns the L1 objects."""
 
 
 def get_configured_capacity_bytes(

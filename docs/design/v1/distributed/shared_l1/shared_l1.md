@@ -29,3 +29,31 @@ are the next steps in the series.
 Tests cover view aliasing, extent bounds, backing types, failed registration
 cleanup, and native/cache-visibility operations. The private Device-DAX allocator
 continues using the same mapping behavior after the helper extraction.
+
+## Manager lifecycle
+
+`SharedL1Manager` implements L1ManagerInterface using SharedL1Config and the
+orchestrator's canonical ObjectKey, layouts and tokens. DRAM/DEVDAX configuration
+subclasses select the medium. The binding is available as a Python component;
+CLI/factory and serving integration follow in the next patch.
+
+ReserveWrite returns private write tokens/views. After D2H completes, FinishWrite
+publishes visibility and commits metadata. Failed publication aborts its tokens.
+ReserveRead acquires independent leases and fences before H2D; overlapping reads
+retain separate counts. Failed acquire releases only that call's leases. Malformed
+extents, payloads and layouts release known tokens without disturbing existing
+reads. CloseClient retires this incarnation after copies have drained.
+
+Startup verifies capacity, page alignment and the epoch across mapping and
+registration. Epoch fencing disables the binding. Unavailable metadata makes
+reads miss and writes return OUT_OF_MEMORY; failed-close leases remain until
+re-registration and writes also expire under the orchestrator TTL. Extents are
+never reclaimed, and shared objects cannot be evicted or forcibly deleted.
+
+Status and common L1 gauges report region-wide allocation/capacity and local
+staging payload bytes. RPCs and visibility operations run outside metadata locks.
+Device-DAX hot-plug is a separate capability; the shared binding does not expose
+it, and the storage-manager API rejects unsupported reconfiguration.
+
+Shared placement events are excluded from the per-server fleet directory, since
+several bindings refer to the same region-owned copy.
