@@ -1,5 +1,32 @@
 # Test disaggregated prefill related components
 
+## Shared-L1 P/D with the MP proxy
+
+`test_shared_l1_pd.py` checks the existing MP proxy with two vLLM instances
+and two MP servers attached to the same shared region. Set the prefiller's
+request telemetry endpoint to the proxy, and start the proxy with
+`--decoder-cache-url` pointing at the decoder MP server's HTTP API. Use equal
+TP sizes (1, 2, 4 or 8), model namespaces, chunk sizes and layouts on both peers.
+The decoder can use `kv_role=kv_consumer`.
+
+Set `LMCACHE_SHARED_PD_TEST_CONFIG` to a JSON file containing `proxy`, `prefill`,
+`decode`, `prefill_cache` and `decode_cache` HTTP URLs; `model` (served name);
+`prompt_token_ids`; `expected_token_ids` from an uncached reference using the
+same model/TP with temperature 0 and seed 42; `cache_salt`; `chunk_size`; and
+`evidence_dir`. The prompt must contain at least one complete cache chunk and
+a trailing token. Enable vLLM's prefix-cache reset endpoint for this test.
+
+```bash
+LMCACHE_SHARED_PD_TEST_CONFIG=/path/to/shared-pd.json \
+    pytest -q tests/disagg/test_shared_l1_pd.py
+```
+
+The test repeats the handoff after clearing GPU caches, checks output token
+agreement and full-chunk cache reuse, verifies actual decoder GPU loads, and
+checks that ownership locks drain. KV bytes travel through the shared region.
+This differs from the native NIXL transfer test below. The SGLang native P/D
+restriction described below still applies.
+
 ## Native vLLM P/D with multi-L1 storage
 
 `test_multi_l1_pd.py` checks running prefill/decode instances configured with

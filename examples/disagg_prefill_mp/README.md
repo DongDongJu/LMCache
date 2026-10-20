@@ -8,7 +8,12 @@ The figure above shows the PD architecture. The workflow goes as:
 - The router sends one request to prefill instance with `max_token=1` and then wait for an event.
 - The prefill instance finishes storing all the KV caches.
 - The `request_telemetry` class reports the finished store event back to the router
-- The router then send the request to decode instance.
+- The router waits for every distinct TP rank, then sends the request to the decode instance.
+- With shared L1, pass `--decoder-cache-url http://DECODE_HOST:8080` to also wait
+  for committed prefix readiness. GPU completion can precede metadata publication.
+  The check uses the existing no-lock prefetch API and times out after 60 seconds.
+  See [the shared L1 guide](../../docs/source/mp/shared_l1.rst) for TP1/2/4/8 and
+  two-host configuration.
 
 
 **NOTE:** the current code only support 1p1d for now.

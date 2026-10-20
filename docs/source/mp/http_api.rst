@@ -1017,14 +1017,13 @@ reports progress; the first poll that observes completion drops the job
 
     {"status": "completed", "found_keys": 12, "total_keys": 12}
 
-``found_keys`` / ``total_keys`` count only chunks **loaded from L2** by this
-request; chunks already resident in L1 are skipped at ``reserve_write`` and not
-counted, so a partially-resident warm undercounts by the resident chunk count
-(a cold request loads and counts everything). The warm uses the gap-tolerant
-``SPARSE`` trim policy, so an already-resident chunk does not stop the rest from
-loading — it loads every not-yet-resident chunk and reports that count. Not
-counting the resident chunks is deliberate: an already-present entry may be a
-transient temporary from another lookup, so claiming it as warmed could mislead.
+``found_keys`` counts resident keys after the warm prefetch, including existing
+L1 hits; ``total_keys`` counts requested keys across all ranks and object groups.
+The completed response also includes ``ready_chunks``: the prefix available
+across every rank and group under the same sliding-window rules as serving
+lookup. With hybrid state, ``ready_chunks`` can cover the prompt even when some
+older state keys are absent. Warm prefetch retains no read leases. Shared-L1
+P/D can poll this field before forwarding a request to the decoder.
 
 **HTTP status codes:**
 
