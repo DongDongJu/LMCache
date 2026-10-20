@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 # First Party
+from lmcache.lmcache_native import Bitmap
 from lmcache.v1.distributed.api import GroupedObjectKeys, ObjectKey, PrefetchLockMode
 from lmcache.v1.multiprocess.warm_prefetch import (
     COMPLETED,
@@ -30,18 +31,9 @@ def _key(i: int) -> ObjectKey:
 
 
 class _FakeHandle:
-    def __init__(self, total: int) -> None:
+    def __init__(self, total: int, windows: tuple[int, ...]) -> None:
         self.total_requested_keys = total
-
-
-class _FakeBitmap:
-    """Stands in for the found-key ``Bitmap``; ``popcount`` is the found count."""
-
-    def __init__(self, n: int) -> None:
-        self._n = n
-
-    def popcount(self) -> int:
-        return self._n
+        self.sliding_windows = windows
 
 
 @dataclass
@@ -62,7 +54,9 @@ class _FakeStorageManager:
             "lock_mode": spec.lock_mode,
             "fetching_policy": spec.fetching_policy,
         }
-        return _FakeHandle(self._total)
+        return _FakeHandle(
+            self._total, tuple(row.sliding_window_size for row in spec.key_groups)
+        )
 
     def query_prefetch_status(self, handle):
         if self._polls < self.delay_polls:
@@ -72,9 +66,9 @@ class _FakeStorageManager:
         from lmcache.v1.distributed.api import PrefetchResult
 
         return PrefetchResult(
-            hit_cells=[_FakeBitmap(self.found)],
-            l1_hit_cells=[_FakeBitmap(0)],
-            l2_hit_cells=[_FakeBitmap(self.found)],
+            hit_cells=[Bitmap(self._total, self.found)],
+            l1_hit_cells=[Bitmap(self._total)],
+            l2_hit_cells=[Bitmap(self._total, self.found)],
         )
 
     def finish_read_prefetched(self, keys, read_locks: int = 1) -> None:
@@ -105,6 +99,7 @@ def test_submit_uses_retain_and_poll_completes_without_release():
     assert status.state == COMPLETED
     assert status.found_keys == 2
     assert status.total_keys == 2
+    assert status.ready_chunks == 2
     # No lock was held, so nothing is released.
     assert sm.finish_called is False
 

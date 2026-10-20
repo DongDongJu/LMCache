@@ -1,0 +1,147 @@
+# SPDX-License-Identifier: Apache-2.0
+"""All ranks and object groups must be ready before a shared prefix is served."""
+
+# Standard
+from contextlib import ExitStack
+from pathlib import Path
+
+# Third Party
+import pytest
+import torch
+
+# First Party
+from lmcache.v1.distributed.api import (
+    GroupedObjectKeys,
+    MemoryLayoutDesc,
+    ObjectKey,
+    PrefetchTaskSpec,
+)
+from lmcache.v1.distributed.config import EvictionConfig, StorageManagerConfig
+from lmcache.v1.distributed.storage_manager import StorageManager
+from lmcache.v1.multiprocess.warm_prefetch import WarmPrefetchJobs
+from tests.v1.distributed.shared_l1.utils import shared_config
+from tests.v1.memory_orchestrator.harness import running_orchestrator
+
+pytestmark = pytest.mark.no_shared_allocator
+
+CAPACITY = 128 * 4096
+LAYOUTS = [
+    MemoryLayoutDesc([torch.Size([2, 16])], [torch.float16]),
+    MemoryLayoutDesc([torch.Size([4, 8])], [torch.float32]),
+]
+
+
+def _rows(tp: int, state_window: int = -1) -> list[GroupedObjectKeys]:
+    """Use the serving key encoding for two groups and two chunks per rank."""
+    return [
+        GroupedObjectKeys(
+            [
+                ObjectKey(
+                    ObjectKey.IntHash2Bytes(chunk + 1),
+                    "shared-tp",
+                    ObjectKey.ComputeKVRank(tp, rank, tp, rank),
+                    group,
+                )
+                for chunk in range(2)
+            ],
+            group,
+            layout,
+            sliding_window_size=state_window if group == 1 else -1,
+        )
+        for group, layout in enumerate(LAYOUTS)
+        for rank in range(tp)
+    ]
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+@pytest.mark.parametrize("state_window", [-1, 1])
+def test_shared_prefix_waits_for_every_rank_and_group(
+    tmp_path: Path, tp: int, state_window: int
+) -> None:
+    """A late shard truncates all rows; overlapping lookups keep separate leases."""
+    with (
+        running_orchestrator(tmp_path / "state", capacity_bytes=CAPACITY) as orch,
+        ExitStack() as stack,
+    ):
+        stores = []
+        for client_id in ("prefill", "decode"):
+            l1 = shared_config(
+                tmp_path / "region", orch.endpoint, client_id, size_bytes=CAPACITY
+            )
+            store = StorageManager(StorageManagerConfig(l1, EvictionConfig("noop")))
+            stack.callback(store.close)
+            stores.append(store)
+        writer, reader = stores
+        rows = _rows(tp, state_window)
+        delayed = {}
+        for index, row in enumerate(rows):
+            reserved = writer.reserve_write(row.keys, row.layout_desc)
+            assert len(reserved) == 2
+            for obj in reserved.values():
+                assert obj.tensor is not None
+                obj.tensor.fill_(index + 1)
+            if index == len(rows) - 1:
+                delayed[row.keys[-1]] = reserved.pop(row.keys[-1])
+            writer.finish_write_by_owner(writer.prepare_write_completion(reserved))
+
+        short = reader.query_prefetch_status(
+            reader.submit_prefetch_task(PrefetchTaskSpec(rows), skip_l2=True)
+        )
+        assert short is not None
+        assert [bitmap.get_indices_list() for bitmap in short.hit_cells] == [[0]] * len(
+            rows
+        )
+        jobs = WarmPrefetchJobs()
+        warm = jobs.poll(reader, jobs.submit(reader, rows))
+        assert warm.ready_chunks == 1
+        writer.finish_write_by_owner(writer.prepare_write_completion(delayed))
+        warm = jobs.poll(reader, jobs.submit(reader, rows))
+        assert warm.ready_chunks == 2
+        if state_window == 1:
+            assert warm.found_keys < warm.total_keys
+        full = reader.query_prefetch_status(
+            reader.submit_prefetch_task(PrefetchTaskSpec(rows), skip_l2=True)
+        )
+        assert full is not None
+        assert [bitmap.get_indices_list() for bitmap in full.hit_cells] == [
+            [1] if row.sliding_window_size == 1 else [0, 1] for row in rows
+        ]
+
+        first_keys = [row.keys[0] for row in rows]
+        reader.finish_read_prefetched(first_keys, l1_owners=short.l1_owners)
+        # Finishing the short lookup cannot release the overlapping full lookup.
+        for index, row in enumerate(rows):
+            retained = full.hit_cells[index].gather(row.keys)
+            with reader.read_prefetched_results(retained, full.l1_owners) as objects:
+                assert objects is not None and len(objects) == len(retained)
+                assert all(torch.all(obj.tensor == index + 1) for obj in objects)
+            reader.finish_read_prefetched(retained, l1_owners=full.l1_owners)
+        shared = reader.report_status()["l1_manager"]
+        assert shared["read_locked_count"] == 0
+        assert shared["shared"]["region_usage"]["read_leases"] == 0
+
+
+def test_peer_layout_mismatch_releases_every_reserved_read(tmp_path: Path) -> None:
+    """A differently configured decoder must not copy an incompatible extent."""
+    with (
+        running_orchestrator(tmp_path / "state", capacity_bytes=CAPACITY) as orch,
+        ExitStack() as stack,
+    ):
+        stores = []
+        for client_id in ("writer", "reader"):
+            l1 = shared_config(
+                tmp_path / "region", orch.endpoint, client_id, size_bytes=CAPACITY
+            )
+            store = StorageManager(StorageManagerConfig(l1, EvictionConfig("noop")))
+            stack.callback(store.close)
+            stores.append(store)
+        writer, reader = stores
+        row = _rows(1)[0]
+        reserved = writer.reserve_write(row.keys, row.layout_desc)
+        writer.finish_write_by_owner(writer.prepare_write_completion(reserved))
+        incompatible = GroupedObjectKeys(row.keys, 0, LAYOUTS[1])
+        with pytest.raises(ValueError, match="Shared L1 layout differs"):
+            reader.submit_prefetch_task(PrefetchTaskSpec([incompatible]), skip_l2=True)
+        status = reader.report_status()["l1_manager"]
+        assert status["read_locked_count"] == 0
+        assert status["shared"]["region_usage"]["read_leases"] == 0

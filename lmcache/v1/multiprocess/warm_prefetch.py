@@ -3,8 +3,9 @@
 
 A *warm* prefetch loads a caller-supplied set of keys from L2 into L1 and leaves
 them resident, retained, and unpinned, so a subsequent real lookup hits L1. It
-loads every requested key not already in L1, and pins nothing -- there is no
-downstream reader to pin for.
+loads every requested full-attention key not already in L1. Hybrid groups
+instead warm a consistent prefix using their sliding windows. Neither path
+retains read locks -- there is no downstream reader to pin for.
 
 The table tracks in-flight warm prefetches: ``submit`` starts one and returns an
 opaque request id; ``poll`` reports its status (pending, then completed) and
@@ -27,6 +28,7 @@ from lmcache.v1.distributed.api import (
     PrefetchLockMode,
     PrefetchTaskSpec,
 )
+from lmcache.v1.distributed.bitmap_ops.fold import fold_unfold_grouped
 from lmcache.v1.distributed.storage_manager import StorageManager
 
 logger = init_logger(__name__)
@@ -48,11 +50,14 @@ class WarmStatus:
         found_keys: Keys loaded into L1 (only meaningful when ``completed``).
         total_keys: Keys originally requested (only meaningful when
             ``completed``).
+        ready_chunks: Prefix chunks available across every rank and object
+            group, respecting sliding windows (only when ``completed``).
     """
 
     state: str
     found_keys: int = 0
     total_keys: int = 0
+    ready_chunks: int = 0
 
 
 class WarmPrefetchJobs:
@@ -78,6 +83,10 @@ class WarmPrefetchJobs:
     ) -> str:
         """Start a no-lock retain prefetch and register its handle.
 
+        Sliding-window groups use prefix fetching, since full fetching does
+        not support their state dependency. Full-attention-only requests
+        retain their existing gap-tolerant full-fetch behavior.
+
         Args:
             storage_manager: The MP server's storage manager.
             key_groups: The keys to load from L2 into L1, one row per
@@ -89,7 +98,11 @@ class WarmPrefetchJobs:
         handle = storage_manager.submit_prefetch_task(
             PrefetchTaskSpec(
                 key_groups=key_groups,
-                fetching_policy="full",
+                fetching_policy=(
+                    "prefix"
+                    if any(row.sliding_window_size > 0 for row in key_groups)
+                    else "full"
+                ),
                 lock_mode=PrefetchLockMode.NO_LOCK,
             )
         )
@@ -126,6 +139,11 @@ class WarmPrefetchJobs:
         with self._lock:
             self._jobs.pop(request_id, None)
         found_keys = sum(row.popcount() for row in result.hit_cells)
+        ready_chunks = (
+            fold_unfold_grouped(result.hit_cells, handle.sliding_windows)[0]
+            if handle.sliding_windows
+            else 0
+        )
         logger.info(
             "Warm prefetch %s completed: %d/%d keys loaded into L1",
             request_id,
@@ -136,4 +154,5 @@ class WarmPrefetchJobs:
             state=COMPLETED,
             found_keys=found_keys,
             total_keys=handle.total_requested_keys,
+            ready_chunks=ready_chunks,
         )

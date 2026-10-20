@@ -111,7 +111,9 @@ class PrefetchService:
 
         Returns:
             ``{"request_id", "status": "pending"}`` or ``{"request_id",
-            "status": "completed", "found_keys", "total_keys"}``.
+            "status": "completed", "found_keys", "total_keys", "ready_chunks"}``.
+            ``ready_chunks`` is the prefix available across all ranks/groups,
+            including existing L1 hits, with no read leases retained.
 
         Raises:
             NotFound: unknown id (already completed-and-consumed, or never
@@ -129,5 +131,6 @@ class PrefetchService:
                 "status": COMPLETED,
                 "found_keys": status.found_keys,
                 "total_keys": status.total_keys,
+                "ready_chunks": status.ready_chunks,
             }
         return {"request_id": request_id, "status": status.state}

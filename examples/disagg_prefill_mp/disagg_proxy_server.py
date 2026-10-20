@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 import argparse
 import asyncio
@@ -21,9 +21,20 @@ from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
 
-# Global dictionary to store asyncio.Events indexed by request ID.
+
+@dataclass
+class PendingRequest:
+    """Store notifications for one request; every TP rank must finish."""
+
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    ranks: set[int] = field(default_factory=set)
+    model_name: str = ""
+    world_size: int = 0
+
+
+# Global dictionary to store completion barriers indexed by request ID.
 # This is shared between the main proxy app and the telemetry app.
-pending_requests: dict[str, asyncio.Event] = {}
+pending_requests: dict[str, PendingRequest] = {}
 pending_requests_lock = threading.Lock()
 
 # Reference to the main event loop (set at startup)
@@ -119,6 +130,10 @@ def parse_args():
     parser.add_argument("--decoder-port", type=csv_ints, default=[8200])
     parser.add_argument("--num-decoders", type=int, default=1)
     parser.add_argument("--telemetry-port", type=int, default=5768)
+    parser.add_argument(
+        "--decoder-cache-url",
+        help="Decoder LMCache HTTP URL; required for shared-L1 P/D readiness",
+    )
 
     args = parser.parse_args()
     return args
@@ -212,12 +227,19 @@ def generate_request_id() -> str:
     return str(uuid.uuid4())[:16]
 
 
-def create_pending_request(request_id: str) -> asyncio.Event:
-    """Create an asyncio.Event for a request and store it."""
-    event = asyncio.Event()
+def create_pending_request(request_id: str) -> PendingRequest:
+    """Create a TP completion barrier for one proxy request.
+
+    Args:
+        request_id: Unique proxy request ID.
+
+    Returns:
+        The pending request, populated by worker telemetry.
+    """
+    pending = PendingRequest()
     with pending_requests_lock:
-        pending_requests[request_id] = event
-    return event
+        pending_requests[request_id] = pending
+    return pending
 
 
 def remove_pending_request(request_id: str):
@@ -226,23 +248,102 @@ def remove_pending_request(request_id: str):
         pending_requests.pop(request_id, None)
 
 
-def notify_request(chatcmpl_request_id: str) -> bool:
+def notify_request(
+    chatcmpl_request_id: str, model_name: str, world_size: int, kv_rank: int
+) -> bool:
+    """Record one worker's store completion, ignoring repeated rank reports.
+
+    Args:
+        chatcmpl_request_id: vLLM request ID wrapping the proxy ID.
+        model_name: Cache model namespace reported by the worker.
+        world_size: Number of TP workers; must agree across reports.
+        kv_rank: Worker rank in ``[0, world_size)``.
+
+    Returns:
+        True when this report completed the barrier, otherwise False.
+
+    Raises:
+        ValueError: The worker identity is invalid or contradicts earlier reports.
     """
-    Notify a pending request that the KV store is complete.
-    Returns True if the request was found and notified.
-    """
+    if (
+        not isinstance(model_name, str)
+        or not model_name
+        or type(world_size) is not int
+        or world_size < 1
+        or type(kv_rank) is not int
+        or not 0 <= kv_rank < world_size
+    ):
+        raise ValueError("Invalid store notification rank/model")
     with pending_requests_lock:
         # vLLM wraps the request ID as "chatcmpl-{uuid}-{suffix}",
         # so strip the first and last segments to recover the original UUID.
         request_id = "-".join(chatcmpl_request_id.split("-")[1:])
         request_id = request_id[:16]
-        event = pending_requests.get(request_id, None)
-        if event:
-            # Schedule the event.set() on the main event loop
-            if main_event_loop is not None:
-                main_event_loop.call_soon_threadsafe(event.set)
+        pending = pending_requests.get(request_id)
+        if pending is None:
+            return False
+        if pending.world_size and (
+            pending.world_size != world_size or pending.model_name != model_name
+        ):
+            raise ValueError("Store notification disagrees with earlier ranks")
+        pending.world_size, pending.model_name = world_size, model_name
+        if kv_rank in pending.ranks:
+            return False
+        pending.ranks.add(kv_rank)
+        if len(pending.ranks) == world_size and main_event_loop is not None:
+            main_event_loop.call_soon_threadsafe(pending.event.set)
             return True
     return False
+
+
+async def wait_for_shared_prefix(
+    client: httpx.AsyncClient,
+    cache_url: str,
+    pending: PendingRequest,
+    token_ids: list[int],
+    cache_salt: str,
+) -> None:
+    """Wait for committed shared chunks using the existing no-lock prefetch API.
+
+    Worker telemetry orders GPU copies, while metadata commits finish later.
+    The decoder's prefix count includes all ranks and hybrid object groups.
+
+    Args:
+        client: HTTP client used for cache requests.
+        cache_url: Decoder LMCache HTTP base URL.
+        pending: Completed worker barrier containing the model name and TP size.
+        token_ids: Exact prompt tokens sent to the prefiller.
+        cache_salt: Same isolation salt as the inference request.
+
+    Raises:
+        httpx.HTTPError: A cache request failed.
+        TimeoutError: The caller's timeout expired before publication.
+    """
+    url = cache_url.rstrip("/") + "/cache/prefetches"
+    body = {
+        "model_name": pending.model_name,
+        "world_size": pending.world_size,
+        "token_ids": token_ids,
+        "cache_salt": cache_salt,
+    }
+    while True:
+        response = await client.post(url, json=body, headers=_build_headers())
+        response.raise_for_status()
+        submitted = response.json()
+        if submitted["status"] == "noop":
+            return
+        while True:
+            response = await client.get(
+                url + "/" + submitted["request_id"], headers=_build_headers()
+            )
+            response.raise_for_status()
+            status = response.json()
+            if status["status"] == "completed":
+                break
+            await asyncio.sleep(0.01)
+        if status["ready_chunks"] == submitted["chunks"]:
+            return
+        await asyncio.sleep(0.01)
 
 
 async def _handle_disagg_request(request: Request, endpoint: str):
@@ -263,7 +364,7 @@ async def _handle_disagg_request(request: Request, endpoint: str):
         prefill_client, decode_client = round_robin_pick_clients()
 
         # Create event for this request (signaled when KV store finishes)
-        event = create_pending_request(request_id)
+        pending = create_pending_request(request_id)
 
         try:
             # Modify request for prefiller: set max_tokens=1
@@ -291,7 +392,25 @@ async def _handle_disagg_request(request: Request, endpoint: str):
             )
 
             # Wait for the event to be signaled (KV store finished)
-            await event.wait()
+            async with asyncio.timeout(60):
+                await pending.event.wait()
+                if global_args.decoder_cache_url:
+                    prompt = req_data.get("prompt")
+                    if isinstance(prompt, list) and all(type(t) is int for t in prompt):
+                        token_ids = prompt
+                    else:
+                        tokenized = await prefill_client.client.post(
+                            "/tokenize", json=req_data, headers=_build_headers()
+                        )
+                        tokenized.raise_for_status()
+                        token_ids = tokenized.json()["tokens"]
+                    await wait_for_shared_prefix(
+                        decode_client.client,
+                        global_args.decoder_cache_url,
+                        pending,
+                        token_ids,
+                        req_data.get("cache_salt", ""),
+                    )
             notify_time = time.monotonic()
             notify_wait_duration = notify_time - prefill_first_response_time
             logger.info(
@@ -398,13 +517,15 @@ async def handle_telemetry(request: Request):
         "kv_rank": K,
     }
 
-    For each request ID in request_ids_set, signal the corresponding
-    event if it exists.
+    For each request ID, record this worker's completion. Signal the proxy
+    only when every distinct rank has reported for the same model/TP size.
     """
     try:
         payload = await request.json()
 
         event_type = payload.get("event")
+        if event_type != "request_store_finished":
+            raise ValueError("Expected request_store_finished telemetry")
         request_ids = payload.get("request_ids_set", [])
 
         for request_id in request_ids:
@@ -414,7 +535,12 @@ async def handle_telemetry(request: Request):
 
         notified_count = 0
         for request_id in request_ids:
-            if notify_request(request_id):
+            if notify_request(
+                request_id,
+                payload.get("model_name"),
+                payload.get("world_size"),
+                payload.get("kv_rank"),
+            ):
                 notified_count += 1
                 logger.info("Notified request: %s", request_id)
 

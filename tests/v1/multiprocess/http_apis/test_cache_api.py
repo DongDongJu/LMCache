@@ -454,8 +454,9 @@ class _FakeLayoutRegistry:
 
 
 class _PrefetchHandle:
-    def __init__(self, total: int) -> None:
+    def __init__(self, total: int, windows: tuple[int, ...]) -> None:
         self.total_requested_keys = total
+        self.sliding_windows = windows
 
 
 @dataclass
@@ -465,15 +466,18 @@ class _PrefetchStorageManager:
     def submit_prefetch_task(self, spec, **_) -> _PrefetchHandle:
         keys = [key for row in spec.key_groups for key in row.keys]
         self.submit_calls.append({"keys": keys, "lock_mode": spec.lock_mode})
-        return _PrefetchHandle(len(keys))
+        return _PrefetchHandle(
+            len(keys), tuple(row.sliding_window_size for row in spec.key_groups)
+        )
 
     def query_prefetch_status(self, handle) -> PrefetchResult:
-        # Every requested key was loaded from L2: one all-set row.
-        n = handle.total_requested_keys
+        # Every requested key was loaded from L2, preserving rank/group rows.
+        rows = len(handle.sliding_windows)
+        n = handle.total_requested_keys // rows
         return PrefetchResult(
-            hit_cells=[Bitmap(n, n)],
-            l1_hit_cells=[Bitmap(n)],
-            l2_hit_cells=[Bitmap(n, n)],
+            hit_cells=[Bitmap(n, n) for _ in range(rows)],
+            l1_hit_cells=[Bitmap(n) for _ in range(rows)],
+            l2_hit_cells=[Bitmap(n, n) for _ in range(rows)],
         )
 
 
@@ -553,6 +557,7 @@ class TestPrefetchEndpoint:
         assert body["status"] == "completed"
         assert body["found_keys"] == 4
         assert body["total_keys"] == 4
+        assert body["ready_chunks"] == 2
         assert client.get(f"/cache/prefetches/{rid}").status_code == 404
 
     def test_status_unknown_request_id_404(self):
