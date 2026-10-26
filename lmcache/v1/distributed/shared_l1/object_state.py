@@ -25,6 +25,7 @@ from lmcache.v1.distributed.shared_l1.visibility import Visibility
 from lmcache.v1.memory_management import TensorMemoryObj
 from lmcache.v1.memory_orchestrator.api import (
     DEFAULT_LAYOUT_FINGERPRINT,
+    DeleteStatus,
     OrchestratorError,
     ReadRequest,
     ReadStatus,
@@ -39,6 +40,12 @@ from lmcache.v1.memory_orchestrator.api import (
 from lmcache.v1.memory_orchestrator.client import MemoryOrchestratorClient
 
 logger = init_logger(__name__)
+
+_DELETE_RESULTS = {
+    DeleteStatus.DELETED: L1Error.SUCCESS,
+    DeleteStatus.MISS: L1Error.KEY_NOT_EXIST,
+    DeleteStatus.BUSY_WRITING: L1Error.KEY_IS_LOCKED,
+}
 
 
 def _layout_to_wire(layout: MemoryLayoutDesc) -> WireLayout:
@@ -490,6 +497,53 @@ class OrchestratedObjectState:
             ret[key] = L1Error.SUCCESS if ok else L1Error.KEY_IN_WRONG_STATE
         return ret
 
+    def delete(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
+        """Make committed objects unreadable for every server.
+
+        Their bytes stay consumed until a region reset, and leases any server
+        already holds on them stay valid until released.
+
+        Args:
+            keys: Keys to delete.
+
+        Returns:
+            Per key ``SUCCESS`` once deleted, ``KEY_NOT_EXIST`` when no
+            committed object exists, or ``KEY_IS_LOCKED`` while the object is
+            still being written or the orchestrator cannot be used.
+        """
+        ret = {key: L1Error.KEY_IS_LOCKED for key in keys}
+        if not keys or self._skip_request_rpc():
+            return ret
+        try:
+            statuses = self._client.delete_objects(keys)
+        except OrchestratorError as exc:
+            self._on_rpc_error("DeleteObjects", exc)
+            return ret
+        self._on_rpc_ok()
+        for key, status in zip(keys, statuses, strict=True):
+            ret[key] = _DELETE_RESULTS[status]
+        return ret
+
+    def delete_published(self) -> int | None:
+        """Delete every committed object written under this server's client_id.
+
+        Objects written before this server restarted count too. Deletion
+        follows :meth:`delete`.
+
+        Returns:
+            The number of objects deleted, or None when the orchestrator
+            cannot be used.
+        """
+        if self._skip_request_rpc():
+            return None
+        try:
+            deleted = self._client.delete_published()
+        except OrchestratorError as exc:
+            self._on_rpc_error("DeletePublished", exc)
+            return None
+        self._on_rpc_ok()
+        return deleted
+
     def get_staging_memory_usage(self) -> int:
         """Return the payload bytes this server reserved and has not committed."""
         with self._lock:
@@ -619,6 +673,6 @@ class OrchestratedObjectState:
             return self._disabled_reason is not None
 
     def _skip_request_rpc(self) -> bool:
-        """Whether a lookup or reservation skips its RPC: closed or disabled."""
+        """Whether a lookup, reservation or delete skips its RPC: closed or disabled."""
         with self._lock:
             return self._closed or self._disabled_reason is not None

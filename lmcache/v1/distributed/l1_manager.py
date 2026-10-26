@@ -1579,9 +1579,15 @@ class L1Manager(L1ManagerInterface):
         keys: list[ObjectKey],
         force: bool = False,
     ) -> dict[ObjectKey, L1Error]:
-        # The orchestrator keeps committed objects until a region reset and
-        # other servers may read them; nothing is freed here, even if forced.
-        return {key: L1Error.KEY_IS_LOCKED for key in keys}
+        # The objects become unreadable for every server; their bytes stay
+        # consumed until a region reset, even if forced.
+        ret = shared.delete(keys)
+        deleted = [key for key, err in ret.items() if err == L1Error.SUCCESS]
+        if deleted:
+            for listener in self._listeners_snapshot():
+                listener.on_l1_keys_deleted_by_manager(deleted)
+            self._publish_shared(EventType.L1_KEYS_EVICTED, {"keys": deleted})
+        return ret
 
     def _shared_finish_write_and_delete(
         self, shared: OrchestratedObjectState, keys: list[ObjectKey], tag: str = ""
@@ -1596,9 +1602,19 @@ class L1Manager(L1ManagerInterface):
     def _shared_clear(
         self, shared: OrchestratedObjectState, force: bool = False
     ) -> None:
-        logger.warning(
-            "L1Manager: clear() leaves the objects of shared Device-DAX L1 %r in "
-            "its region; only a region reset removes them",
+        # Only the objects this server wrote go; other servers' objects stay.
+        deleted = shared.delete_published()
+        if deleted is None:
+            logger.warning(
+                "L1Manager: clear() could not reach the memory orchestrator; the "
+                "objects of shared Device-DAX L1 %r stay readable",
+                self._config.tag,
+            )
+            return
+        logger.info(
+            "L1Manager: cleared %d objects this server wrote to shared "
+            "Device-DAX L1 %r",
+            deleted,
             self._config.tag,
         )
 
