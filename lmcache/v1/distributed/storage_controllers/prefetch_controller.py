@@ -41,6 +41,7 @@ from lmcache.v1.distributed.bitmap_ops.fold import (
     all_grouped,
     fold_unfold_grouped,
 )
+from lmcache.v1.distributed.config import DevDaxL1ManagerConfig
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerInterface
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
@@ -503,6 +504,12 @@ class PrefetchController(StorageControllerInterface):
         self._l1_manager_descriptors: dict[int, L1ManagerDescriptor] = {
             desc.index: desc for desc in l1_manager_descriptors
         }
+        self._shared_l1s = frozenset(
+            desc.index
+            for desc in l1_manager_descriptors
+            if isinstance(desc.config, DevDaxL1ManagerConfig)
+            and desc.config.shared is not None
+        )
 
         self._l2_adapters: dict[int, L2AdapterInterface] = {
             desc.index: adapter
@@ -1188,6 +1195,24 @@ class PrefetchController(StorageControllerInterface):
                 request.key_states.l1_locked_keys[l1_idx] = (
                     _scatter_bitmaps_full_global(res_bitmap, num_rows, num_cols)
                 )
+                # Another server wrote a shared object, so its layout is checked
+                # here, after recording the locks so a mismatch releases them.
+                if l1_idx in self._shared_l1s:
+                    for i, key in enumerate(flattened_keys):
+                        error, obj = result[key]
+                        layout = request.key_groups[i // num_cols].layout_desc
+                        if (
+                            error == L1Error.SUCCESS
+                            and obj is not None
+                            and (
+                                obj.get_shapes() != layout.shapes
+                                or obj.get_dtypes() != layout.dtypes
+                            )
+                        ):
+                            raise ValueError(
+                                f"Shared Device-DAX object {key} "
+                                "does not have the reader's layout"
+                            )
             completed = True
         finally:
             if not completed:

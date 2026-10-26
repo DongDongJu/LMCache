@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Validation of the ``shared`` object of a Device-DAX L1."""
+"""Validation of the ``shared`` object of a Device-DAX L1 and of server modes."""
 
 # Standard
 from dataclasses import replace
@@ -18,6 +18,12 @@ from lmcache.v1.distributed.config import (
     StorageManagerConfig,
     parse_args,
 )
+from lmcache.v1.multiprocess.config import (
+    MPServerConfig,
+    P2PConfig,
+    RuntimePluginConfig,
+)
+from lmcache.v1.multiprocess.server import check_shared_devdax_support
 
 SHARED = {"orchestrator": "h:1", "region_id": "region", "client_id": "host"}
 
@@ -55,6 +61,9 @@ def test_shared_object_reuses_the_dax_fields(spec: dict[str, object]) -> None:
     )
     # The global LRU default does not reach the shared L1.
     assert shared.eviction is not None and shared.eviction.eviction_policy == "noop"
+    check_shared_devdax_support(
+        MPServerConfig(supported_transfer_mode="lmcache_driven"), config
+    )
 
 
 def test_omitted_shared_keeps_the_private_l1(spec: dict[str, object]) -> None:
@@ -148,3 +157,33 @@ def test_programmatic_construction_is_validated(build) -> None:
     with pytest.raises(ValueError):
         config = build()
         StorageManagerConfig(config, EvictionConfig("LRU"), l1_manager_configs=[config])
+
+
+BASE_MP = MPServerConfig(supported_transfer_mode="lmcache_driven")
+
+
+@pytest.mark.parametrize(
+    "mp_config",
+    [
+        replace(BASE_MP, supported_transfer_mode="auto"),
+        replace(BASE_MP, supported_transfer_mode="engine_driven"),
+        replace(BASE_MP, engine_type="blend"),
+        replace(BASE_MP, p2p_config=P2PConfig(advertise_url="h:9000")),
+        replace(
+            BASE_MP, runtime_plugin_config=RuntimePluginConfig(locations=["plugin.py"])
+        ),
+    ],
+)
+def test_unsupported_server_modes(
+    spec: dict[str, object], mp_config: MPServerConfig
+) -> None:
+    with pytest.raises(ValueError, match="shared Device-DAX"):
+        check_shared_devdax_support(mp_config, parse_args(args([spec])))
+
+
+def test_private_servers_keep_every_mode(spec: dict[str, object]) -> None:
+    del spec["shared"]
+    check_shared_devdax_support(
+        replace(BASE_MP, supported_transfer_mode="auto", engine_type="blend"),
+        parse_args(args([spec])),
+    )
