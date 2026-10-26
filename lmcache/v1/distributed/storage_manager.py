@@ -448,6 +448,28 @@ class StorageManager:
 
         # TODO: global key states update
 
+    def abort_write_by_owner(self, completion: L1WriteCompletion) -> None:
+        """Discard captured reservations whose store failed.
+
+        The caller must wait for every device write into the reserved
+        buffers, so schedule this on the stream of the copies. A private L1
+        frees the staging buffers now instead of at write-TTL expiry; a shared
+        Device-DAX L1 aborts its grants, which the orchestrator would
+        otherwise keep write-locked against every later writer.
+
+        Args:
+            completion: Owner/key groups captured before the copies ran.
+
+        Raises:
+            ValueError: A captured owner is no longer registered.
+        """
+        if any(owner not in self._l1_managers_by_id for owner, _ in completion):
+            raise ValueError("write completion requires a registered L1 owner")
+        for owner, keys in completion:
+            self._l1_managers_by_id[owner].finish_write_and_delete(
+                keys, tag=_L1_WRITE_TAG
+            )
+
     @contextmanager
     def read_prefetched_results(
         self,

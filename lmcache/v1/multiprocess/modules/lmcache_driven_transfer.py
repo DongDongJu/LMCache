@@ -210,6 +210,11 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             payload_type=L1WriteCompletion,
         )
         self._device_host_func_dispatcher.register(
+            "abort_write_by_owner",
+            self._ctx.storage_manager.abort_write_by_owner,
+            payload_type=L1WriteCompletion,
+        )
+        self._device_host_func_dispatcher.register(
             "finish_read_prefetched",
             self._ctx.storage_manager.finish_read_prefetched,
             payload_type=list[ObjectKey],
@@ -620,9 +625,8 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             store is skipped and nothing is committed; a subsequent retrieve misses
             and the engine recomputes. The boolean result reports whether the
             store completed without such a failure.
-            Failed copies or completion preparation retain staging reservations
-            under the existing write-TTL rules; queued GPU writes may still
-            reference those buffers.
+            Failed copies or completion preparation abort their reservations
+            on the copy stream, after the queued GPU writes into them drain.
         """
         st = time.perf_counter()
 
@@ -760,6 +764,8 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
 
             reserved_dict: dict[ObjectKey, MemoryObj] = {}
             all_dict: dict[ObjectKey, MemoryObj] = {}
+            # Captured before any copy runs, so a failed store aborts per owner.
+            reserved_owners: L1WriteCompletion = []
             total_bytes: int = 0
             store_succeeded = False
             try:
@@ -779,6 +785,11 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     )
                     all_dict.update(reserved_dict)
                     if reserved_dict:
+                        reserved_owners.extend(
+                            self._ctx.storage_manager.prepare_write_completion(
+                                reserved_dict
+                            )
+                        )
                         total_bytes += next(
                             iter(reserved_dict.values())
                         ).get_size() * len(reserved_dict)
@@ -823,6 +834,13 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     )
                 else:
                     total_bytes = 0
+                    if reserved_owners:
+                        # Abort after the partial copies drain, not at write TTL.
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "abort_write_by_owner",
+                            reserved_owners,
+                        )
                 num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
