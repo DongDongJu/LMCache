@@ -311,3 +311,10 @@ the last cached entry is deleted. It accepts real `/dev/dax` devices via
   (`add_device` / `remove_device`).
 - Runtime reconfigure maps and unmaps already-provisioned Device-DAX devices;
   it does not perform kernel-level CXL/DAX namespace reconfiguration.
+
+## Shared Mode
+
+With a `shared` object the manager has no allocator: it maps the orchestrator's
+region with `DevDaxMemoryAllocator.open_devdax_mapping`, requires GPU
+registration, and returns parentless `view()`s of granted extents, so dropping
+one frees nothing. See [shared_l1](../shared_l1/shared_l1.md).

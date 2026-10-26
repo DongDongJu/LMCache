@@ -74,6 +74,23 @@ def _l1_offset_bytes(values: dict[str, object]) -> int:
     return int(value * (1 << 30))
 
 
+def _parse_shared_devdax(raw: object) -> "SharedDevDaxConfig":
+    """Read the JSON ``shared`` object; ``SharedDevDaxConfig`` checks the values."""
+    if not isinstance(raw, dict):
+        raise ValueError("shared must be a JSON object")
+    fields = {"orchestrator", "region_id", "client_id", "rpc_timeout_seconds"}
+    if unknown := set(raw) - fields:
+        raise ValueError(f"Unknown shared fields: {sorted(unknown)}")
+    names = ("orchestrator", "region_id", "client_id")
+    for name in names:
+        if not isinstance(raw.get(name), str):
+            raise ValueError(f"shared.{name} must be a string")
+    return SharedDevDaxConfig(
+        **{name: raw[name] for name in names},
+        rpc_timeout_seconds=_l1_number(raw, "rpc_timeout_seconds", 5.0),
+    )
+
+
 def _parse_l1_common(
     cls: type[_L1ConfigT],
     values: dict[str, object],
@@ -429,6 +446,38 @@ class GdsL1Config:
     """Allocation alignment; cuFile/hipFile and O_DIRECT require 4 KiB."""
 
 
+@dataclass(frozen=True)
+class SharedDevDaxConfig:
+    """The ``shared`` object of a Device-DAX L1.
+
+    A memory orchestrator (``python -m lmcache.v1.memory_orchestrator``) owns
+    allocation and object readiness for one region that several MP servers
+    map; each server maps it through the L1's own ``path`` and ``offset_gb``
+    and moves the KV bytes.
+    """
+
+    orchestrator: str
+    """ ``host:port`` of the region's memory orchestrator. """
+
+    region_id: str
+    """ Must equal the orchestrator's region ID. """
+
+    client_id: str
+    """ Stable identity of this MP server, unique among the region's servers. """
+
+    rpc_timeout_seconds: float = 5.0
+    """ Deadline of each orchestrator RPC attempt. """
+
+    def __post_init__(self) -> None:
+        for name in ("orchestrator", "region_id", "client_id"):
+            if not getattr(self, name).strip():
+                raise ValueError(f"shared.{name} must be a non-empty string")
+        if not (
+            math.isfinite(self.rpc_timeout_seconds) and self.rpc_timeout_seconds > 0
+        ):
+            raise ValueError("shared.rpc_timeout_seconds must be finite and positive")
+
+
 @dataclass
 class L1ManagerConfig:
     """
@@ -584,6 +633,10 @@ class DRAML1ManagerConfig(L1ManagerConfig):
 class DevDaxL1ManagerConfig(L1ManagerConfig):
     """A separate Device-DAX L1 with no implicit DRAM overflow pool."""
 
+    shared: SharedDevDaxConfig | None = None
+    """ Set when a memory orchestrator owns the objects of the mapped range,
+    which other MP servers map too; None keeps the private Device-DAX L1. """
+
     @classmethod
     def from_dict(
         cls,
@@ -596,6 +649,8 @@ class DevDaxL1ManagerConfig(L1ManagerConfig):
 
         Args:
             values: JSON fields for this backend, including tag and size_gb.
+                An optional ``shared`` object binds the range to a memory
+                orchestrator; its eviction policy then defaults to ``noop``.
             defaults: Global eviction settings, or None to require a local policy.
             read_ttl: Default read-lock lifetime in seconds.
             write_ttl: Default write-lock lifetime in seconds.
@@ -606,15 +661,43 @@ class DevDaxL1ManagerConfig(L1ManagerConfig):
         Raises:
             ValueError: A field is unknown, malformed, or incompatible.
         """
+        if "shared" in values and "eviction" not in values:
+            values = {**values, "eviction": {"eviction_policy": "noop"}}
         config = _parse_l1_common(
-            cls, values, defaults, read_ttl, write_ttl, {"path", "offset_gb"}
+            cls, values, defaults, read_ttl, write_ttl, {"path", "offset_gb", "shared"}
         )
         config.memory_config = replace(
             config.memory_config,
             devdax_path=_l1_path(values),
             devdax_offset_in_bytes=_l1_offset_bytes(values),
         )
+        if "shared" in values:
+            config.shared = _parse_shared_devdax(values["shared"])
         return config
+
+
+def validate_shared_devdax_l1(config: DevDaxL1ManagerConfig) -> None:
+    """Reject a shared Device-DAX L1 this revision cannot serve.
+
+    Call it before mapping the range or registering with the orchestrator.
+
+    Args:
+        config: A Device-DAX L1 configuration with ``shared`` set.
+
+    Raises:
+        ValueError: The path is missing, the legacy DRAM-plus-DAX hybrid
+            allocator is configured, or the eviction policy is not ``noop``.
+    """
+    memory = config.memory_config
+    if not memory.devdax_path:
+        raise ValueError("A shared Device-DAX L1 requires a path")
+    if memory.devdax_size_in_bytes:
+        raise ValueError(
+            "A shared Device-DAX L1 cannot use the DRAM-plus-DAX hybrid "
+            "allocator; configure private DRAM as a separate L1"
+        )
+    if config.eviction is not None and config.eviction.eviction_policy != "noop":
+        raise ValueError("A shared Device-DAX L1 requires eviction_policy noop")
 
 
 @dataclass
@@ -757,10 +840,20 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
         None.
 
     Raises:
-        ValueError: If mutually exclusive L1 tiers are both configured, or
-            hybrid L1 is paired with incompatible L2 adapters.
+        ValueError: If mutually exclusive L1 tiers are both configured,
+            hybrid L1 is paired with incompatible L2 adapters, or more than
+            one shared Device-DAX L1 or an unsupported one is configured.
     """
     by_tag = {c.tag: c for c in config.l1_manager_configs}
+    shared = [
+        c
+        for c in by_tag.values()
+        if isinstance(c, DevDaxL1ManagerConfig) and c.shared is not None
+    ]
+    if len(shared) > 1:
+        raise ValueError("Only one shared Device-DAX L1 is supported per MP server")
+    for c in shared:
+        validate_shared_devdax_l1(c)
     shm_names = [
         c.memory_config.shm_name
         for c in by_tag.values()

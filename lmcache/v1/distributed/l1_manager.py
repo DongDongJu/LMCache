@@ -21,7 +21,11 @@ from lmcache.v1.distributed.api import (
     MemoryTags,
     ObjectKey,
 )
-from lmcache.v1.distributed.config import L1ManagerConfig, get_configured_capacity_bytes
+from lmcache.v1.distributed.config import (
+    DevDaxL1ManagerConfig,
+    L1ManagerConfig,
+    get_configured_capacity_bytes,
+)
 from lmcache.v1.distributed.error import L1Error, L1ReconfigureError
 from lmcache.v1.distributed.internal_api import (
     L1ManagerInterface,
@@ -204,6 +208,8 @@ class L1Manager(L1ManagerInterface):
     )
 
     def __init__(self, config: L1ManagerConfig):
+        if isinstance(config, DevDaxL1ManagerConfig) and config.shared is not None:
+            raise ValueError("L1Manager does not run a shared Device-DAX L1 yet")
         self._config = config
         self._l1_manager_id = next_l1_manager_id()
         self._lock = threading.Lock()

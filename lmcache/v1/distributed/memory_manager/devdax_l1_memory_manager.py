@@ -2,11 +2,18 @@
 """Device-DAX L1 memory manager."""
 
 # Standard
-from typing import cast
+from dataclasses import dataclass
+from typing import Any, cast
+import mmap
+import os
+
+# Third Party
+import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import L1BackendType
+from lmcache.utils import get_device_identity, get_size_bytes
+from lmcache.v1.distributed.api import L1BackendType, MemoryLayoutDesc
 from lmcache.v1.distributed.config import L1MemoryManagerConfig
 from lmcache.v1.distributed.error import L1ReconfigureError
 from lmcache.v1.distributed.internal_api import L1MemoryDesc
@@ -17,9 +24,51 @@ from lmcache.v1.memory_allocators.devdax_memory_allocator import (
     DevDaxNotMappedError,
     DevDaxRemoveMode,
 )
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import (
+    MemoryFormat,
+    MemoryObj,
+    MemoryObjMetadata,
+    TensorMemoryObj,
+)
+from lmcache.v1.memory_orchestrator.api import RegionContract
+from lmcache.v1.platform import current_device_spec
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _SharedRegionMapping:
+    """The mapping of a region whose extents a memory orchestrator grants."""
+
+    path: str
+    offset: int
+    """ Device offset where the region starts. """
+    capacity: int
+    alignment: int
+    fd: int
+    mmap_obj: mmap.mmap
+    mmap_buffer: Any
+    buffer: torch.Tensor
+    registered: bool = False
+
+    def close(self) -> None:
+        """Unregister and unmap the region once; live views keep it mapped."""
+        if self.fd < 0:
+            return
+        if self.registered:
+            current_device_spec.unpin_memory(self.buffer.data_ptr())
+            self.registered = False
+        self.buffer = torch.empty(0, dtype=torch.uint8)
+        self.mmap_buffer = None
+        try:
+            self.mmap_obj.close()
+        except BufferError:
+            logger.warning(
+                "Shared Device-DAX region %s still has live views; leaving it mapped",
+                self.path,
+            )
+        os.close(self.fd)
+        self.fd = -1
 
 
 class DevDaxL1MemoryManager(L1MemoryManager):
@@ -31,19 +80,40 @@ class DevDaxL1MemoryManager(L1MemoryManager):
     CPU L1 manager. A pure Device-DAX configuration maps the DAX device as the
     full L1 arena. A hybrid configuration uses DRAM first and spills overflow
     allocations into Device-DAX.
+
+    A shared region (``shared_region`` set) has no local allocator: the memory
+    orchestrator owns its bytes, and this manager only maps and GPU-registers
+    the region and builds bounds-checked views of the extents it grants.
     """
 
-    def __init__(self, config: L1MemoryManagerConfig) -> None:
+    def __init__(
+        self,
+        config: L1MemoryManagerConfig,
+        shared_region: RegionContract | None = None,
+    ) -> None:
         """Create a Device-DAX L1 memory manager.
 
         Args:
             config: L1 memory configuration with ``devdax_path`` set.
+            shared_region: Contract of the memory orchestrator's region when
+                the range is shared. The manager then maps the region's
+                capacity at ``devdax_offset_in_bytes`` and GPU-registers it.
 
         Raises:
             ValueError: If ``devdax_path`` is not configured.
+            RuntimeError: If a shared region leaves the device, breaks its
+                alignment, or cannot be GPU-registered.
+            OSError: If a shared region cannot be opened or mapped.
         """
         if not config.devdax_path:
             raise ValueError("DevDaxL1MemoryManager requires devdax_path")
+
+        self._shared: _SharedRegionMapping | None = None
+        if shared_region is not None:
+            self._shared = self._map_shared_region(
+                config.devdax_path, config.devdax_offset_in_bytes, shared_region
+            )
+            return
 
         devdax_size = config.devdax_size_in_bytes or config.size_in_bytes
         local_size = config.size_in_bytes if config.devdax_size_in_bytes else 0
@@ -112,10 +182,69 @@ class DevDaxL1MemoryManager(L1MemoryManager):
             size_in_bytes: Length of the candidate range.
 
         Returns:
-            ``True`` while an overlapping arena remains mapped.
+            ``True`` while an overlapping arena, or the overlapping shared
+            region, remains mapped.
         """
+        shared = self._shared
+        if shared is not None:
+            identity = get_device_identity(device_path)
+            return (
+                identity is not None
+                and identity == get_device_identity(shared.fd)
+                and offset_in_bytes < shared.offset + shared.capacity
+                and shared.offset < offset_in_bytes + size_in_bytes
+            )
         return cast(DevDaxMemoryAllocator, self._allocator).owns_range(
             device_path, offset_in_bytes, size_in_bytes
+        )
+
+    def view(
+        self, offset: int, length: int, layout: MemoryLayoutDesc
+    ) -> TensorMemoryObj:
+        """Return a view of an extent the memory orchestrator granted.
+
+        The view has no parent allocator: dropping it never returns the
+        orchestrator's bytes to an allocator or unmaps them.
+
+        Args:
+            offset: Byte offset of the extent in the region.
+            length: Aligned extent length in bytes.
+            layout: Shapes and dtypes of the object's tensors.
+
+        Returns:
+            A memory object over ``[offset, offset + length)`` of the region.
+
+        Raises:
+            ValueError: The extent is negative, misaligned, outside the
+                region, or smaller than the layout's payload.
+        """
+        shared = self._shared
+        assert shared is not None, "view() requires a shared Device-DAX region"
+        payload = get_size_bytes(layout.shapes, layout.dtypes)
+        if (
+            offset < 0
+            or offset % shared.alignment
+            or length < payload
+            or offset + length > shared.capacity
+        ):
+            raise ValueError(
+                f"extent [{offset}, {offset + length}) for a {payload}-byte "
+                f"object does not fit the {shared.capacity}-byte region"
+            )
+        return TensorMemoryObj(
+            raw_data=shared.buffer[offset : offset + length],
+            metadata=MemoryObjMetadata(
+                layout.shapes[0],
+                layout.dtypes[0],
+                offset,
+                length,
+                1,
+                0,
+                MemoryFormat.KV_2LTD,
+                shapes=list(layout.shapes),
+                dtypes=list(layout.dtypes),
+            ),
+            parent_allocator=None,
         )
 
     def add_device(
@@ -206,8 +335,11 @@ class DevDaxL1MemoryManager(L1MemoryManager):
 
         Returns:
             One for the DRAM tier of a hybrid configuration, if present, plus
-            one per mapped Device-DAX arena, active or draining.
+            one per mapped Device-DAX arena, active or draining; one for a
+            shared region.
         """
+        if self._shared is not None:
+            return 1
         return cast(DevDaxMemoryAllocator, self._allocator).memory_region_count()
 
     def get_arena_statuses(self) -> list[DevDaxArenaStatus]:
@@ -219,3 +351,46 @@ class DevDaxL1MemoryManager(L1MemoryManager):
         """
         allocator = cast(DevDaxMemoryAllocator, self._allocator)
         return allocator.arena_statuses()
+
+    def close(self) -> None:
+        """Release all resources.
+
+        A shared region is GPU-unregistered and unmapped; call this only
+        after copies through its views have drained.
+        """
+        if self._shared is None:
+            super().close()
+            return
+        self._shared.close()
+
+    def _map_shared_region(
+        self, path: str, offset: int, contract: RegionContract
+    ) -> _SharedRegionMapping:
+        """Map the region's capacity at ``offset`` of ``path``; GPU-register it."""
+        fd, mmap_obj, mmap_buffer, buffer = DevDaxMemoryAllocator.open_devdax_mapping(
+            path, contract.capacity_bytes, offset
+        )
+        mapping = _SharedRegionMapping(
+            path,
+            offset,
+            contract.capacity_bytes,
+            contract.alignment_bytes,
+            fd,
+            mmap_obj,
+            mmap_buffer,
+            buffer,
+        )
+        try:
+            # Shared direct transfers require registered memory; unlike the
+            # private path there is no pageable fallback.
+            mapping.registered = current_device_spec.pin_memory(
+                buffer.data_ptr(), mapping.capacity
+            )
+            if not mapping.registered:
+                raise RuntimeError(
+                    f"A shared Device-DAX region must be GPU-registered: {path}"
+                )
+        except BaseException:
+            mapping.close()
+            raise
+        return mapping
