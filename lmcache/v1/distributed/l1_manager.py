@@ -25,11 +25,13 @@ from lmcache.v1.distributed.config import (
     DevDaxL1ManagerConfig,
     L1ManagerConfig,
     get_configured_capacity_bytes,
+    validate_shared_devdax_l1,
 )
 from lmcache.v1.distributed.error import L1Error, L1ReconfigureError
 from lmcache.v1.distributed.internal_api import (
     L1ManagerInterface,
     L1ManagerListener,
+    L1MemoryDesc,
     L1ObjectMeta,
     L1OperationResult,
 )
@@ -41,6 +43,7 @@ from lmcache.v1.distributed.memory_manager import (
 from lmcache.v1.distributed.memory_manager.devdax_l1_memory_manager import (
     DevDaxL1MemoryManager,
 )
+from lmcache.v1.distributed.shared_l1.object_state import OrchestratedObjectState
 from lmcache.v1.gpu_connector.gds_context import (
     close_l1_gds_context,
     initialize_l1_gds_context,
@@ -120,9 +123,17 @@ class L1ObjectState:
 def l1_mgr_synchronized(func):
     """
     Decorator to mark L1Manager methods as thread-safe
+
+    A shared Device-DAX L1 runs ``_shared_<name>`` with its object state
+    instead, without the lock: those calls wait on the memory orchestrator,
+    which must never happen while ``_lock`` is held.
     """
+    shared_name = f"_shared_{func.__name__}"
 
     def wrapper(self: "L1Manager", *args, **kwargs):
+        shared = self._shared
+        if shared is not None:
+            return getattr(self, shared_name)(shared, *args, **kwargs)
         with self._lock:
             return func(self, *args, **kwargs)
 
@@ -200,6 +211,10 @@ class L1Manager(L1ManagerInterface):
     For every operation on list of keys, the operation is atomic
     """
 
+    # Object state of a shared Device-DAX L1, set by __init__; None keeps the
+    # private path (see l1_mgr_synchronized).
+    _shared: OrchestratedObjectState | None = None
+
     # OTel registers each gauge once; its callback snapshots all live managers.
     _gauge_registered: bool = False
     _gauge_lock = threading.Lock()
@@ -208,8 +223,6 @@ class L1Manager(L1ManagerInterface):
     )
 
     def __init__(self, config: L1ManagerConfig):
-        if isinstance(config, DevDaxL1ManagerConfig) and config.shared is not None:
-            raise ValueError("L1Manager does not run a shared Device-DAX L1 yet")
         self._config = config
         self._l1_manager_id = next_l1_manager_id()
         self._lock = threading.Lock()
@@ -224,6 +237,8 @@ class L1Manager(L1ManagerInterface):
 
         # GDS, Device-DAX, and CPU L1 are mutually exclusive tiers. Each tier
         # owns its backing allocator instead of branching inside the CPU path.
+        # A shared Device-DAX L1 has no allocator: the memory orchestrator owns
+        # its objects, and the synchronized methods route to ``_shared``.
         self._memory_manager: L1ManagerProtocol
         if config.gds_l1_config is not None:
             if config.memory_config.devdax_path:
@@ -231,6 +246,11 @@ class L1Manager(L1ManagerInterface):
             self._memory_manager = GDSL1MemoryManager(config.gds_l1_config)
             initialize_l1_gds_context(self._l1_manager_id, config.gds_l1_config)
             logger.info("L1Manager: GDS L1 tier enabled; CPU pinned-DRAM L1 disabled")
+        elif isinstance(config, DevDaxL1ManagerConfig) and config.shared is not None:
+            validate_shared_devdax_l1(config)
+            self._shared, self._memory_manager = OrchestratedObjectState.connect(
+                config.shared, config.memory_config, self._l1_manager_id
+            )
         elif config.memory_config.devdax_path:
             self._memory_manager = DevDaxL1MemoryManager(config.memory_config)
             logger.info("L1Manager: Device-DAX L1 tier enabled; CPU-only L1 disabled")
@@ -1001,7 +1021,13 @@ class L1Manager(L1ManagerInterface):
         Note:
             In the future, we many want to make a "callback" based mechanism
             via "L1ManagerListener" to notify the memory usage changes.
+            A shared Device-DAX L1 reports its staging bytes and region capacity.
         """
+        if self._shared is not None:
+            return (
+                self._shared.get_staging_memory_usage(),
+                self._shared.capacity_bytes,
+            )
         return self._memory_manager.get_memory_usage()
 
     @l1_mgr_synchronized
@@ -1032,8 +1058,10 @@ class L1Manager(L1ManagerInterface):
         Note:
             Device-DAX arena state is snapshotted under the allocator's pool
             lock. A separate usage query may observe an adjacent topology if
-            reconfiguration is concurrent.
+            reconfiguration is concurrent. A shared Device-DAX L1 reports its region.
         """
+        if self._shared is not None:
+            return {L1BackendType.DEVDAX: self._shared.capacity_bytes}
         capacities = self._boot_capacity_bytes_by_backend.copy()
         manager = self._memory_manager
         if isinstance(manager, DevDaxL1MemoryManager):
@@ -1048,8 +1076,14 @@ class L1Manager(L1ManagerInterface):
                 capacities.pop(L1BackendType.DEVDAX, None)
         return capacities
 
-    def get_l1_memory_desc(self):
-        """Return an L1MemoryDesc describing the underlying L1 memory buffer."""
+    def get_l1_memory_desc(self) -> L1MemoryDesc | None:
+        """Return an L1MemoryDesc describing the underlying L1 memory buffer.
+
+        A shared Device-DAX L1 returns None: no L2 adapter may register the
+        region another authority allocates.
+        """
+        if self._shared is not None:
+            return None
         return self._memory_manager.get_l1_memory_desc()
 
     def get_memory_tags(self) -> MemoryTags:
@@ -1057,12 +1091,16 @@ class L1Manager(L1ManagerInterface):
 
         Returns:
             ``GDS`` for a GDS slab, ``CXL`` for a pure Device-DAX tier, and
-            ``DRAM`` otherwise, all ``LOCAL``.
+            ``DRAM`` otherwise, all ``LOCAL``; a shared region is ``CXL``/``REMOTE``.
 
         Note:
             A hybrid DRAM + Device-DAX tier reports ``DRAM``, its primary
             pool. Tags are fixed at construction.
         """
+        if self._shared is not None:
+            return MemoryTags(
+                segment=MemorySegment.CXL, residency=MemoryResidency.REMOTE
+            )
         memory_config = self._config.memory_config
         if self._config.gds_l1_config is not None:
             segment = MemorySegment.GDS
@@ -1188,13 +1226,19 @@ class L1Manager(L1ManagerInterface):
         return self._config
 
     def close(self) -> None:
-        """Close the L1Manager and free all resources."""
+        """Close the L1Manager and free all resources.
+
+        Close a shared Device-DAX L1 only after copies through it have drained.
+        """
         close_l1_gds_context(self._l1_manager_id)
+        if self._shared is not None:
+            self._shared.close()
         with self._lock:
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
             for per_tag in self._staging.values():
                 all_memory_objs.extend(staged.memory_obj for staged in per_tag.values())
-            self._memory_manager.free(all_memory_objs)
+            if self._shared is None:
+                self._memory_manager.free(all_memory_objs)
             self._objects.clear()
             self._staging.clear()
             self._staging_bytes = 0
@@ -1434,12 +1478,167 @@ class L1Manager(L1ManagerInterface):
 
     def _require_devdax_memory_manager(self) -> DevDaxL1MemoryManager:
         """Return the Device-DAX manager or raise a reconfiguration error."""
+        if self._shared is not None:
+            raise L1ReconfigureError(
+                409,
+                "A shared Device-DAX L1 has no arenas: its memory orchestrator "
+                "owns the region, so hot-plug is unsupported",
+            )
         if not isinstance(self._memory_manager, DevDaxL1MemoryManager):
             raise L1ReconfigureError(
                 409,
                 "L1 is not Device-DAX backed (--l1-devdax-path not set)",
             )
         return self._memory_manager
+
+    # Shared Device-DAX region: ``l1_mgr_synchronized`` routes here unlocked.
+    # Object state lives in the orchestrator; listeners and events stay here.
+
+    def _shared_reserve_read(
+        self,
+        shared: OrchestratedObjectState,
+        keys: list[ObjectKey],
+        read_locks: int = 1,
+    ) -> dict[ObjectKey, L1OperationResult]:
+        ret = shared.reserve_read(keys, validate_read_locks(read_locks))
+        leased = [key for key, (err, _) in ret.items() if err == L1Error.SUCCESS]
+        for listener in self._listeners_snapshot():
+            listener.on_l1_keys_reserved_read(leased)
+        self._publish_shared(EventType.L1_READ_RESERVED, {"keys": leased})
+        return ret
+
+    def _shared_unsafe_read(
+        self, shared: OrchestratedObjectState, keys: list[ObjectKey]
+    ) -> dict[ObjectKey, L1OperationResult]:
+        # Leased views only: the retrieve path reads prefetched keys this way.
+        return shared.unsafe_read(keys)
+
+    def _shared_finish_read(
+        self,
+        shared: OrchestratedObjectState,
+        keys: list[ObjectKey],
+        read_locks: int = 1,
+    ) -> dict[ObjectKey, L1Error]:
+        ret = shared.finish_read(keys, validate_read_locks(read_locks))
+        done = [key for key, err in ret.items() if err == L1Error.SUCCESS]
+        for listener in self._listeners_snapshot():
+            listener.on_l1_keys_read_finished(done)
+        self._publish_shared(EventType.L1_READ_FINISHED, {"keys": done})
+        return ret
+
+    def _shared_reserve_write(
+        self,
+        shared: OrchestratedObjectState,
+        keys: list[ObjectKey],
+        is_temporary: list[bool],
+        layout_desc: MemoryLayoutDesc,
+        tag: str = "",
+    ) -> dict[ObjectKey, L1OperationResult]:
+        ret = shared.reserve_write(keys, is_temporary, layout_desc, tag)
+        granted = [key for key, (err, _) in ret.items() if err == L1Error.SUCCESS]
+        for listener in self._listeners_snapshot():
+            listener.on_l1_keys_reserved_write(granted)
+        self._publish_shared(EventType.L1_WRITE_RESERVED, {"keys": granted, "tag": tag})
+        return ret
+
+    def _shared_finish_write(
+        self, shared: OrchestratedObjectState, keys: list[ObjectKey], tag: str = ""
+    ) -> dict[ObjectKey, L1Error]:
+        ret, done = shared.commit(keys, tag)
+        self._report_shared_write_finished(done)
+        return ret
+
+    def _shared_finish_write_and_reserve_read(
+        self,
+        shared: OrchestratedObjectState,
+        keys: list[ObjectKey],
+        read_locks: int = 1,
+        tag: str = "",
+    ) -> dict[ObjectKey, L1OperationResult]:
+        count = validate_read_locks(read_locks)
+        errors, done = shared.commit(keys, tag)
+        ret: dict[ObjectKey, L1OperationResult] = {
+            key: (err, None) for key, err in errors.items() if err != L1Error.SUCCESS
+        }
+        ret.update(shared.reserve_read(done, count))
+        # Report only what succeeded: a commit whose lease failed is written,
+        # not read-reserved.
+        leased = [key for key in done if ret[key][0] == L1Error.SUCCESS]
+        unleased = [key for key in done if ret[key][0] != L1Error.SUCCESS]
+        for listener in self._listeners_snapshot():
+            listener.on_l1_keys_finish_write_and_reserve_read(leased)
+        self._publish_shared(
+            EventType.L1_WRITE_FINISHED_AND_READ_RESERVED, {"keys": leased}
+        )
+        self._report_shared_write_finished(unleased)
+        return ret
+
+    def _shared_delete(
+        self,
+        shared: OrchestratedObjectState,
+        keys: list[ObjectKey],
+        force: bool = False,
+    ) -> dict[ObjectKey, L1Error]:
+        # The orchestrator keeps committed objects until a region reset and
+        # other servers may read them; nothing is freed here, even if forced.
+        return {key: L1Error.KEY_IS_LOCKED for key in keys}
+
+    def _shared_finish_write_and_delete(
+        self, shared: OrchestratedObjectState, keys: list[ObjectKey], tag: str = ""
+    ) -> dict[ObjectKey, L1Error]:
+        ret = shared.abort(keys, tag)
+        gone = [key for key, err in ret.items() if err != L1Error.KEY_NOT_EXIST]
+        if gone:
+            for listener in self._listeners_snapshot():
+                listener.on_l1_keys_deleted_by_manager(gone)
+        return ret
+
+    def _shared_clear(
+        self, shared: OrchestratedObjectState, force: bool = False
+    ) -> None:
+        logger.warning(
+            "L1Manager: clear() leaves the objects of shared Device-DAX L1 %r in "
+            "its region; only a region reset removes them",
+            self._config.tag,
+        )
+
+    def _shared_get_staging_memory_usage(self, shared: OrchestratedObjectState) -> int:
+        return shared.get_staging_memory_usage()
+
+    def _shared_report_status(self, shared: OrchestratedObjectState) -> dict:
+        return shared.report_status()
+
+    def _shared_get_object_state(
+        self, shared: OrchestratedObjectState, key: ObjectKey
+    ) -> L1ObjectState | None:
+        return None
+
+    def _shared_memcheck(self, shared: OrchestratedObjectState) -> bool:
+        return shared.is_healthy()
+
+    def _report_shared_write_finished(self, keys: list[ObjectKey]) -> None:
+        """Notify listeners and the event bus that shared ``keys`` committed."""
+        if not keys:
+            return
+        for listener in self._listeners_snapshot():
+            listener.on_l1_keys_write_finished(keys)
+        self._publish_shared(EventType.L1_WRITE_FINISHED, {"keys": keys})
+
+    def _listeners_snapshot(self) -> list[L1ManagerListener]:
+        with self._lock:
+            return list(self._registered_listeners)
+
+    def _publish_shared(
+        self, event_type: EventType, metadata: dict[str, object]
+    ) -> None:
+        # ``shared`` keeps region-owned placements out of per-server cache
+        # events, which would otherwise report one object once per server.
+        self._event_bus.publish(
+            Event(
+                event_type=event_type,
+                metadata={"l1_tag": self._config.tag, "shared": True, **metadata},
+            )
+        )
 
     @classmethod
     def _observations(

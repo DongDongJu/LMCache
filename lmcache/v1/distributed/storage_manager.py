@@ -26,6 +26,7 @@ from lmcache.v1.distributed.api import (
     Tier,
 )
 from lmcache.v1.distributed.config import (
+    DevDaxL1ManagerConfig,
     EvictionConfig,
     StorageManagerConfig,
     requires_single_l1_memory_region,
@@ -120,6 +121,11 @@ class StorageManager:
             ValueError: Manager identities/tags, placement, backing storage, or
                 affinity settings conflict.
         """
+        if any(
+            isinstance(c, DevDaxL1ManagerConfig) and c.shared is not None
+            for c in config.l1_manager_configs
+        ):
+            raise ValueError("StorageManager does not run a shared Device-DAX L1 yet")
         with ExitStack() as cleanup:
             if _l1_managers is not None:
                 if not _l1_managers or len(
