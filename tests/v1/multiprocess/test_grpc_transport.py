@@ -606,7 +606,9 @@ def test_response_encoder_compiles_its_codec_once(
     encode = proto_codec.compile_response_encoder_for_type(
         kv_event_service_pb2.KVEventBatch, KVEventBatch
     )
-    record = KVEventRecord(1, "stored", "cpu", "model", [b"h"], None, [1, 2, 3])
+    record = KVEventRecord(
+        1, "stored", "CPU", "model", (b"h",), None, (1, 2, 3), 3, "test-native", 1
+    )
     batch = KVEventBatch(True, 1, 2, False, [record])
 
     first = encode(batch).SerializeToString()
@@ -1013,7 +1015,9 @@ def test_client_reports_a_zmq_server_instead_of_waiting() -> None:
     client = GrpcMultiprocessClient(f"grpc://127.0.0.1:{port}")  # type: ignore[abstract]
     try:
         in_flight = client.noop()
-        stream = client.subscribe_kv_events(1, "model", 0, 16)
+        stream = client.subscribe_kv_events(
+            1, "model", 0, 16, 1, KVEventProfile("test-native", 1)
+        )
         with pytest.raises(ConnectionError, match="speaks ZMQ"):
             in_flight.result(timeout=10)
         with pytest.raises(ConnectionError, match="speaks ZMQ"):

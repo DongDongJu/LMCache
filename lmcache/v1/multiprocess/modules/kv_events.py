@@ -143,6 +143,8 @@ class CommittedKVResidency:
     def clear(self) -> None:
         """Discard all ownership after event loss makes the projection unreliable."""
         self._owners.clear()
+
+
 @dataclass
 class _BindingState:
     descriptor: EventBinding
@@ -416,6 +418,13 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
             raise ValueError(
                 "LMCache chunk size must be a multiple of native block size"
             )
+        if (
+            attn_desc is None
+            and not self._ctx.layout_desc_registry.find_group_layout_descs(
+                model_name, world_size
+            )
+        ):
+            raise ValueError("native KV events require registered nonempty geometry")
         attn = (
             attn_desc
             if attn_desc is not None
@@ -482,9 +491,14 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
                     or binding.block_size != key.event_profile.block_size
                     or len(binding.token_ids) != self._ctx.chunk_size
                     or binding.token_ids
-                    != tuple(unpack_token_ids(key.token_bytes[
-                        start * TOKEN_STRIDE : (start + self._ctx.chunk_size) * TOKEN_STRIDE
-                    ]))
+                    != tuple(
+                        unpack_token_ids(
+                            key.token_bytes[
+                                start * TOKEN_STRIDE : (start + self._ctx.chunk_size)
+                                * TOKEN_STRIDE
+                            ]
+                        )
+                    )
                 ):
                     raise ValueError(
                         "native STORE binding profile, geometry or tokens mismatch"
@@ -577,15 +591,25 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
         if state is None:
             return
         model, world_size, salt, chunk_hash = identity
-        key = ObjectKey(chunk_hash, model,
-                        ObjectKey.ComputeKVRank(world_size, 0, world_size, 0), 0, salt)
+        key = ObjectKey(
+            chunk_hash,
+            model,
+            ObjectKey.ComputeKVRank(world_size, 0, world_size, 0),
+            0,
+            salt,
+        )
         ready = self._residency.is_committed(key)
         announced = self._announced.get(identity)
         refresh = (
-            ready and announced is not None and bool(self._kv_event_log)
+            ready
+            and announced is not None
+            and bool(self._kv_event_log)
             and announced < self._kv_event_log[0].seq
-            and event_type in (EventType.L1_WRITE_FINISHED,
-                               EventType.L1_WRITE_FINISHED_AND_READ_RESERVED)
+            and event_type
+            in (
+                EventType.L1_WRITE_FINISHED,
+                EventType.L1_WRITE_FINISHED_AND_READ_RESERVED,
+            )
         )
         if ready != (announced is not None) or refresh:
             binding = state.descriptor

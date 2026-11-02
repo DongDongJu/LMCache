@@ -135,13 +135,6 @@ _DCP_LAYOUT_NAMESPACE = "##lmcache-dcp-layout-v1-"
 _MAX_LCM_EXPANSION_FACTOR = 4
 
 
-def _convert_kv_event_hash(block_hash: bytes | int | None) -> bytes | int | None:
-    """Convert LMCache event hashes to vLLM's configured external format."""
-    if isinstance(block_hash, bytes):
-        return maybe_convert_block_hash(BlockHash(block_hash))
-    return block_hash
-
-
 # Helper functions
 def _has_preemption_reqs(scheduler_output: SchedulerOutput) -> bool:
     """Return whether the scheduler output contains preemption-related requests.
@@ -1679,9 +1672,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         events = self.scheduler_adapter.get_kv_events()
         blocks: list[KVCacheEvent] = []
         for event in events:
-            block_hashes = [
-                _convert_kv_event_hash(block_hash) for block_hash in event.block_hashes
-            ]
+            block_hashes = event.block_hashes
             if isinstance(event, CacheRemoveEvent):
                 blocks.append(
                     BlockRemoved(block_hashes=block_hashes, medium=event.medium)
@@ -1690,7 +1681,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             blocks.append(
                 BlockStored(
                     block_hashes=block_hashes,
-                    parent_block_hash=_convert_kv_event_hash(event.parent_block_hash),
+                    parent_block_hash=event.parent_block_hash,
                     token_ids=event.token_ids,
                     lora_id=event.lora_id,
                     block_size=event.block_size,

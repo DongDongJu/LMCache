@@ -30,6 +30,7 @@ from lmcache.integration.vllm.vllm_multi_process_adapter import (
     get_lmcache_chunk_size,
 )
 from lmcache.utils import CacheRemoveEvent, CacheStoreEvent
+from lmcache.v1.multiprocess import kv_event_subscriber as native_events
 from lmcache.v1.multiprocess.custom_types import (
     KV_EVENT_CAPABILITY,
     KVEventBatch,
@@ -37,7 +38,6 @@ from lmcache.v1.multiprocess.custom_types import (
     KVEventRecord,
 )
 from lmcache.v1.multiprocess.futures import MessagingStream
-from lmcache.v1.multiprocess import kv_event_subscriber as native_events
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.token_codec import pack_token_ids
 from lmcache.v1.multiprocess.transport.base import RequestClient
@@ -56,8 +56,8 @@ from tests.v1.mp_scheduler_adapter_test_utils import (
     ready_future,
 )
 
-
 _EVENT_PROFILE = KVEventProfile("vllm-native-test-v1", 16)
+
 
 class FakeMQClient:
     """MessageQueueClient double that records close calls."""
@@ -163,7 +163,9 @@ def _event_adapter(
     return adapter, client, senders
 
 
-def _event_record(kind: str = "stored", chunk: bytes = b"chunk", *, seq: int = 1) -> KVEventRecord:
+def _event_record(
+    kind: str = "stored", chunk: bytes = b"chunk", *, seq: int = 1
+) -> KVEventRecord:
     return KVEventRecord(
         seq=seq,
         kind=kind,
@@ -963,7 +965,9 @@ def test_lazy_store_preserves_completion_and_failure_reporting(
         adapter.shutdown()
 
 
-def test_store_without_native_binding_keeps_ordinary_cache_path(fake_adapter: tuple) -> None:
+def test_store_without_native_binding_keeps_ordinary_cache_path(
+    fake_adapter: tuple,
+) -> None:
     client = fake_adapter[1]
     client.get_experimental.return_value.result.return_value = [KV_EVENT_CAPABILITY]
     adapter = _make_worker_adapter(event_profile=_EVENT_PROFILE)
@@ -1891,12 +1895,27 @@ def test_pushed_cpu_events_preserve_transitions_without_worker_polls(
             list(range(16)),
             "CPU",
         )
-        senders[-1](replace(batch, next_cursor=6, events=[_event_record("removed", seq=5), replace(stored, seq=6)]))
+        senders[-1](
+            replace(
+                batch,
+                next_cursor=6,
+                events=[_event_record("removed", seq=5), replace(stored, seq=6)],
+            )
+        )
         assert [type(e) for e in adapter.get_kv_events()] == [
             CacheRemoveEvent,
             CacheStoreEvent,
         ]
-        senders[-1](replace(batch, next_cursor=8, events=[_event_record("removed", seq=7), _event_record("removed", seq=8)]))
+        senders[-1](
+            replace(
+                batch,
+                next_cursor=8,
+                events=[
+                    _event_record("removed", seq=7),
+                    _event_record("removed", seq=8),
+                ],
+            )
+        )
         assert len(adapter.get_kv_events()) == 1
         # Repeated engine drains never issue a new request.
         for _ in range(10):
@@ -2074,6 +2093,74 @@ def test_scheduler_rejects_shared_native_event_sources(fake_adapter: tuple) -> N
         _event_adapter(fake_adapter, n_servers=2)
 
 
+@pytest.mark.parametrize(
+    "incoming,pending_removal",
+    [("stored", False), ("removed", False), ("stored", True)],
+)
+def test_scheduler_overflow_withdraws_cpu_before_later_updates(
+    fake_adapter: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+    incoming: str,
+    pending_removal: bool,
+) -> None:
+    """Dropped queued transitions cannot leave an earlier CPU placement stale."""
+    monkeypatch.setattr(adapter_mod, "_MAX_BUFFERED_KV_EVENTS", 2)
+    adapter, _, senders = _event_adapter(fake_adapter)
+    try:
+        senders[0](KVEventBatch(True, 7, 1, False, [_event_record(chunk=b"old")]))
+        assert adapter.get_kv_events()[0].block_hashes == [b"old"]
+        senders[0](
+            KVEventBatch(
+                True,
+                7,
+                2,
+                False,
+                [
+                    _event_record(
+                        "removed" if pending_removal else "stored",
+                        b"old" if pending_removal else b"a",
+                        seq=2,
+                    )
+                ],
+            )
+        )
+        senders[0](KVEventBatch(True, 7, 3, False, [_event_record(chunk=b"b", seq=3)]))
+        senders[0](
+            KVEventBatch(
+                True,
+                7,
+                4,
+                False,
+                [
+                    _event_record(
+                        incoming, b"fresh" if incoming == "stored" else b"old", seq=4
+                    )
+                ],
+            )
+        )
+        events = adapter.get_kv_events()
+        assert len(events) <= 2
+        removed = {
+            block_hash
+            for event in events
+            if isinstance(event, CacheRemoveEvent)
+            for block_hash in event.block_hashes
+        }
+        assert b"old" in removed
+        assert all(event.medium == "CPU" for event in events)
+        if incoming == "stored":
+            assert isinstance(events[-1], CacheStoreEvent)
+            assert events[-1].block_hashes == [b"fresh"]
+            senders[0](
+                KVEventBatch(
+                    True, 7, 5, False, [_event_record("removed", b"fresh", seq=5)]
+                )
+            )
+            assert adapter.get_kv_events() == [CacheRemoveEvent([b"fresh"], "CPU")]
+    finally:
+        adapter.shutdown()
+
+
 def test_scheduler_metrics_follow_background_reception_and_drain(
     fake_adapter: tuple,
 ) -> None:
@@ -2105,7 +2192,11 @@ def test_scheduler_metrics_follow_background_reception_and_drain(
                 7,
                 3,
                 False,
-                [_event_record(seq=1), _event_record("removed", seq=2), _event_record(seq=3)],
+                [
+                    _event_record(seq=1),
+                    _event_record("removed", seq=2),
+                    _event_record(seq=3),
+                ],
             )
         )
         assert metrics() == (3, 3, 0)

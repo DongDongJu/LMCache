@@ -33,7 +33,7 @@ from lmcache.v1.multiprocess.transport.grpc_impl.method_registry import (
 
 PROFILE = KVEventProfile("native-test", 2)
 BINDING = EventBinding(PROFILE.profile_id, (10, 11), None, (0, 1, 2, 3), 2)
-KEY = IPCCacheServerKey(
+KEY = IPCCacheServerKey.from_token_ids(
     "model",
     2,
     0,

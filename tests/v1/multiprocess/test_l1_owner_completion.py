@@ -190,8 +190,10 @@ def test_store_owner_callback_round_trip(
                 assert kind == "finish_write"
                 payload = msgspec.msgpack.decode(encoded, type=dict[ObjectKey, int])
             expected_payload = (
-                {k: managers[0 if owner_count == 1 else i].l1_manager_id
-                 for i, k in enumerate(keys)}
+                {
+                    k: managers[0 if owner_count == 1 else i].l1_manager_id
+                    for i, k in enumerate(keys)
+                }
                 if failure == "none"
                 else {}
             )

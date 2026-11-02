@@ -46,6 +46,7 @@ logger = init_logger(__name__)
 _MAX_EVENTS_PER_RECV = 64
 _UNIMPLEMENTED = grpc.StatusCode.UNIMPLEMENTED.value[0]
 _INVALID_ARGUMENT = grpc.StatusCode.INVALID_ARGUMENT.value[0]
+_UNAVAILABLE = grpc.StatusCode.UNAVAILABLE.value[0]
 _INTERNAL = grpc.StatusCode.INTERNAL.value[0]
 _UNKNOWN = grpc.StatusCode.UNKNOWN.value[0]
 
@@ -357,9 +358,9 @@ class GrpcNativeMultiprocessServer(GrpcMultiprocessServerBase):
         """Decode, run and answer one call on a handler thread.
 
         Status codes follow the sync server: an undecodable request is
-        INTERNAL, NotImplementedError is UNIMPLEMENTED, a ValueError from a
-        streaming handler is INVALID_ARGUMENT, and any other exception is
-        UNKNOWN. A streaming method's stream is then sent by ``_forward``.
+        INTERNAL, NotImplementedError is UNIMPLEMENTED, ConnectionError is
+        UNAVAILABLE, TypeError/ValueError is INVALID_ARGUMENT, and any other
+        exception is UNKNOWN. A streaming method's stream is then sent by ``_forward``.
         """
         registered = method.registered
         front = self._front
@@ -373,6 +374,20 @@ class GrpcNativeMultiprocessServer(GrpcMultiprocessServerBase):
             # Only methods with a handler get a submitter.
             handler = cast(Callable[..., Any], registered.handler)
             result = handler(*registered.request_decoder(request))
+        except NotImplementedError as exc:
+            front.fail(call_id, _UNIMPLEMENTED, str(exc))
+            return
+        except ConnectionError as exc:
+            front.fail(call_id, _UNAVAILABLE, str(exc))
+            return
+        except (TypeError, ValueError) as exc:
+            front.fail(call_id, _INVALID_ARGUMENT, str(exc))
+            return
+        except Exception as exc:
+            self._fail_application(registered, call_id, exc)
+            return
+        try:
+            # Invalid handler output is an application failure, not bad input.
             if method.server_streaming:
                 if not isinstance(result, MessagingStream):
                     raise TypeError(
@@ -384,15 +399,6 @@ class GrpcNativeMultiprocessServer(GrpcMultiprocessServerBase):
                 result.close()
                 raise TypeError(f"{registered.operation} returned a stream")
             response = registered.response_encoder(result).SerializeToString()
-        except NotImplementedError as exc:
-            front.fail(call_id, _UNIMPLEMENTED, str(exc))
-            return
-        except ValueError as exc:
-            if method.server_streaming:
-                front.fail(call_id, _INVALID_ARGUMENT, str(exc))
-            else:
-                self._fail_application(registered, call_id, exc)
-            return
         except Exception as exc:
             self._fail_application(registered, call_id, exc)
             return

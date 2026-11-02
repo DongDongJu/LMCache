@@ -51,8 +51,8 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
 )
 from lmcache.integration.vllm.vllm_multi_process_adapter import LoadStoreOp
 from lmcache.utils import CacheRemoveEvent, CacheStoreEvent  # noqa: E402
-from lmcache.v1.multiprocess.token_codec import pack_token_ids
 from lmcache.v1.multiprocess.custom_types import KV_EVENT_CAPABILITY, KVEventProfile
+from lmcache.v1.multiprocess.token_codec import pack_token_ids
 
 pytestmark = pytest.mark.no_shared_allocator
 
@@ -743,7 +743,9 @@ def test_scheduler_kv_events_preserve_store_remove_store(
         KVTransferConfig(kv_connector="LMCacheMPConnector", kv_role="kv_both")
     )
     cast(Any, config).kv_events_config = SimpleNamespace(enable_kv_cache_events=True)
-    scheduler = LMCacheMPConnector(config, KVConnectorRole.SCHEDULER, _event_cache_config())
+    scheduler = LMCacheMPConnector(
+        config, KVConnectorRole.SCHEDULER, _event_cache_config()
+    )
     mock_io.scheduler.get_kv_events.return_value = [
         _kv_event(11),
         CacheRemoveEvent(block_hashes=[11], medium="CPU"),

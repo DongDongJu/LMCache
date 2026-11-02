@@ -11,8 +11,13 @@ from lmcache.logging import init_logger
 from lmcache.utils import CacheEvent, CacheRemoveEvent, CacheStoreEvent
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.multiprocess.custom_types import (
-    KV_EVENT_KIND_REMOVED, KV_EVENT_KIND_STORED, KV_EVENT_MEDIUM_CPU,
-    KVEventBatch, KVEventRecord, KVEventProfile, NativeBlockHash,
+    KV_EVENT_KIND_REMOVED,
+    KV_EVENT_KIND_STORED,
+    KV_EVENT_MEDIUM_CPU,
+    KVEventBatch,
+    KVEventProfile,
+    KVEventRecord,
+    NativeBlockHash,
 )
 from lmcache.v1.multiprocess.futures import MessagingStream
 from lmcache.v1.multiprocess.transport.base import RequestClient
@@ -32,42 +37,6 @@ class KVEventStreamClosed:
     """
 
     error: str | None = None
-
-
-def apply_kv_event_record(
-    record: KVEventRecord, announced: set[NativeBlockHash]
-) -> CacheEvent | None:
-    """Convert a validated record on the engine's publication thread.
-
-    Args:
-        record: Native CPU record validated by the subscriber.
-        announced: Caller-owned ledger, updated in place.
-
-    Returns:
-        A cache event, or None for an already-applied transition.
-
-    Raises:
-        ValueError: A STORE overlaps only part of an advertised chunk.
-    """
-    if record.kind == KV_EVENT_KIND_REMOVED:
-        hashes = [h for h in record.block_hashes if h in announced]
-        announced.difference_update(hashes)
-        return CacheRemoveEvent(hashes, "CPU") if hashes else None
-    overlap = announced.intersection(record.block_hashes)
-    if len(overlap) == len(record.block_hashes):
-        return None
-    if overlap:
-        raise ValueError("Native STORE partially overlaps an advertised chunk")
-    announced.update(record.block_hashes)
-    return CacheStoreEvent(
-        block_hashes=list(record.block_hashes),
-        parent_block_hash=record.parent_block_hash,
-        token_ids=list(record.token_ids),
-        block_size=record.block_size,
-        lora_id=None,
-        medium="CPU",
-        lora_name=None,
-    )
 
 
 class KVEventLedger:
@@ -116,13 +85,10 @@ class KVEventLedger:
                     del self._block_refcounts[block_hash]
                     del self._descriptors[block_hash]
                     removed.append(block_hash)
-            return (
-                [CacheRemoveEvent(removed, "CPU")]
-                if removed
-                else []
-            )
+            return [CacheRemoveEvent(removed, "CPU")] if removed else []
         if (
-            record.block_size <= 0 or not hashes
+            record.block_size <= 0
+            or not hashes
             or len(set(hashes)) != len(hashes)
             or len(record.token_ids) != len(hashes) * record.block_size
         ):
@@ -131,7 +97,9 @@ class KVEventLedger:
         for index, block_hash in enumerate(hashes):
             descriptor = (
                 hashes[index - 1] if index else record.parent_block_hash,
-                record.token_ids[index * record.block_size : (index + 1) * record.block_size],
+                record.token_ids[
+                    index * record.block_size : (index + 1) * record.block_size
+                ],
                 record.block_size,
             )
             existing = self._descriptors.get(block_hash)
@@ -341,8 +309,12 @@ class MPKVEventSubscriber:
             stream = None
             try:
                 stream = self._client.subscribe_kv_events(
-                    self._instance_id, self._model_name, 0, _BATCH_SIZE,
-                    self._world_size, self._profile,
+                    self._instance_id,
+                    self._model_name,
+                    0,
+                    _BATCH_SIZE,
+                    self._world_size,
+                    self._profile,
                 )
                 with self._lock:
                     if self._stop.is_set():

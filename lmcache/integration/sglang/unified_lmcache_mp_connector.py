@@ -29,16 +29,16 @@ from lmcache.integration.sglang.lmcache_mp_metadata import (
     LMCacheStoreOperation,
     SGLangKVComponentGroup,
 )
-from lmcache.utils import CacheEvent, CacheRemoveEvent
+from lmcache.utils import CacheEvent
 from lmcache.v1.multiprocess.custom_types import (
     KV_EVENT_CAPABILITY,
     EventBinding,
-    KVEventProfile,
     KVEventBatch,
+    KVEventProfile,
 )
 from lmcache.v1.multiprocess.kv_event_subscriber import (
-    KVEventStreamClosed,
     KVEventLedger,
+    KVEventStreamClosed,
     MPKVEventSubscriber,
 )
 
@@ -1347,7 +1347,11 @@ class UnifiedLMCacheMPConnector:
         """Bound the caller-drained queue while satisfying receiver ownership."""
         with self._kv_event_lock:
             for update in subscriber.drain():
-                size = max(1, len(update.events)) if isinstance(update, KVEventBatch) else 1
+                size = (
+                    max(1, len(update.events))
+                    if isinstance(update, KVEventBatch)
+                    else 1
+                )
                 if self._kv_event_pending_size + size > 65536:
                     self._kv_event_updates = [KVEventStreamClosed()]
                     self._kv_event_pending_size = 1

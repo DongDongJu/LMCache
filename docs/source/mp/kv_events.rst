@@ -14,7 +14,7 @@ Enable native KV events in the engine and keep MP observability and a positive
 profile on every rank's cache registration, including native block size, hash
 algorithm, seed semantics, and representation. Old chunk-hash consumers cannot
 use this stream.
-An incompatible profile or missing capability fails explicitly. The elected
+An incompatible profile or missing capability fails explicitly. The scheduler
 subscriber also checks the profile when opening or restoring its stream.
 
 Supported deployment
@@ -33,16 +33,17 @@ topology configurations fail at startup. Explicitly disabling engine KV events
 retains the ordinary inference/cache path.
 
 vLLM obtains identities from scheduler ``Request.block_hashes`` and carries
-them to workers in connector metadata. Its direct event hook and MultiConnector
-worker-metadata bridge carry each transition through one delivery path.
-vLLM uses its existing connector APIs and requires no companion engine patch.
+them to workers in STORE metadata. Its scheduler subscribes directly to MP;
+``take_events()`` drains the native CPU ledger, including under MultiConnector.
+No worker event bridge or admission-validation hook is required. Request-free
+idle publication requires the companion vLLM idle connector-drain change.
 Requests with salted, LoRA, multimodal, embedding or session namespaces retain
 ordinary caching without native CPU-event bindings. They are not rejected by
 an LMCache admission hook.
 SGLang requires the companion native descriptor and ``take_events`` bridge.
 That companion also rejects unsupported namespaces before scheduler admission.
 These SGLang changes are separate dependencies of the LMCache integration.
-The validated Dynamo/SGLang deployment also requires the native replay companion
+The Dynamo/SGLang deployment also requires the native replay companion
 and SGLang's ``replay_endpoint`` and ``replay_handshake`` configuration. The
 handshake confirms that the live subscription is installed before retained
 native events are replayed, preserving warm CPU placement during engine startup.
@@ -51,13 +52,15 @@ Configure the matching replay endpoint and handshake in both publisher and consu
 Delivery and recovery
 ---------------------
 
-Both engines use ``MPKVEventSubscriber`` over ZMQ or gRPC. One elected worker
-subscribes per engine/MP attachment. Other TP ranks remain in server-event mode.
-Both synchronous and asynchronous gRPC servers are supported.
+Both engines use ``MPKVEventSubscriber`` over ZMQ or gRPC. vLLM's scheduler
+subscribes with its own heartbeat identity; SGLang's publisher attachment owns
+its subscription. Synchronous, asynchronous and native gRPC servers share the
+same profile and error contracts.
 The subscriber owns its stream and receiver thread; the engine owns the client,
 registration, heartbeat, native publisher, and advertised CPU identity ledger.
-The vLLM buffered-event gauge counts pending stream records and invalidations
-even when vLLM stops draining. Generated/drained counters track native publication.
+The vLLM buffered-event gauge counts queued converted events even before the
+next drain. Generated/drained counters track native publication. Shared native
+prefix blocks stay advertised until their final contributing chunk disappears.
 
 Reconnect invalidates prior CPU advertisements and replays the current retained
 log from its beginning. Log truncation, local queue overflow, and a new MP
@@ -71,10 +74,11 @@ replay coverage but does not guarantee recovery of every warm entry. Protocol
 failures remain visible; neither engine switches to local STORE announcements,
 lookup polling, or guessed native hashes.
 
-SGLang drains events through its normal scheduler publication path. vLLM drains
-on engine steps, so an idle worker may receive an MP eviction before publishing
-its removal. Active-step convergence and request-free idle convergence are
-separate measurements. Pause behavior must also be measured separately.
+SGLang drains events through its normal scheduler publication path. The paired
+vLLM idle change drains connector events during bounded idle waits without a
+worker inference step. Stock vLLM versions without that change still delay idle
+publication. Active-step, idle and explicit-pause behavior require separate
+validation on the exact serving-engine build.
 
 An MP process restart also loses its device-transfer registrations. SGLang's
 existing heartbeat only pings; it does not recreate these registrations. After

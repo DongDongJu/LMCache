@@ -14,8 +14,12 @@ import time
 import pytest
 
 # First Party
-from lmcache.v1.multiprocess.custom_types import KVEventBatch, KVEventRecord, KVEventProfile
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
+from lmcache.v1.multiprocess.custom_types import (
+    KVEventBatch,
+    KVEventProfile,
+    KVEventRecord,
+)
 from lmcache.v1.multiprocess.futures import MessagingStream
 from lmcache.v1.multiprocess.kv_event_subscriber import (
     KVEventStreamClosed,
@@ -26,20 +30,37 @@ from lmcache.v1.multiprocess.transport.base import RequestClient
 PROFILE = KVEventProfile("test-native", 2)
 
 
-@pytest.mark.parametrize("field,value", [
-    ("profile_id", "other"), ("block_size", 4), ("world_size", 2),
-    ("cache_salt", "salt"), ("medium", "GPU"), ("seq", 2),
-])
-def test_native_record_contract_failure_is_terminal(field: str, value: object) -> None:
+_NATIVE_RECORD = KVEventRecord(
+    1,
+    "stored",
+    "CPU",
+    "model",
+    (b"block",),
+    None,
+    (1, 2),
+    2,
+    PROFILE.profile_id,
+    1,
+)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        replace(_NATIVE_RECORD, profile_id="other"),
+        replace(_NATIVE_RECORD, block_size=4),
+        replace(_NATIVE_RECORD, world_size=2),
+        replace(_NATIVE_RECORD, cache_salt="salt"),
+        replace(_NATIVE_RECORD, medium="GPU"),
+        replace(_NATIVE_RECORD, seq=2),
+    ],
+)
+def test_native_record_contract_failure_is_terminal(record: KVEventRecord) -> None:
     channel = EventChannel()
     subscriber = MPKVEventSubscriber(
         channel.client, 41, "model", channel.collect, world_size=1, profile=PROFILE
     )
-    record = KVEventRecord(
-        1, "stored", "CPU", "model", (b"block",), None, (1, 2),
-        2, PROFILE.profile_id, 1,
-    )
-    channel.inbox.put(KVEventBatch(True, 7, 1, False, [replace(record, **{field: value})]))
+    channel.inbox.put(KVEventBatch(True, 7, 1, False, [record]))
     try:
         subscriber.start()
         [failure] = channel.updates.get(timeout=5)
@@ -128,11 +149,17 @@ class EventChannel:
 
 def test_batches_keep_payload_and_order() -> None:
     channel = EventChannel()
-    subscriber = MPKVEventSubscriber(channel.client, 41, "model", channel.collect, world_size=1, profile=PROFILE)
-    stored = KVEventRecord(1, "stored", "CPU", "model", (b"chunk",), None, (1, 2), 2, PROFILE.profile_id, 1)
+    subscriber = MPKVEventSubscriber(
+        channel.client, 41, "model", channel.collect, world_size=1, profile=PROFILE
+    )
+    stored = KVEventRecord(
+        1, "stored", "CPU", "model", (b"chunk",), None, (1, 2), 2, PROFILE.profile_id, 1
+    )
     batches = [
         KVEventBatch(True, 7, 1, False, [stored]),
-        KVEventBatch(True, 7, 12, False, [replace(stored, seq=12, kind="removed", token_ids=())]),
+        KVEventBatch(
+            True, 7, 12, False, [replace(stored, seq=12, kind="removed", token_ids=())]
+        ),
         KVEventBatch(True, 8, 1, True, [stored]),
     ]
     try:
@@ -144,7 +171,9 @@ def test_batches_keep_payload_and_order() -> None:
             [batch] for batch in batches
         ]
         assert subscriber.drain() == []
-        channel.client.subscribe_kv_events.assert_called_once_with(41, "model", 0, 1024, 1, PROFILE)
+        channel.client.subscribe_kv_events.assert_called_once_with(
+            41, "model", 0, 1024, 1, PROFILE
+        )
     finally:
         subscriber.close()
     subscriber.close()
@@ -165,7 +194,9 @@ def test_stream_end_and_disconnect_replay_after_interruptible_delay(
         channel.subscribe(),
         second.subscribe(),
     ]
-    subscriber = MPKVEventSubscriber(channel.client, 41, "model", channel.collect, world_size=1, profile=PROFILE)
+    subscriber = MPKVEventSubscriber(
+        channel.client, 41, "model", channel.collect, world_size=1, profile=PROFILE
+    )
     try:
         subscriber.start()
         start = time.monotonic()
@@ -188,7 +219,9 @@ def test_stream_end_and_disconnect_replay_after_interruptible_delay(
 def test_subscription_failure_backoff_is_cancelled_by_close() -> None:
     channel = EventChannel()
     channel.client.subscribe_kv_events.side_effect = ConnectionError("unavailable")
-    subscriber = MPKVEventSubscriber(channel.client, 41, "model", channel.collect, world_size=1, profile=PROFILE)
+    subscriber = MPKVEventSubscriber(
+        channel.client, 41, "model", channel.collect, world_size=1, profile=PROFILE
+    )
     subscriber.start()
     try:
         assert channel.updates.get(timeout=5) == [KVEventStreamClosed()]
@@ -209,7 +242,9 @@ def test_disabled_and_terminal_streams_do_not_restart(failure: str) -> None:
         receivers.append(threading.current_thread())
         channel.collect(subscriber)
 
-    subscriber = MPKVEventSubscriber(channel.client, 41, "model", collect, world_size=1, profile=PROFILE)
+    subscriber = MPKVEventSubscriber(
+        channel.client, 41, "model", collect, world_size=1, profile=PROFILE
+    )
     expected: KVEventBatch | KVEventStreamClosed
     if failure == "disabled":
         expected = KVEventStreamClosed(error="MP native KV event stream is disabled")
@@ -236,7 +271,9 @@ def test_disabled_and_terminal_streams_do_not_restart(failure: str) -> None:
 
 def test_close_before_start_prevents_subscription() -> None:
     channel = EventChannel()
-    subscriber = MPKVEventSubscriber(channel.client, 41, "model", channel.collect, world_size=1, profile=PROFILE)
+    subscriber = MPKVEventSubscriber(
+        channel.client, 41, "model", channel.collect, world_size=1, profile=PROFILE
+    )
     subscriber.close()
     subscriber.close()
     with pytest.raises(RuntimeError, match="closed"):
@@ -254,7 +291,9 @@ def test_batch_callback_failure_delivers_terminal_update() -> None:
             raise RuntimeError("batch rejected")
         channel.updates.put(updates)
 
-    subscriber = MPKVEventSubscriber(channel.client, 41, "model", collect, world_size=1, profile=PROFILE)
+    subscriber = MPKVEventSubscriber(
+        channel.client, 41, "model", collect, world_size=1, profile=PROFILE
+    )
     try:
         subscriber.start()
         channel.inbox.put(KVEventBatch(True, 7, 0, False, []))
@@ -271,7 +310,9 @@ def test_batch_callback_failure_delivers_terminal_update() -> None:
 
 def test_close_cancels_blocked_read_and_joins_receiver() -> None:
     channel = EventChannel()
-    subscriber = MPKVEventSubscriber(channel.client, 41, "model", channel.collect, world_size=1, profile=PROFILE)
+    subscriber = MPKVEventSubscriber(
+        channel.client, 41, "model", channel.collect, world_size=1, profile=PROFILE
+    )
     subscriber.start()
     try:
         assert channel.reading.wait(5)
@@ -306,7 +347,9 @@ def test_close_cancels_stream_returned_by_inflight_subscription() -> None:
         return channel.subscribe(*args)
 
     channel.client.subscribe_kv_events.side_effect = subscribe
-    subscriber = MPKVEventSubscriber(channel.client, 41, "model", channel.collect, world_size=1, profile=PROFILE)
+    subscriber = MPKVEventSubscriber(
+        channel.client, 41, "model", channel.collect, world_size=1, profile=PROFILE
+    )
     subscriber.start()
     closer = threading.Thread(target=subscriber.close)
     try:
@@ -335,7 +378,9 @@ def test_close_waits_for_inflight_callback() -> None:
         assert release.wait(5)
         channel.collect(subscriber)
 
-    subscriber = MPKVEventSubscriber(channel.client, 41, "model", collect, world_size=1, profile=PROFILE)
+    subscriber = MPKVEventSubscriber(
+        channel.client, 41, "model", collect, world_size=1, profile=PROFILE
+    )
     closer = threading.Thread(target=subscriber.close)
     batch = KVEventBatch(True, 7, 0, False, [])
     try:
@@ -372,7 +417,9 @@ def test_failure_callback_must_not_raise(
         raise RuntimeError("closure handler failed")
 
     monkeypatch.setattr(threading, "excepthook", record_failure)
-    subscriber = MPKVEventSubscriber(channel.client, 41, "model", collect, world_size=1, profile=PROFILE)
+    subscriber = MPKVEventSubscriber(
+        channel.client, 41, "model", collect, world_size=1, profile=PROFILE
+    )
     try:
         subscriber.start()
         channel.inbox.put(failure)

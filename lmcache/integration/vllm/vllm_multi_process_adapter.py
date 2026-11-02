@@ -37,11 +37,14 @@ from lmcache.utils import (
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     KV_EVENT_CAPABILITY,
+    KV_EVENT_KIND_STORED,
     BlockAllocationRecord,
     EventBinding,
     IPCCacheServerKey,
+    KVEventBatch,
     KVEventProfile,
     KVEventRecord,
+    NativeBlockHash,
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import (
@@ -49,9 +52,9 @@ from lmcache.v1.multiprocess.group_view import (
     expand_engine_block_ids,
 )
 from lmcache.v1.multiprocess.kv_event_subscriber import (
+    KVEventLedger,
     KVEventStreamClosed,
     MPKVEventSubscriber,
-    KVEventLedger,
 )
 from lmcache.v1.multiprocess.token_codec import num_packed_tokens
 from lmcache.v1.multiprocess.transfer_context import (
@@ -839,7 +842,12 @@ class LMCacheMPSchedulerAdapter:
             self._kv_event_batches = _KV_EVENT_BATCHES.labels(*labels)
             self._kv_event_resyncs = {
                 reason: _KV_EVENT_RESYNCS.labels(*labels, reason)
-                for reason in ("server_restart", "events_lost", "stream_closed", "queue_overflow")
+                for reason in (
+                    "server_restart",
+                    "events_lost",
+                    "stream_closed",
+                    "queue_overflow",
+                )
             }
             assert self.instance_id is not None and event_profile is not None
             for url, client in self.req_clients.items():
@@ -1270,22 +1278,43 @@ class LMCacheMPSchedulerAdapter:
 
     def _apply_kv_event_record(self, server_url: str, record: KVEventRecord) -> None:
         """Join native chunk contributions before publishing individual blocks."""
-        if len(self._kv_events) + len(record.block_hashes) > _MAX_BUFFERED_KV_EVENTS:
+        ledger = self._kv_event_ledgers[server_url]
+        events = ledger.apply(record)
+        if len(self._kv_events) + len(events) > _MAX_BUFFERED_KV_EVENTS:
             # Withdraw discarded history before keeping any later transition.
             # Replay is conservative: uncached ancestors may remain undiscovered.
-            self._kv_events = [
-                event for ledger in self._kv_event_ledgers.values()
-                for event in ledger.reset()
-            ]
-            self._kv_events_generated.inc(len(self._kv_events))
+            self._compact_cpu_withdrawals(events)
             self._kv_event_resyncs["queue_overflow"].inc()
-        self._buffer_kv_events(self._kv_event_ledgers[server_url].apply(record))
+            events = ledger.apply(record) if record.kind == KV_EVENT_KIND_STORED else []
+        self._buffer_kv_events(events)
+
+    def _compact_cpu_withdrawals(self, incoming: Sequence[CacheEvent]) -> None:
+        """Withdraw queued removals and live contributions before dropping history."""
+        events = [*self._kv_events, *incoming]
+        events.extend(
+            event
+            for ledger in self._kv_event_ledgers.values()
+            for event in ledger.reset()
+        )
+        hashes: dict[NativeBlockHash, None] = {
+            block_hash: None
+            for event in events
+            if isinstance(event, CacheRemoveEvent)
+            for block_hash in event.block_hashes
+        }
+        self._kv_events = [CacheRemoveEvent(list(hashes), "CPU")] if hashes else []
+        self._kv_events_generated.inc(len(self._kv_events))
+        self._kv_events_buffered.set(len(self._kv_events))
 
     def _resync_kv_events(self, server_url: str, reason: str) -> None:
         """Withdraw only this source's CPU contributions before replay."""
         self._kv_event_resyncs[reason].inc()
         logger.warning("Resynchronizing CPU KV events after %s", reason)
-        self._buffer_kv_events(self._kv_event_ledgers[server_url].reset())
+        events = self._kv_event_ledgers[server_url].reset()
+        if len(self._kv_events) + len(events) > _MAX_BUFFERED_KV_EVENTS:
+            self._compact_cpu_withdrawals(events)
+        else:
+            self._buffer_kv_events(events)
 
     def _create_key(
         self,

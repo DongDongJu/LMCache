@@ -125,9 +125,6 @@ class _GeneratedServicer:
                 raise NotImplementedError(
                     f"{registered.handler_type.name} handlers are not supported"
                 )
-            if isinstance(result, MessagingStream):
-                return result
-            return registered.response_encoder(result)
         except NotImplementedError as exc:
             context.abort(grpc.StatusCode.UNIMPLEMENTED, str(exc))
             raise RuntimeError("gRPC context abort unexpectedly returned") from exc
@@ -137,6 +134,9 @@ class _GeneratedServicer:
         except (TypeError, ValueError) as exc:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
             raise RuntimeError("gRPC context abort unexpectedly returned") from exc
+        if isinstance(result, MessagingStream):
+            return result
+        return registered.response_encoder(result)
 
 
 class GrpcMultiprocessServer(GrpcMultiprocessServerBase):

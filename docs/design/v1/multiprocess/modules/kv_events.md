@@ -43,11 +43,11 @@ reconstruct readiness across a dropped eviction. Every required object must
 subsequently report a committed copy before another Stored is emitted.
 
 This implements the residency step of [issue #5932](https://github.com/LMCache/LMCache/issues/5932).
-The wire format, chunk hashes, token bindings, and engine publication hooks remain
-the existing contract. The scheduler subscribes to committed events independently
-of worker execution. Native block identities and idle engine publication belong
-to later steps.
-The legacy wire does not distinguish salts or parallel setups for a shared model;
-separate ownership scopes prevent mixed-shard completeness but do not solve
-router identity collisions. The supported routing profile uses one unsalted
-parallel setup per model and full-attention object groups.
+Native bindings extend these commitment decisions with immutable engine block
+descriptors. The scheduler subscribes independently of worker execution and
+tracks chunk contributions to shared native prefixes. Binding lifetime follows
+committed objects and pending transfers; the residency projection remains the
+sole owner of readable-copy completeness. See
+[native KV events](../native_kv_events.md) for the matched wire/profile contract,
+and [scheduler subscriptions](../kv_event_subscriber.md) for delivery ownership.
+Idle publication additionally requires the serving engine's idle drain.

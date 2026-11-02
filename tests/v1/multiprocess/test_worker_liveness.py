@@ -16,7 +16,6 @@ import threading
 import time
 
 # Third Party
-import grpc
 import pytest
 import torch
 import zmq
@@ -48,6 +47,7 @@ from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
 )
 from lmcache.v1.multiprocess.modules.management import ManagementModule
+from lmcache.v1.multiprocess.transport.errors import MPRequestError
 from lmcache.v1.multiprocess.transport.factory import RequestClientFactory
 from lmcache.v1.multiprocess.transport.server_factory import create_request_server
 from lmcache.v1.periodic_thread import PeriodicThreadRegistry
@@ -451,7 +451,7 @@ def test_cpu_events_preserve_tokens_parents_and_deduplicate_ranks() -> None:
         EventType.L1_WRITE_FINISHED_AND_READ_RESERVED,
         keys=[*keys, *[_event_key(i, rank=1, world_size=2) for i in (1, 2)]],
     )
-    result = module.read_kv_events("model", 0, 8)
+    result = module.read_kv_events("model", 0, 8, world_size=2)
     assert [
         (r.kind, r.block_hashes, r.token_ids, r.parent_block_hash)
         for r in result.events
@@ -464,12 +464,15 @@ def test_cpu_events_preserve_tokens_parents_and_deduplicate_ranks() -> None:
         EventType.L1_KEYS_EVICTED,
         keys=[keys[0], _event_key(1, rank=1, world_size=2)],
     )
-    removed = module.read_kv_events("model", result.next_cursor, 8)
+    removed = module.read_kv_events("model", result.next_cursor, 8, world_size=2)
     assert [(r.kind, r.medium, r.block_hashes) for r in removed.events] == [
         ("removed", "CPU", (keys[0].chunk_hash,)),
     ]
     assert removed.incarnation == result.incarnation and not removed.lost
-    assert module.read_kv_events("model", removed.next_cursor, 8).events == []
+    assert (
+        module.read_kv_events("model", removed.next_cursor, 8, world_size=2).events
+        == []
+    )
 
 
 @pytest.mark.parametrize("groups", [1, 2])
@@ -487,15 +490,17 @@ def test_cpu_events_require_every_committed_rank_and_group(groups: int) -> None:
         for group in range(groups)
     ]
     _bind_kv(module, bus, [keys[0]])
-    assert module.read_kv_events("model", 0, 8).events == []
+    assert module.read_kv_events("model", 0, 8, world_size=2).events == []
     for key in keys[:-1]:
         _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[key])
-        assert module.read_kv_events("model", 0, 8).events == []
+        assert module.read_kv_events("model", 0, 8, world_size=2).events == []
     _publish_kv(bus, EventType.L1_WRITE_FINISHED_AND_READ_RESERVED, keys=[keys[-1]])
-    first = module.read_kv_events("model", 0, 8)
+    first = module.read_kv_events("model", 0, 8, world_size=2)
     assert [record.kind for record in first.events] == ["stored"]
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=keys)
-    assert module.read_kv_events("model", first.next_cursor, 8).events == []
+    assert (
+        module.read_kv_events("model", first.next_cursor, 8, world_size=2).events == []
+    )
 
 
 @pytest.mark.parametrize("world_size", [1, 2])
@@ -510,19 +515,33 @@ def test_cpu_events_keep_a_chunk_until_its_required_object_loses_all_copies(
     _bind_kv(module, bus, keys[:1])
     for tag in ("_default", "second"):
         _publish_kv(bus, EventType.L1_WRITE_FINISHED, l1_tag=tag, keys=keys)
-    first = module.read_kv_events("model", 0, 8)
+    first = module.read_kv_events("model", 0, 8, world_size=world_size)
     assert [record.kind for record in first.events] == ["stored"]
     _publish_kv(bus, EventType.L1_KEYS_EVICTED, keys=keys)
-    assert module.read_kv_events("model", first.next_cursor, 8).events == []
+    assert (
+        module.read_kv_events(
+            "model", first.next_cursor, 8, world_size=world_size
+        ).events
+        == []
+    )
     _publish_kv(bus, EventType.L1_KEYS_EVICTED, l1_tag="second", keys=keys[:1])
-    removed = module.read_kv_events("model", first.next_cursor, 8)
+    removed = module.read_kv_events(
+        "model", first.next_cursor, 8, world_size=world_size
+    )
     assert [record.kind for record in removed.events] == ["removed"]
     _publish_kv(bus, EventType.L1_KEYS_EVICTED, l1_tag="second", keys=keys[:1])
-    assert module.read_kv_events("model", removed.next_cursor, 8).events == []
+    assert (
+        module.read_kv_events(
+            "model", removed.next_cursor, 8, world_size=world_size
+        ).events
+        == []
+    )
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=keys[:1])
     assert [
         record.kind
-        for record in module.read_kv_events("model", removed.next_cursor, 8).events
+        for record in module.read_kv_events(
+            "model", removed.next_cursor, 8, world_size=world_size
+        ).events
     ] == ["stored"]
 
 
@@ -537,7 +556,7 @@ def test_cpu_events_refresh_a_committed_chunk_after_its_record_ages_out() -> Non
     assert lagging.lost
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, l1_tag="second", keys=keys[:1])
     replay = module.read_kv_events("model", lagging.next_cursor, 8)
-    assert [record.block_hashes for record in replay.events] == [[keys[0].chunk_hash]]
+    assert [record.block_hashes for record in replay.events] == [(keys[0].chunk_hash,)]
 
 
 def test_cpu_events_follow_real_l1_commit_and_delete(
@@ -570,22 +589,27 @@ def test_cpu_events_follow_real_l1_commit_and_delete(
                 assert tensor is not None
                 tensor.fill_(1)
         bus.stop()
-        assert not module.read_kv_events("model", 0, 8).events
+        assert not module.read_kv_events("model", 0, 8, world_size=2).events
         managers[0].finish_write(keys[:1])
         bus.stop()
-        assert not module.read_kv_events("model", 0, 8).events
+        assert not module.read_kv_events("model", 0, 8, world_size=2).events
         managers[0].finish_write(keys[1:])
         bus.stop()
-        stored = module.read_kv_events("model", 0, 8)
+        stored = module.read_kv_events("model", 0, 8, world_size=2)
         assert [r.kind for r in stored.events] == ["stored"]
         managers[1].finish_write(keys)
         managers[0].delete(keys)
         bus.stop()
-        assert not module.read_kv_events("model", stored.next_cursor, 8).events
+        assert not module.read_kv_events(
+            "model", stored.next_cursor, 8, world_size=2
+        ).events
         managers[1].delete(keys[:1])
         bus.stop()
         assert [
-            r.kind for r in module.read_kv_events("model", stored.next_cursor, 8).events
+            r.kind
+            for r in module.read_kv_events(
+                "model", stored.next_cursor, 8, world_size=2
+            ).events
         ] == ["removed"]
     finally:
         for manager in managers:
@@ -651,13 +675,17 @@ def test_bus_loss_discards_queued_commits_and_requires_all_ranks_again() -> None
         )
     )
     bus.stop()
-    lost = module.read_kv_events("model", 0, 8)
+    lost = module.read_kv_events("model", 0, 8, world_size=2)
     assert lost.lost and not lost.events
+    _bind_kv(module, bus, keys[:1])
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=keys[1:])
-    assert not module.read_kv_events("model", lost.next_cursor, 8).events
+    assert not module.read_kv_events("model", lost.next_cursor, 8, world_size=2).events
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=keys[:1])
     assert [
-        r.kind for r in module.read_kv_events("model", lost.next_cursor, 8).events
+        r.kind
+        for r in module.read_kv_events(
+            "model", lost.next_cursor, 8, world_size=2
+        ).events
     ] == ["stored"]
 
 
@@ -689,6 +717,7 @@ def test_bus_loss_during_notification_cannot_replay_an_evicted_completion() -> N
     bus.stop()
     lost = module.read_kv_events("model", 0, 8)
     assert lost.lost and lost.events == []
+    _bind_kv(module, bus, [key])
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[key])
     assert [
         r.kind for r in module.read_kv_events("model", lost.next_cursor, 8).events
@@ -707,9 +736,11 @@ def test_cpu_events_do_not_combine_objects_from_other_namespaces(other: str) -> 
     }[other]
     _bind_kv(module, bus, [first])
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[first, foreign])
-    assert not module.read_kv_events("model", 0, 8).events
+    assert not module.read_kv_events("model", 0, 8, world_size=2).events
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[second])
-    assert [r.kind for r in module.read_kv_events("model", 0, 8).events] == ["stored"]
+    assert [
+        r.kind for r in module.read_kv_events("model", 0, 8, world_size=2).events
+    ] == ["stored"]
 
 
 @pytest.mark.parametrize("groups", [None, {}])
@@ -725,7 +756,8 @@ def test_cpu_events_require_registered_nonempty_geometry(
             "model", 1, MemoryLayoutDesc([], []), group_layout_descs=groups
         )
     key = _event_key(1)
-    _bind_kv(module, bus, [key])
+    with pytest.raises(ValueError, match="registered nonempty geometry"):
+        _bind_kv(module, bus, [key])
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[key])
     assert not module.read_kv_events("model", 0, 8).events
 
@@ -832,7 +864,7 @@ def test_event_subscription_pushes_without_polling_and_keeps_requests_live(
             99, "model", 0, 8, 1, KVEventProfile("wrong-profile", 1)
         )
         streams.append(invalid)
-        with pytest.raises((ValueError, grpc.RpcError), match="profile.*mismatch"):
+        with pytest.raises(MPRequestError, match="profile.*mismatch"):
             pool.submit(next, invalid).result(timeout=5)
         invalid.close()
         streams.pop()

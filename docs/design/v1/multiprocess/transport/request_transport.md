@@ -44,8 +44,11 @@ future times out. The gRPC client sees the connection close and raises
 `TimeoutError` and a `ConnectionError`, so callers written for ZMQ handle it
 and event streams still end with a `ConnectionError`. When a gRPC server
 answers with any other error status, the client raises `MPRequestError` with
-the status code and message instead of grpcio's own error. A ZMQ server
-doesn't reply to a request whose handler fails, so that request times out.
+the status code and message instead of grpcio's own error. ZMQ reports handler
+`ConnectionError` as `UNAVAILABLE` and `TypeError`/`ValueError` as
+`INVALID_ARGUMENT` through its existing `ZmqErrorResponse` envelope; its client
+uses those same canonical exception classes. Other ZMQ handler exceptions retain
+the existing logging/timeout behavior.
 
 ## Transport implementations
 
@@ -116,9 +119,11 @@ client ──HTTP/2──▶ tokio threads: path → method id, client id metada
 
 Python still owns the protobuf codecs and the handlers, so the wire format,
 the clients and the handler contract are the same as on `sync` and `aio`.
-Status codes follow grpcio: a missing handler is `UNIMPLEMENTED`, a handler
-exception is `UNKNOWN` (`Exception calling application: ...`), an undecodable
-request is `INTERNAL`, and calls still running at shutdown get `UNAVAILABLE`.
+Status codes follow the same contract in all three modes: a missing handler is
+`UNIMPLEMENTED`, handler `ConnectionError` is `UNAVAILABLE`, and handler or
+request-decoder `TypeError`/`ValueError` is `INVALID_ARGUMENT`. Other application
+exceptions and invalid handler output remain `UNKNOWN`. An undecodable protobuf
+request is `INTERNAL`; calls still running at shutdown get `UNAVAILABLE`.
 A cancelled server-streaming call closes the handler's `MessagingStream`.
 Like grpcio servers it accepts gzip requests, answers uncompressed, and ends
 a call with `DEADLINE_EXCEEDED` once its `grpc-timeout` passes.
@@ -185,15 +190,15 @@ boundary.
 The CPU/L1 channel reuses the event bus and the existing vLLM publisher:
 
 ```text
-MP_TOKENS + L1 write/eviction -> KVEventModule's bounded log
-    -> subscribe_kv_events(instance, model, cursor, limit)
+native STORE bindings + committed L1 residency -> KVEventModule's bounded log
+    -> subscribe_kv_events(instance, model, cursor, limit, world_size, profile)
     -> ZMQ / gRPC push -> MP scheduler buffer -> vLLM -> router
 ```
 
-The scheduler subscribes once per configured server. Completed server writes are the store source;
+The native profile uses one private MP per replica; the scheduler subscribes to it. Completed server writes are the store source;
 a successful store request can skip chunks it could not reserve. Stores
-require known tokens and parent hashes. Unknown bindings are counted and
-skipped, and the binding cache is bounded.
+require validated native tokens, hashes and parents. Bindings follow committed
+objects and in-flight transfers; unknown bindings never produce a placement.
 
 Batches carry an incarnation, cursor, loss flag and ordered records.
 Restart, lost records or disconnect withdraw announced CPU placements.
@@ -214,14 +219,15 @@ It uses the existing `InstanceLivenessTarget` hooks for PING refresh and cleanup
 `ManagementModule` retains the shared reaper. Subscription expiry only closes
 that stream; it does not reap the worker's cache registrations.
 
-The scheduler retains an ordered buffer for store/remove/store transitions.
+The scheduler retains a bounded ordered buffer for store/remove/store transitions.
 `take_events()` drains it directly, including under `MultiConnector`, without
 worker metadata or TP aggregation. Reception and heartbeat start at scheduler
 construction when events are enabled. Idle publication also requires vLLM to
 drain its connector while idle; moving reception alone does not provide it.
 
-Both transports advertise `kv_event_stream`. Enable the event
-bus and vLLM KV events, and match hash algorithms and chunk sizes. The scheduler
+Both transports advertise `kv_event_native_bindings_v1`. Enable the event
+bus and vLLM KV events with a matching native profile; LMCache chunks must contain
+complete engine blocks. The scheduler
 subscribes automatically when vLLM events are enabled. See
 `docs/source/mp/configuration.rst` for the server's log-size/disable control.
 L2 events, access events and salted hash interoperability are outside scope.

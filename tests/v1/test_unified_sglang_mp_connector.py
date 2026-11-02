@@ -5,8 +5,8 @@
 from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
-import unittest
 import threading
+import unittest
 
 # Third Party
 import torch
@@ -22,9 +22,9 @@ from lmcache.integration.sglang.unified_lmcache_mp_connector import (
     UnifiedLMCacheMPConnector,
 )
 from lmcache.utils import EngineType
-from lmcache.v1.multiprocess.kv_event_subscriber import KVEventLedger
 from lmcache.v1.distributed.api import ipc_key_to_object_keys
 from lmcache.v1.gpu_connector.kv_format import detect_format
+from lmcache.v1.multiprocess.kv_event_subscriber import KVEventLedger
 from lmcache.v1.multiprocess.token_codec import unpack_token_ids
 import lmcache.lmcache_native as lmcache_native
 
@@ -75,11 +75,6 @@ class _TransferContext:
     def submit_retrieve(self, *args, **kwargs):
         self.retrieve_args = (args, kwargs)
         return _Future(True)
-
-
-class _IPCCacheServerKey:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
 
 
 def _connector_without_io() -> UnifiedLMCacheMPConnector:
@@ -307,7 +302,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
 
     def test_register_kv_cache_rolls_back_failed_context(self) -> None:
         """A rejected registration releases all partially created resources."""
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector._registered = False
         connector._transfer_ctx = None
         connector._kv_caches = {"kv_0": torch.empty(1)}
@@ -339,7 +334,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
 
     def test_register_kv_cache_rejects_duplicate_registration(self) -> None:
         """Registering the same connector twice fails before creating a context."""
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector._registered = True
 
         with (
@@ -830,7 +825,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
 
     def test_failed_store_completion_allows_suffix_retry(self) -> None:
         """A failed tail moves submitted progress back to the operation start."""
-        connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector = _connector_without_io()
         connector._store_submitted_tokens = {"request": 16}
         operation = LMCacheStoreOperation(
             request_id="request",
@@ -1188,6 +1183,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         )
         return self.connector._create_key(operation, start=0, end=4, worker_id=0)
 
+
 class TestNativeCPUEvents(unittest.TestCase):
     """Committed CPU transitions are drained and invalidated on the caller."""
 
@@ -1199,7 +1195,7 @@ class TestNativeCPUEvents(unittest.TestCase):
 
         connector = _connector_without_io()
         connector._ensure_heartbeat_started = Mock()
-        connector._kv_event_subscriber = subscriber = Mock()
+        connector._kv_event_subscriber = Mock()
         stored = KVEventRecord(
             1,
             "stored",
@@ -1234,9 +1230,7 @@ class TestNativeCPUEvents(unittest.TestCase):
             (events[0].block_size, events[0].parent_block_hash, events[0].token_ids),
             (4, -7, list(range(8))),
         )
-        connector._kv_event_updates = [
-            KVEventStreamClosed(error="profile mismatch")
-        ]
+        connector._kv_event_updates = [KVEventStreamClosed(error="profile mismatch")]
         (removed,) = connector.get_kv_events()
         self.assertEqual((set(removed.block_hashes), removed.medium), ({-1, 23}, "CPU"))
         with self.assertRaisesRegex(RuntimeError, "profile mismatch"):
