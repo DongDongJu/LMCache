@@ -28,20 +28,20 @@ native blocks and their original parent chain; incomplete terminal chunks do
 not advertise CPU placement.
 
 Event-enabled hybrid/SWA/Mamba, MLA, DCP, multimodal, LoRA, salted, speculative,
-and shared/L2 configurations are outside this profile. Unsupported request
-namespaces fail before publishing identities. Explicitly disabling engine KV
-events retains the ordinary inference/cache path.
+and shared/L2 configurations are outside this profile. Unsupported model and
+topology configurations fail at startup. Explicitly disabling engine KV events
+retains the ordinary inference/cache path.
 
 vLLM obtains identities from scheduler ``Request.block_hashes`` and carries
 them to workers in connector metadata. Its direct event hook and MultiConnector
 worker-metadata bridge carry each transition through one delivery path.
-Event-enabled vLLM also requires the companion ``validate_kv_event_request``
-admission hook. It rejects unsupported request namespaces before EngineCore
-enqueue, including through MultiConnector, so a rejected request leaves the
-engine available for ordinary inference. An unpatched engine fails explicitly
-at event-enabled startup.
+vLLM uses its existing connector APIs and requires no companion engine patch.
+Requests with salted, LoRA, multimodal, embedding or session namespaces retain
+ordinary caching without native CPU-event bindings. They are not rejected by
+an LMCache admission hook.
 SGLang requires the companion native descriptor and ``take_events`` bridge.
-These engine changes are separate dependencies of the LMCache integration.
+That companion also rejects unsupported namespaces before scheduler admission.
+These SGLang changes are separate dependencies of the LMCache integration.
 The validated Dynamo/SGLang deployment also requires the native replay companion
 and SGLang's ``replay_endpoint`` and ``replay_handshake`` configuration. The
 handshake confirms that the live subscription is installed before retained

@@ -655,7 +655,7 @@ class LoadStoreOp:
     range. Used to avoid overwriting APC-shared GPU blocks during retrieve."""
 
     event_bindings: tuple[EventBinding, ...] = ()
-    """Native identities prepared by the scheduler for each STORE chunk."""
+    """Native identities for each STORE chunk; empty means ordinary caching."""
 
     @property
     def flat_block_ids(self) -> list[int]:

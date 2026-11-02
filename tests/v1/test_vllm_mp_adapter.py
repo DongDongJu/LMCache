@@ -31,6 +31,7 @@ from lmcache.integration.vllm.vllm_multi_process_adapter import (
 )
 from lmcache.utils import CacheRemoveEvent, CacheStoreEvent
 from lmcache.v1.multiprocess.custom_types import (
+    KV_EVENT_CAPABILITY,
     KVEventBatch,
     KVEventProfile,
     KVEventRecord,
@@ -253,6 +254,7 @@ class FakeHeartbeatThread:
 
 def _make_worker_adapter(
     extra_config: dict[str, object] | None = None,
+    event_profile: KVEventProfile | None = None,
     parallel_strategy: ParallelStrategy | None = None,
 ) -> LMCacheMPWorkerAdapter:
     """Construct a worker adapter with the standard test arguments; the
@@ -276,6 +278,7 @@ def _make_worker_adapter(
         parallel_strategy=parallel_strategy,
         mq_timeout=5.0,
         extra_config=extra_config,
+        event_profile=event_profile,
     )
 
 
@@ -956,6 +959,31 @@ def test_lazy_store_preserves_completion_and_failure_reporting(
             None if store_result else {"req-1"}
         )
         assert adapter.get_failed_store_requests() is None
+    finally:
+        adapter.shutdown()
+
+
+def test_store_without_native_binding_keeps_ordinary_cache_path(fake_adapter: tuple) -> None:
+    client = fake_adapter[1]
+    client.get_experimental.return_value.result.return_value = [KV_EVENT_CAPABILITY]
+    adapter = _make_worker_adapter(event_profile=_EVENT_PROFILE)
+    try:
+        adapter.transfer_ctx = MagicMock()
+        adapter.submit_store_request("req-1", _op([[0]]), None)
+        key = adapter.transfer_ctx.submit_store.call_args.args[1]
+        assert key.event_profile is None and key.event_bindings == ()
+        client.subscribe_kv_events.assert_not_called()
+    finally:
+        adapter.shutdown()
+
+
+def test_native_event_identity_does_not_use_storage_hasher(fake_adapter: tuple) -> None:
+    adapter, _, senders = _event_adapter(
+        fake_adapter, extra_config={"lmcache.mp.hash_algorithm": "sha256_cbor"}
+    )
+    try:
+        senders[-1](KVEventBatch(True, 7, 1, False, [_event_record(chunk=b"native")]))
+        assert adapter.get_kv_events()[0].block_hashes == [b"native"]
     finally:
         adapter.shutdown()
 
