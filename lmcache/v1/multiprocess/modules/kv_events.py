@@ -462,6 +462,8 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
             transfer_key: Unique transfer operation ID, used for pending cleanup.
 
         Raises:
+            ConnectionError: EventBus loss recovery has not reached its empty
+                boundary. The caller may retry after recovery; no binding is added.
             ValueError: Missing/incompatible profile, salted input, geometry or
                 token mismatch, or conflicting descriptor for a live identity.
 
@@ -481,6 +483,14 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
         identities: list[ChunkIdentity] = []
         pending = (key.request_id, transfer_key)
         with self._kv_event_lock:
+            if (
+                self._discard_until_empty
+                or self._ctx.event_bus.dropped_events_count() > self._kv_event_dropped
+            ):
+                # Only the event consumer can establish the recovery boundary.
+                raise ConnectionError(
+                    "native KV binding unavailable during loss recovery"
+                )
             # Validate the full request before changing any binding.
             for index, (obj_key, binding) in enumerate(
                 zip(obj_keys, key.event_bindings, strict=True)

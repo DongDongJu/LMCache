@@ -68,6 +68,10 @@ during loss notification. A later binding cannot resurrect pre-loss owners;
 newly observed complete writes are required. This is conservative recovery, not
 an authoritative snapshot. Warm objects whose records have fallen out of replay
 may remain undiscovered until re-established with sufficient fresh evidence.
+STORE binding rejects active recovery, including an unobserved drop count,
+with a retryable `ConnectionError` before adding pending metadata or reserving
+write owners. Only the event consumer ends the discard barrier; an RPC thread
+cannot infer that boundary from queue depth while a popped event is still in flight.
 
 The shared subscriber borrows the client and owns its stream/thread. Its callback
 drains raw updates immediately, with no second raw consumer. The vLLM scheduler

@@ -18,6 +18,11 @@ import pytest
 
 # First Party
 from lmcache.v1.kv_layer_groups import ObjectGroupInfo
+from lmcache.v1.multiprocess.custom_types import (
+    EventBinding,
+    IPCCacheServerKey,
+    KVEventProfile,
+)
 from lmcache.v1.multiprocess.modules import lmcache_driven_transfer as mod
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
@@ -140,6 +145,7 @@ def _make_module(monkeypatch, num_chunks, num_chunks_in_sw, group_kinds=()):
 
     kvlgm = SimpleNamespace(
         num_object_groups=num_object_groups,
+        object_groups=[_og([group]) for group in range(num_object_groups)],
         num_kernel_groups=num_object_groups,
         get_attn_desc=lambda: SimpleNamespace(
             num_chunks_in_sw=num_chunks_in_sw, group_kinds=tuple(group_kinds)
@@ -225,6 +231,37 @@ def _make_checkpoint_module(
     )
     monkeypatch.setattr(mod, "get_layout_desc", lambda *a, **kw: object())
     return module, context, reads, transfers
+
+
+def test_native_recovery_rejection_precedes_write_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retryable event barrier cannot acquire write owners or submit KV copies."""
+    module, _, transfers = _make_module(monkeypatch, 1, [-1])
+    profile = KVEventProfile("native-test", 16)
+    binding = EventBinding(
+        profile.profile_id, tuple(range(16)), None, tuple(range(256)), 16
+    )
+    key = IPCCacheServerKey.from_token_ids(
+        "m",
+        1,
+        0,
+        range(256),
+        0,
+        256,
+        "request",
+        event_profile=profile,
+        event_bindings=(binding,),
+    )
+    cast(
+        MagicMock, module.context.kv_event_module
+    ).bind_store.side_effect = ConnectionError(
+        "native KV binding unavailable during loss recovery"
+    )
+    with pytest.raises(ConnectionError, match="loss recovery"):
+        module.store(key, 1, [[1]], b"producer")
+    cast(MagicMock, module.context.storage_manager.reserve_write).assert_not_called()
+    assert transfers == []
 
 
 def test_store_reserves_real_page_zero_and_only_present_state_objects(

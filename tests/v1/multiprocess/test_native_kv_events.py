@@ -102,6 +102,96 @@ def events(module):
     return module.read_kv_events("model", 0, 100, 2).events
 
 
+@pytest.mark.parametrize("phase", ["unobserved", "draining"])
+def test_bind_during_loss_retries_without_retaining_pending_metadata(
+    phase: str,
+) -> None:
+    """A completion discarded by recovery cannot strand a newly accepted binding."""
+    bus = EventBus(EventBusConfig(max_queue_size=8))
+    registry = LayoutDescRegistry()
+    registry.register("model", 2, MemoryLayoutDesc([], []), AttnWindowDesc([-1, -1]))
+    context = SimpleNamespace(
+        event_bus=bus,
+        chunk_size=4,
+        layout_desc_registry=registry,
+        validate_native_event_storage=lambda: None,
+    )
+    module = KVEventModule(cast(MPCacheServerContext, context), kv_event_log_size=16)
+    objects = keys()
+    rejected: list[str] = []
+    seen = 0
+
+    def attempt_bind() -> None:
+        try:
+            module.bind_store(KEY, objects[:1], "late")
+        except ConnectionError as error:
+            rejected.append(str(error))
+
+    def inject(event: Event) -> None:
+        nonlocal seen
+        seen += 1
+        if phase == "draining" and seen == 3:
+            # Three free queue slots prevent another overflow from hiding the leak.
+            attempt_bind()
+            bus.publish(
+                Event(
+                    EventType.L1_WRITE_FINISHED,
+                    metadata={"keys": objects, "l1_tag": "cpu0"},
+                )
+            )
+            bus.publish(
+                Event(
+                    EventType.MP_TOKENS,
+                    metadata={"native_store_finished": (KEY.request_id, "late")},
+                )
+            )
+
+    try:
+        module.bind_store(KEY, objects[:1], "initial")
+        publish(bus, EventType.L1_WRITE_FINISHED, objects)
+        finish(bus, "initial")
+        initial = module.read_kv_events("model", 0, 100, 2)
+        assert [record.kind for record in initial.events] == ["stored"]
+        bus.subscribe(EventType.L1_WRITE_FINISHED, inject)
+        for _ in range(9):
+            bus.publish(
+                Event(
+                    EventType.L1_WRITE_FINISHED,
+                    metadata={"keys": objects, "l1_tag": "cpu0"},
+                )
+            )
+        assert bus.dropped_events_count() == 1
+        if phase == "unobserved":
+            attempt_bind()
+        bus.stop()
+        assert bus.dropped_events_count() == 1
+        publish(bus, EventType.L1_KEYS_EVICTED, objects)
+        status = module.report_status()["kv_events"]
+        assert status["pending_stores"] == 0, status
+        assert rejected and "recovery" in rejected[0]
+        assert status["bindings"] == status["live_objects"] == 0
+        lost = module.read_kv_events("model", initial.next_cursor, 100, 2)
+        assert lost.lost and not lost.events
+        module.bind_store(KEY, objects[:1], "fresh")
+        publish(bus, EventType.L1_WRITE_FINISHED, objects)
+        finish(bus, "fresh")
+        publish(bus, EventType.L1_KEYS_EVICTED, objects)
+        assert [(record.kind, record.medium) for record in events(module)] == [
+            ("stored", "CPU"),
+            ("removed", "CPU"),
+        ]
+        status = module.report_status()["kv_events"]
+        assert (
+            status["pending_stores"]
+            == status["bindings"]
+            == status["live_objects"]
+            == 0
+        )
+    finally:
+        module.close()
+        bus.stop()
+
+
 @pytest.mark.parametrize("binding_first", [False, True])
 def test_complete_ranks_groups_copies_and_both_join_orders(cache, binding_first):
     module, bus = cache
