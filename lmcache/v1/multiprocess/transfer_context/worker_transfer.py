@@ -25,6 +25,7 @@ from lmcache.v1.gpu_connector.utils import (
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.multiprocess.custom_types import (
     GroupLayout,
+    KVEventProfile,
     RegisterEngineDrivenContextPayload,
     RegisterEngineDrivenContextResponse,
 )
@@ -324,6 +325,7 @@ class TransferContext(ABC):
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
         lmcache_chunk_tokens: int | None = None,
+        event_profile: KVEventProfile | None = None,
     ) -> None:
         """Register KV caches with the server and wait for ACK.
 
@@ -345,6 +347,8 @@ class TransferContext(ABC):
                 worker's own groups, which is wrong when a pipeline stage does
                 not hold the group with the largest block. Adapters that know
                 the chunk size should pass it.
+            event_profile: Optional native CPU-event contract validated on every
+                worker registration; supported only by LMCache-driven transfer.
 
         Raises:
             TimeoutError: If server registration does not complete before
@@ -573,6 +577,7 @@ class LMCacheDrivenTransferContext(TransferContext):
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
         lmcache_chunk_tokens: int | None = None,
+        event_profile: KVEventProfile | None = None,
     ) -> None:
         """Register the worker KV cache with the LMCache server.
 
@@ -585,6 +590,8 @@ class LMCacheDrivenTransferContext(TransferContext):
             layout_hints: Optional KV-layout metadata.
             engine_group_infos: Optional engine KV-group metadata.
             engine_type: Serving engine that produced the caches.
+            event_profile: Optional native CPU-event contract to validate before
+                this worker becomes ready.
 
         Raises:
             RuntimeError: If event IPC is unsupported for the KV-cache device.
@@ -603,6 +610,7 @@ class LMCacheDrivenTransferContext(TransferContext):
                 engine_type,
                 layout_hints or {},
                 list(engine_group_infos),
+                event_profile,
             )
         )
         future.result(timeout=mq_timeout)
@@ -893,6 +901,7 @@ class EngineDrivenTransferContext(TransferContext):
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         engine_type: EngineType = EngineType.VLLM,
         lmcache_chunk_tokens: int | None = None,
+        event_profile: KVEventProfile | None = None,
     ) -> None:
         """Register KV caches with the engine-driven context server.
 
@@ -909,7 +918,14 @@ class EngineDrivenTransferContext(TransferContext):
         Uncompressed single-group registration keeps the legacy path (see
         ``_single_group_block_ids``). Compressed groups size their buffers in
         physical slots while block counts and windows remain in logical tokens.
+
+        Native CPU events require LMCache-driven transfer.
+
+        Raises:
+            ValueError: If a native event profile is supplied.
         """
+        if event_profile is not None:
+            raise ValueError("native KV events require LMCache-driven transfer")
         (
             block_size,
             num_layers,

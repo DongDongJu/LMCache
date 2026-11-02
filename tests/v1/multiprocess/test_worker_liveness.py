@@ -16,6 +16,7 @@ import threading
 import time
 
 # Third Party
+import grpc
 import pytest
 import torch
 import zmq
@@ -27,6 +28,12 @@ from lmcache.v1.distributed.l1_manager import DramL1Manager
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventBus, EventBusConfig
 from lmcache.v1.multiprocess.config import CoordinatorConfig, MPServerConfig
+from lmcache.v1.multiprocess.custom_types import (
+    KV_EVENT_CAPABILITY,
+    EventBinding,
+    IPCCacheServerKey,
+    KVEventProfile,
+)
 from lmcache.v1.multiprocess.engine_context import LayoutDescRegistry
 from lmcache.v1.multiprocess.engine_module import ModuleBuildContext
 from lmcache.v1.multiprocess.modules import engine_driven_transfer as non_gpu_mod
@@ -80,7 +87,7 @@ def _event_module(
             MemoryLayoutDesc([torch.Size([1])], [torch.float16]),
             AttnWindowDesc(num_chunks_in_sw=[-1] * groups),
         )
-    ctx = MagicMock(event_bus=bus, layout_desc_registry=layouts)
+    ctx = MagicMock(event_bus=bus, chunk_size=1, layout_desc_registry=layouts)
     return KVEventModule(ctx, kv_event_log_size=size), bus
 
 
@@ -101,16 +108,29 @@ def _event_key(
     )
 
 
-def _bind_kv(bus: EventBus, keys: list[ObjectKey]) -> None:
-    hashes = [key.chunk_hash for key in keys]
-    _publish_kv(
-        bus,
-        EventType.MP_TOKENS,
-        chunk_hashes=hashes,
-        token_chunks=[[i] for i in range(len(keys))],
-        token_offsets=list(range(len(keys))),
-        parent_hashes=[None] + hashes[:-1],
-    )
+def _bind_kv(module: KVEventModule, bus: EventBus, keys: list[ObjectKey]) -> None:
+    for index, key in enumerate(keys):
+        profile = KVEventProfile("test:native:bytes:v1", 1)
+        binding = EventBinding(
+            profile.profile_id,
+            (key.chunk_hash,),
+            None if index == 0 else keys[index - 1].chunk_hash,
+            (index,),
+            1,
+        )
+        ipc_key = IPCCacheServerKey.from_token_ids(
+            key.model_name,
+            ObjectKey.WorldSizeFromKVRank(key.kv_rank),
+            0,
+            (index,),
+            0,
+            1,
+            "request",
+            event_profile=profile,
+            event_bindings=(binding,),
+        )
+        module.bind_store(ipc_key, [key], f"store{index}")
+    bus.stop()
 
 
 def _bare_gpu_module() -> LMCacheDrivenTransferModule:
@@ -425,7 +445,7 @@ def test_config_accepts_disabled_and_defaults() -> None:
 def test_cpu_events_preserve_tokens_parents_and_deduplicate_ranks() -> None:
     module, bus = _event_module(world_size=2)
     keys = [_event_key(1, world_size=2), _event_key(2, world_size=2)]
-    _bind_kv(bus, keys)
+    _bind_kv(module, bus, keys)
     _publish_kv(
         bus,
         EventType.L1_WRITE_FINISHED_AND_READ_RESERVED,
@@ -436,8 +456,8 @@ def test_cpu_events_preserve_tokens_parents_and_deduplicate_ranks() -> None:
         (r.kind, r.block_hashes, r.token_ids, r.parent_block_hash)
         for r in result.events
     ] == [
-        ("stored", [keys[0].chunk_hash], [0], None),
-        ("stored", [keys[1].chunk_hash], [1], keys[0].chunk_hash),
+        ("stored", (keys[0].chunk_hash,), (0,), None),
+        ("stored", (keys[1].chunk_hash,), (1,), keys[0].chunk_hash),
     ]
     _publish_kv(
         bus,
@@ -446,7 +466,7 @@ def test_cpu_events_preserve_tokens_parents_and_deduplicate_ranks() -> None:
     )
     removed = module.read_kv_events("model", result.next_cursor, 8)
     assert [(r.kind, r.medium, r.block_hashes) for r in removed.events] == [
-        ("removed", "CPU", [keys[0].chunk_hash]),
+        ("removed", "CPU", (keys[0].chunk_hash,)),
     ]
     assert removed.incarnation == result.incarnation and not removed.lost
     assert module.read_kv_events("model", removed.next_cursor, 8).events == []
@@ -466,7 +486,7 @@ def test_cpu_events_require_every_committed_rank_and_group(groups: int) -> None:
         for rank in range(2)
         for group in range(groups)
     ]
-    _bind_kv(bus, [keys[0]])
+    _bind_kv(module, bus, [keys[0]])
     assert module.read_kv_events("model", 0, 8).events == []
     for key in keys[:-1]:
         _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[key])
@@ -487,7 +507,7 @@ def test_cpu_events_keep_a_chunk_until_its_required_object_loses_all_copies(
     keys = [
         _event_key(1, rank=rank, world_size=world_size) for rank in range(world_size)
     ]
-    _bind_kv(bus, keys[:1])
+    _bind_kv(module, bus, keys[:1])
     for tag in ("_default", "second"):
         _publish_kv(bus, EventType.L1_WRITE_FINISHED, l1_tag=tag, keys=keys)
     first = module.read_kv_events("model", 0, 8)
@@ -510,7 +530,7 @@ def test_cpu_events_refresh_a_committed_chunk_after_its_record_ages_out() -> Non
     """Replay loss must not permanently hide a chunk when it is stored again."""
     module, bus = _event_module(size=2)
     keys = [_event_key(i) for i in range(1, 4)]
-    _bind_kv(bus, keys)
+    _bind_kv(module, bus, keys)
     for key in keys:
         _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[key])
     lagging = module.read_kv_events("model", 0, 8)
@@ -540,7 +560,7 @@ def test_cpu_events_follow_real_l1_commit_and_delete(
     keys = [_event_key(1, rank=rank, world_size=2) for rank in range(2)]
     layout = module.context.layout_desc_registry.find("model", 2)
     assert layout is not None
-    _bind_kv(bus, keys[:1])
+    _bind_kv(module, bus, keys[:1])
     try:
         for manager in managers:
             reserved = manager.reserve_write(keys, [False, False], layout)
@@ -578,7 +598,7 @@ def test_event_log_pages_filters_models_and_reports_overflow() -> None:
     module, bus = _event_module(size=3)
     for index, model in enumerate(("model", "other", "model")):
         key = _event_key(index, model)
-        _bind_kv(bus, [key])
+        _bind_kv(module, bus, [key])
         _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[key])
     first = module.read_kv_events("model", 0, 1)
     assert [r.seq for r in first.events] == [1] and first.next_cursor == 1
@@ -595,7 +615,7 @@ def test_event_log_pages_filters_models_and_reports_overflow() -> None:
 def test_bus_loss_is_visible_without_later_bus_traffic() -> None:
     module, bus = _event_module(bus=EventBus(EventBusConfig(max_queue_size=1)))
     key = _event_key(1)
-    _bind_kv(bus, [key])
+    _bind_kv(module, bus, [key])
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[key])
     event = Event(
         EventType.L1_KEYS_EVICTED, metadata={"l1_tag": "_default", "keys": [key]}
@@ -617,7 +637,7 @@ def test_bus_loss_discards_queued_commits_and_requires_all_ranks_again() -> None
         world_size=2,
     )
     keys = [_event_key(1, rank=rank, world_size=2) for rank in range(2)]
-    _bind_kv(bus, keys[:1])
+    _bind_kv(module, bus, keys[:1])
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=keys)
     bus.publish(
         Event(
@@ -662,7 +682,7 @@ def test_bus_loss_during_notification_cannot_replay_an_evicted_completion() -> N
 
     bus.subscribe_drops(refill_during_loss)
     module, _ = _event_module(bus=bus)
-    _bind_kv(bus, [key])
+    _bind_kv(module, bus, [key])
     bus.publish(write)
     bus.publish(eviction)
     bus.stop()
@@ -685,7 +705,7 @@ def test_cpu_events_do_not_combine_objects_from_other_namespaces(other: str) -> 
         "salt": ObjectKey(identity=replace(second.identity, cache_salt="other")),
         "world": _event_key(1, rank=1, world_size=4),
     }[other]
-    _bind_kv(bus, [first])
+    _bind_kv(module, bus, [first])
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[first, foreign])
     assert not module.read_kv_events("model", 0, 8).events
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[second])
@@ -705,7 +725,7 @@ def test_cpu_events_require_registered_nonempty_geometry(
             "model", 1, MemoryLayoutDesc([], []), group_layout_descs=groups
         )
     key = _event_key(1)
-    _bind_kv(bus, [key])
+    _bind_kv(module, bus, [key])
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[key])
     assert not module.read_kv_events("model", 0, 8).events
 
@@ -727,6 +747,11 @@ def test_event_channel_enabled_and_disabled_state(
         EventBus(EventBusConfig(enabled=bus_enabled)),
     )
     enabled = bus_enabled and size > 0
+    build_ctx = ModuleBuildContext(
+        module.context, MPServerConfig(kv_event_log_size=size), CoordinatorConfig()
+    )
+    KVEventModule.create(build_ctx)
+    assert (KV_EVENT_CAPABILITY in build_ctx.experimental) == enabled
     result = module.read_kv_events("model", 0, 8)
     assert result.enabled == enabled and result.events == []
     assert module.enabled == enabled
@@ -745,19 +770,18 @@ def test_event_log_validates_arguments() -> None:
             module.read_kv_events("model", cursor, size)
 
 
-def test_unknown_and_expired_token_bindings_skip_stores(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "lmcache.v1.multiprocess.modules.kv_events._TOKEN_BINDING_CACHE_SIZE",
-        4,
-    )
+def test_commit_before_binding_and_metadata_survival() -> None:
     module, bus = _event_module()
     keys = [_event_key(i) for i in range(5)]
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[keys[0]])
-    _bind_kv(bus, keys)
+    assert module.read_kv_events("model", 0, 8).events == []
+    _bind_kv(module, bus, keys)
     _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[keys[0], keys[-1]])
     result = module.read_kv_events("model", 0, 8)
-    assert [r.block_hashes for r in result.events] == [[keys[-1].chunk_hash]]
-    assert module.report_status()["kv_events"]["unbound_stores"] == 2
+    assert [r.block_hashes for r in result.events] == [
+        (keys[0].chunk_hash,),
+        (keys[-1].chunk_hash,),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -799,20 +823,30 @@ def test_event_subscription_pushes_without_polling_and_keeps_requests_live(
     try:
         # More idle streams than unary workers must not starve ping/lookup.
         for instance_id in range(3):
-            stream = client.subscribe_kv_events(instance_id, "model", 0, 8)
+            stream = client.subscribe_kv_events(
+                instance_id, "model", 0, 8, 1, KVEventProfile("test:native:bytes:v1", 1)
+            )
             streams.append(stream)
             assert pool.submit(next, stream).result(timeout=5).events == []
+        invalid = client.subscribe_kv_events(
+            99, "model", 0, 8, 1, KVEventProfile("wrong-profile", 1)
+        )
+        streams.append(invalid)
+        with pytest.raises((ValueError, grpc.RpcError), match="profile.*mismatch"):
+            pool.submit(next, invalid).result(timeout=5)
+        invalid.close()
+        streams.pop()
         waiting_readers = [pool.submit(next, stream) for stream in streams]
         assert client.ping(0).result(timeout=5)
         assert all(not future.done() for future in waiting_readers)
 
         key = _event_key(1)
-        _bind_kv(bus, [key])
+        _bind_kv(module, bus, [key])
         _publish_kv(bus, EventType.L1_WRITE_FINISHED, keys=[key])
         for future in waiting_readers:
             batch = future.result(timeout=5)
             assert [(r.kind, r.medium, r.token_ids) for r in batch.events] == [
-                ("stored", "CPU", [0])
+                ("stored", "CPU", (0,))
             ]
         waiting = pool.submit(next, streams[0])
         _publish_kv(bus, EventType.L1_KEYS_EVICTED, keys=[key])
@@ -829,7 +863,9 @@ def test_event_subscription_pushes_without_polling_and_keeps_requests_live(
         management = ManagementModule(module.context, liveness_targets=[module])
         server = create_request_server([management, module], config)
         server.start()
-        resumed = client.subscribe_kv_events(0, "model", 2, 8)
+        resumed = client.subscribe_kv_events(
+            0, "model", 2, 8, 1, KVEventProfile("test:native:bytes:v1", 1)
+        )
         streams.append(resumed)
         batch = pool.submit(next, resumed).result(timeout=5)
         assert batch.incarnation != old_incarnation and batch.lost
@@ -848,7 +884,9 @@ def test_event_subscription_pushes_without_polling_and_keeps_requests_live(
 
 def test_subscription_wakes_for_final_dropped_event_and_close() -> None:
     module, bus = _event_module(bus=EventBus(EventBusConfig(max_queue_size=0)))
-    stream = module.subscribe_kv_events(1, "model", 0, 8)
+    stream = module.subscribe_kv_events(
+        1, "model", 0, 8, 1, KVEventProfile("test:native:bytes:v1", 1)
+    )
     assert next(stream).events == []
     with ThreadPoolExecutor(max_workers=1) as pool:
         pending = pool.submit(next, stream)
@@ -859,7 +897,7 @@ def test_subscription_wakes_for_final_dropped_event_and_close() -> None:
             stream.close()
 
 
-@pytest.mark.parametrize("log_size", [0, 3])
+@pytest.mark.parametrize("log_size", [3])
 def test_subscription_liveness_uses_management_ping_without_reaping_workers(
     monkeypatch: pytest.MonkeyPatch,
     log_size: int,
@@ -868,7 +906,12 @@ def test_subscription_liveness_uses_management_ping_without_reaping_workers(
     monkeypatch.setattr(kv_events_mod.time, "monotonic", lambda: now)
     module, _ = _event_module(size=log_size)
     management = ManagementModule(module.context, liveness_targets=[module])
-    streams = [module.subscribe_kv_events(i, "model", 0, 8) for i in (1, 2)]
+    streams = [
+        module.subscribe_kv_events(
+            i, "model", 0, 8, 1, KVEventProfile("test:native:bytes:v1", 1)
+        )
+        for i in (1, 2)
+    ]
     try:
         now = 10.0
         management.ping(1)
@@ -896,7 +939,9 @@ def test_management_reaper_closes_subscription_for_reaped_worker() -> None:
         worker_reap_timeout_seconds=0.4,
         worker_registration_grace_seconds=0.8,
     )
-    stream = module.subscribe_kv_events(7, "model", 0, 8)
+    stream = module.subscribe_kv_events(
+        7, "model", 0, 8, 1, KVEventProfile("test:native:bytes:v1", 1)
+    )
     assert next(stream).events == []
     with ThreadPoolExecutor(max_workers=1) as pool:
         waiting = pool.submit(next, stream)

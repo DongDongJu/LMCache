@@ -2,22 +2,26 @@
 """CPU KV-event subscriptions and replay for the MP server."""
 
 # Standard
-from collections import OrderedDict, deque
-from collections.abc import Sequence
+from collections import deque
+from dataclasses import dataclass
 from itertools import islice
 import threading
 import time
 
 # First Party
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import AttnWindowDesc, ObjectKey
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.otel_init import register_gauge
 from lmcache.v1.multiprocess.config import MPServerConfig
 from lmcache.v1.multiprocess.custom_types import (
+    KV_EVENT_CAPABILITY,
     KV_EVENT_KIND_REMOVED,
     KV_EVENT_KIND_STORED,
     KV_EVENT_MEDIUM_CPU,
+    EventBinding,
+    IPCCacheServerKey,
     KVEventBatch,
+    KVEventProfile,
     KVEventRecord,
 )
 from lmcache.v1.multiprocess.engine_context import (
@@ -38,13 +42,12 @@ from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
 )
 from lmcache.v1.multiprocess.request_handler import request_handler
+from lmcache.v1.multiprocess.token_codec import TOKEN_STRIDE, unpack_token_ids
 
-_KIND_LOST = "lost"
-_TOKEN_BINDING_CACHE_SIZE = 65536
-_ChunkKey = tuple[str, int, str, bytes]
+ChunkIdentity = tuple[str, int, str, bytes]
 
 
-def _chunk_key(key: ObjectKey) -> _ChunkKey:
+def _chunk_key(key: ObjectKey) -> ChunkIdentity:
     """Identify content independently of its required rank and object group."""
     return (
         key.model_name,
@@ -67,7 +70,7 @@ class CommittedKVResidency:
 
     def __init__(self, layouts: LayoutDescRegistry) -> None:
         self._layouts = layouts
-        self._owners: dict[ObjectKey, set[str]] = {}
+        self._owners: dict[ChunkIdentity, dict[ObjectKey, set[str]]] = {}
 
     def commit(self, key: ObjectKey, l1_tag: str) -> None:
         """Record a completed readable copy; duplicate notifications are idempotent.
@@ -76,7 +79,7 @@ class CommittedKVResidency:
             key: The committed object, including rank, group, and cache salt.
             l1_tag: The L1 manager that completed the write.
         """
-        self._owners.setdefault(key, set()).add(l1_tag)
+        self._owners.setdefault(_chunk_key(key), {}).setdefault(key, set()).add(l1_tag)
 
     def evict(self, key: ObjectKey, l1_tag: str) -> None:
         """Forget one L1 copy, removing owner state when its final copy is gone.
@@ -85,11 +88,16 @@ class CommittedKVResidency:
             key: The object removed from L1.
             l1_tag: The L1 manager that removed it. Unknown copies are ignored.
         """
-        owners = self._owners.get(key)
+        chunk = self._owners.get(_chunk_key(key))
+        if chunk is None:
+            return
+        owners = chunk.get(key)
         if owners is not None:
             owners.discard(l1_tag)
             if not owners:
-                del self._owners[key]
+                del chunk[key]
+                if not chunk:
+                    del self._owners[_chunk_key(key)]
 
     def is_committed(self, key: ObjectKey) -> bool:
         """Return whether every required rank/group has a readable L1 copy.
@@ -105,6 +113,7 @@ class CommittedKVResidency:
         groups = self._layouts.find_group_layout_descs(key.model_name, world_size)
         if not world_size or not groups:
             return False
+        owners = self._owners.get(_chunk_key(key), {})
         return all(
             ObjectKey(
                 key.chunk_hash,
@@ -113,14 +122,31 @@ class CommittedKVResidency:
                 group,
                 key.cache_salt,
             )
-            in self._owners
+            in owners
             for rank in range(world_size)
             for group in groups
         )
 
+    def has_objects(self, identity: ChunkIdentity) -> bool:
+        """Whether any committed object still retains a chunk's native binding.
+
+        Args:
+            identity: Model, KV world size, cache salt and chunk hash.
+        """
+        return identity in self._owners
+
+    @property
+    def object_count(self) -> int:
+        """Number of distinct objects with at least one committed L1 copy."""
+        return sum(len(objects) for objects in self._owners.values())
+
     def clear(self) -> None:
         """Discard all ownership after event loss makes the projection unreliable."""
         self._owners.clear()
+@dataclass
+class _BindingState:
+    descriptor: EventBinding
+    pending: set[tuple[str, str]]
 
 
 class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
@@ -148,10 +174,13 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
     @classmethod
     def create(cls, build_ctx: ModuleBuildContext) -> EngineModule | None:
         """Build the event channel; a disabled channel still serves subscribers."""
-        return cls(
+        module = cls(
             build_ctx.engine_context,
             kv_event_log_size=build_ctx.mp_config.kv_event_log_size,
         )
+        if module.enabled:
+            build_ctx.add_experimental(KV_EVENT_CAPABILITY)
+        return module
 
     def __init__(
         self,
@@ -175,12 +204,14 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
         self._kv_event_next_seq = 1
         self._kv_event_dropped = self._kv_event_lost_markers = 0
         self._discard_until_empty = False
-        self._kv_event_unbound_stores = 0
-        self._kv_event_bindings: OrderedDict[
-            bytes, tuple[tuple[int, ...], bytes | None]
-        ] = OrderedDict()
         self._residency = CommittedKVResidency(ctx.layout_desc_registry)
-        self._announced: dict[_ChunkKey, int] = {}
+        self._announced: dict[ChunkIdentity, int] = {}
+        self._kv_event_bindings: dict[ChunkIdentity, _BindingState] = {}
+        self._profiles: dict[
+            tuple[str, int], tuple[KVEventProfile, frozenset[tuple[int, int]]]
+        ] = {}
+        self._pending: dict[tuple[str, str], set[ChunkIdentity]] = {}
+        self._ctx.kv_event_module = self
         if not self._kv_events_enabled:
             return
         self._ctx.event_bus.subscribe_drops(self._record_kv_event_loss)
@@ -219,8 +250,11 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
                     "log_capacity": self._kv_event_log.maxlen,
                     "next_seq": self._kv_event_next_seq,
                     "lost_markers": self._kv_event_lost_markers,
-                    "unbound_stores": self._kv_event_unbound_stores,
+                    "unbound_stores": 0,
                     "subscribers": len(self._kv_event_streams),
+                    "bindings": len(self._kv_event_bindings),
+                    "live_objects": self._residency.object_count,
+                    "pending_stores": len(self._pending),
                 }
             }
 
@@ -262,7 +296,13 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
 
     @request_handler()
     def subscribe_kv_events(
-        self, instance_id: int, model_name: str, cursor: int, max_events: int
+        self,
+        instance_id: int,
+        model_name: str,
+        cursor: int,
+        max_events: int,
+        world_size: int,
+        profile: KVEventProfile,
     ) -> MessagingStream[KVEventBatch]:
         """Subscribe to CPU changes, replaying records after cursor.
 
@@ -273,17 +313,23 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
         """
         if cursor < 0 or not 0 < max_events <= 1024:
             raise ValueError("cursor must be >= 0 and max_events must be in [1, 1024]")
+        if (
+            self.enabled
+            and self._ctx.layout_desc_registry.find(model_name, world_size) is None
+        ):
+            raise ConnectionError("waiting for engine KV cache re-registration")
+        self.register_profile(model_name, world_size, profile)
         first = True
 
         def read(closed: threading.Event) -> KVEventBatch:
             nonlocal cursor, first
             with self._kv_event_lock:
                 while not closed.is_set():
-                    batch = self.read_kv_events(model_name, cursor, max_events)
+                    batch = self.read_kv_events(
+                        model_name, cursor, max_events, world_size
+                    )
                     cursor = batch.next_cursor
-                    if not first and not batch.enabled:
-                        raise StopIteration
-                    if first or batch.events or batch.lost or not batch.enabled:
+                    if first or batch.events or batch.lost:
                         first = False
                         return batch
                     self._kv_event_lock.wait()
@@ -305,7 +351,7 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
         return stream
 
     def read_kv_events(
-        self, model_name: str, cursor: int, max_events: int
+        self, model_name: str, cursor: int, max_events: int, world_size: int = 1
     ) -> KVEventBatch:
         """Read up to max_events records for model_name after cursor.
 
@@ -322,15 +368,15 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
                 last = self._kv_event_next_seq - 1
                 first = self._kv_event_log[0].seq if self._kv_event_log else last + 1
                 lost = cursor + 1 < first or cursor > last
-                next_cursor = min(cursor, last)
+                next_cursor = max(first - 1, min(cursor, last))
                 for record in islice(
                     self._kv_event_log, max(0, cursor + 1 - first), None
                 ):
                     next_cursor = record.seq
-                    if record.kind == _KIND_LOST:
-                        lost = True
-                        records.clear()
-                    elif record.model_name == model_name:
+                    if (
+                        record.model_name == model_name
+                        and record.world_size == world_size
+                    ):
                         records.append(record)
                         if len(records) == max_events:
                             break
@@ -342,31 +388,139 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
                 events=records,
             )
 
-    def _append_kv_event(
+    def register_profile(
         self,
-        kind: str,
         model_name: str,
-        hashes: list[bytes],
-        parent: bytes | None = None,
-        tokens: Sequence[int] = (),
+        world_size: int,
+        profile: KVEventProfile,
+        *,
+        attn_desc: AttnWindowDesc | None = None,
     ) -> None:
-        """Append a sequenced record while holding the event lock."""
-        self._kv_event_log.append(
-            KVEventRecord(
-                seq=self._kv_event_next_seq,
-                kind=kind,
-                medium=KV_EVENT_MEDIUM_CPU,
-                model_name=model_name,
-                block_hashes=hashes,
-                parent_block_hash=parent,
-                token_ids=list(tokens),
+        """Validate one immutable profile against registered dense KV geometry.
+
+        Args:
+            model_name: Existing registered model namespace.
+            world_size: Required KV rank count from engine registration.
+            profile: Engine-native identity semantics and block granularity.
+            attn_desc: Actual candidate GPU layout during registration, before
+                mutating the shared registry; None reads the registered layout.
+
+        Raises:
+            ValueError: Events are disabled, the layout is unsupported, or a
+                different profile was already registered for this context.
+        """
+        if not self.enabled:
+            raise ValueError("native KV events are disabled on this MP server")
+        self._ctx.validate_native_event_storage()
+        if self._ctx.chunk_size % profile.block_size:
+            raise ValueError(
+                "LMCache chunk size must be a multiple of native block size"
+            )
+        attn = (
+            attn_desc
+            if attn_desc is not None
+            else self._ctx.layout_desc_registry.find_attn_desc(model_name, world_size)
+        )
+        if world_size not in (1, 2) or any(w != -1 for w in attn.num_chunks_in_sw):
+            raise ValueError(
+                "native KV events require dense full attention and TP=1 or TP=2"
+            )
+        if any(kind != "attention" for kind in attn.group_kinds):
+            raise ValueError(
+                "native KV events do not support recurrent or auxiliary groups"
+            )
+        required = frozenset(
+            (ObjectKey.ComputeKVRank(world_size, rank, world_size, rank), group)
+            for rank in range(world_size)
+            for group in range(attn.num_object_groups)
+        )
+        context = (model_name, world_size)
+        with self._kv_event_lock:
+            candidate = (profile, required)
+            if self._profiles.setdefault(context, candidate) != candidate:
+                raise ValueError(
+                    "native KV event profile or registered layout mismatch"
+                )
+
+    def bind_store(
+        self, key: IPCCacheServerKey, obj_keys: list[ObjectKey], transfer_key: str
+    ) -> None:
+        """Validate STORE metadata synchronously, then join it through EventBus.
+
+        Args:
+            key: STORE key with one native binding per complete chunk.
+            obj_keys: Resolved object keys for the first object group.
+            transfer_key: Unique transfer operation ID, used for pending cleanup.
+
+        Raises:
+            ValueError: Missing/incompatible profile, salted input, geometry or
+                token mismatch, or conflicting descriptor for a live identity.
+
+        A binding is never proof of residency. Pending entries are retained until
+        the corresponding storage completion callback; live entries survive
+        request cleanup.
+        """
+        if key.event_profile is None:
+            return
+        if key.cache_salt:
+            raise ValueError("native KV events do not support cache_salt")
+        self.register_profile(key.model_name, key.world_size, key.event_profile)
+        if key.start % self._ctx.chunk_size or len(obj_keys) != len(key.event_bindings):
+            raise ValueError(
+                "STORE requires one native binding per complete LMCache chunk"
+            )
+        identities: list[ChunkIdentity] = []
+        pending = (key.request_id, transfer_key)
+        with self._kv_event_lock:
+            # Validate the full request before changing any binding.
+            for index, (obj_key, binding) in enumerate(
+                zip(obj_keys, key.event_bindings, strict=True)
+            ):
+                start = key.start + index * self._ctx.chunk_size
+                if (
+                    binding.profile_id != key.event_profile.profile_id
+                    or binding.block_size != key.event_profile.block_size
+                    or len(binding.token_ids) != self._ctx.chunk_size
+                    or binding.token_ids
+                    != tuple(unpack_token_ids(key.token_bytes[
+                        start * TOKEN_STRIDE : (start + self._ctx.chunk_size) * TOKEN_STRIDE
+                    ]))
+                ):
+                    raise ValueError(
+                        "native STORE binding profile, geometry or tokens mismatch"
+                    )
+                identity: ChunkIdentity = (
+                    key.model_name,
+                    key.world_size,
+                    key.cache_salt,
+                    obj_key.chunk_hash,
+                )
+                current = self._kv_event_bindings.get(identity)
+                if current is not None and current.descriptor != binding:
+                    raise ValueError("conflicting native KV event binding")
+                identities.append(identity)
+            for identity, binding in zip(identities, key.event_bindings, strict=True):
+                state = self._kv_event_bindings.setdefault(
+                    identity, _BindingState(binding, set())
+                )
+                state.pending.add(pending)
+                self._pending.setdefault(pending, set()).add(identity)
+        self._ctx.event_bus.publish(
+            Event(
+                event_type=EventType.MP_TOKENS,
+                session_id=key.request_id,
+                metadata={
+                    "chunk_hashes": [],
+                    "token_chunks": [],
+                    "token_offsets": [],
+                    "parent_hashes": [],
+                    "native_identities": tuple(identities),
+                },
             )
         )
-        self._kv_event_next_seq += 1
-        self._kv_event_lock.notify_all()
 
     def _record_kv_event_loss(self) -> None:
-        """Wake subscribers even when the final eviction was dropped."""
+        """Invalidate completeness as well as subscribers after EventBus loss."""
         with self._kv_event_lock:
             dropped = self._ctx.event_bus.dropped_events_count()
             if dropped > self._kv_event_dropped:
@@ -374,12 +528,18 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
                 self._kv_event_lost_markers += 1
                 self._residency.clear()
                 self._announced.clear()
-                self._append_kv_event(_KIND_LOST, "", [])
+                self._kv_event_bindings.clear()
+                self._pending.clear()
+                # Advancing the empty log's floor reports loss even without a
+                # later write; pre-loss pages can no longer be replayed.
+                self._kv_event_log.clear()
+                self._kv_event_next_seq += 1
+                self._kv_event_lock.notify_all()
             # Read the drop count before the queue: later overflow stays detectable.
             self._discard_until_empty = self._ctx.event_bus.queue_depth() > 0
 
     def _record_kv_event(self, event: Event) -> None:
-        """Translate bus events to ordered records; token bindings precede writes."""
+        """Join native metadata with complete committed rank/group/copy state."""
         with self._kv_event_lock:
             if (
                 self._discard_until_empty
@@ -388,52 +548,67 @@ class KVEventModule(DiscoverableModule, InstanceLivenessTarget):
                 self._record_kv_event_loss()
                 return
             if event.event_type == EventType.MP_TOKENS:
-                for chunk_hash, tokens, parent in zip(
-                    event.metadata["chunk_hashes"],
-                    event.metadata["token_chunks"],
-                    event.metadata["parent_hashes"],
-                    strict=True,
-                ):
-                    self._kv_event_bindings[chunk_hash] = (tuple(tokens), parent)
-                    self._kv_event_bindings.move_to_end(chunk_hash)
-                if len(self._kv_event_bindings) > _TOKEN_BINDING_CACHE_SIZE:
-                    while len(self._kv_event_bindings) > _TOKEN_BINDING_CACHE_SIZE // 2:
-                        self._kv_event_bindings.popitem(last=False)
+                for identity in event.metadata.get("native_identities", ()):
+                    self._update_chunk(identity, event.event_type)
+                pending = event.metadata.get("native_store_finished")
+                if pending is not None:
+                    for identity in self._pending.pop(pending, ()):
+                        state = self._kv_event_bindings.get(identity)
+                        if state is not None:
+                            state.pending.discard(pending)
+                            self._update_chunk(identity, event.event_type)
                 return
             keys: list[ObjectKey] = event.metadata["keys"]
             l1_tag: str = event.metadata["l1_tag"]
             evicted = event.event_type == EventType.L1_KEYS_EVICTED
-            chunks: dict[_ChunkKey, ObjectKey] = {}
+            chunks: dict[ChunkIdentity, None] = {}
             for key in keys:
                 if evicted:
                     self._residency.evict(key, l1_tag)
                 else:
                     self._residency.commit(key, l1_tag)
-                chunks[_chunk_key(key)] = key
-            for chunk, key in chunks.items():
-                announced = self._announced.get(chunk)
-                if not self._residency.is_committed(key):
-                    if announced is not None:
-                        del self._announced[chunk]
-                        self._append_kv_event(
-                            KV_EVENT_KIND_REMOVED, key.model_name, [key.chunk_hash]
-                        )
-                    continue
-                if evicted:
-                    continue
-                # Refresh aged-out records on a new commit so replay can recover.
-                if announced is not None and announced >= self._kv_event_log[0].seq:
-                    continue
-                binding = self._kv_event_bindings.get(key.chunk_hash)
-                if binding is None:
-                    self._kv_event_unbound_stores += 1
-                    continue
-                tokens, parent = binding
-                self._announced[chunk] = self._kv_event_next_seq
-                self._append_kv_event(
-                    KV_EVENT_KIND_STORED,
-                    key.model_name,
-                    [key.chunk_hash],
-                    parent,
-                    tokens,
+                chunks[_chunk_key(key)] = None
+            for identity in chunks:
+                self._update_chunk(identity, event.event_type)
+
+    def _update_chunk(self, identity: ChunkIdentity, event_type: EventType) -> None:
+        """Emit only advertisability transitions and collect unused metadata."""
+        state = self._kv_event_bindings.get(identity)
+        if state is None:
+            return
+        model, world_size, salt, chunk_hash = identity
+        key = ObjectKey(chunk_hash, model,
+                        ObjectKey.ComputeKVRank(world_size, 0, world_size, 0), 0, salt)
+        ready = self._residency.is_committed(key)
+        announced = self._announced.get(identity)
+        refresh = (
+            ready and announced is not None and bool(self._kv_event_log)
+            and announced < self._kv_event_log[0].seq
+            and event_type in (EventType.L1_WRITE_FINISHED,
+                               EventType.L1_WRITE_FINISHED_AND_READ_RESERVED)
+        )
+        if ready != (announced is not None) or refresh:
+            binding = state.descriptor
+            self._kv_event_log.append(
+                KVEventRecord(
+                    seq=self._kv_event_next_seq,
+                    kind=KV_EVENT_KIND_STORED if ready else KV_EVENT_KIND_REMOVED,
+                    medium=KV_EVENT_MEDIUM_CPU,
+                    model_name=model,
+                    block_hashes=binding.block_hashes,
+                    parent_block_hash=binding.parent_block_hash,
+                    token_ids=binding.token_ids if ready else (),
+                    block_size=binding.block_size,
+                    profile_id=binding.profile_id,
+                    world_size=world_size,
+                    cache_salt=salt,
                 )
+            )
+            if ready:
+                self._announced[identity] = self._kv_event_next_seq
+            else:
+                self._announced.pop(identity)
+            self._kv_event_next_seq += 1
+            self._kv_event_lock.notify_all()
+        if not state.pending and not self._residency.has_objects(identity):
+            del self._kv_event_bindings[identity]
