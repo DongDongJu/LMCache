@@ -70,6 +70,125 @@ def apply_kv_event_record(
     )
 
 
+class KVEventLedger:
+    """Track chunk contributions to native CPU placements on the engine thread.
+
+    One ledger belongs to one subscribed model/profile. A chunk is identified by
+    its ordered native hashes; sibling chunks can share constituent blocks.
+    Only the first contribution publishes a block and the last removal withdraws
+    it. Replayed transitions for an already-known chunk are idempotent.
+    """
+
+    def __init__(self) -> None:
+        self._chunks: set[tuple[NativeBlockHash, ...]] = set()
+        self._block_refcounts: dict[NativeBlockHash, int] = {}
+        self._descriptors: dict[
+            NativeBlockHash, tuple[NativeBlockHash | None, tuple[int, ...], int]
+        ] = {}
+
+    def apply(self, record: KVEventRecord) -> list[CacheEvent]:
+        """Apply a validated chunk transition on the engine's publication thread.
+
+        Args:
+            record: Complete native chunk descriptor validated by the subscriber.
+
+        Returns:
+            CPU placement changes, or an empty list for a duplicate or an unknown
+            removal. Stored runs contain only newly advertised blocks, with their
+            corresponding original tokens and preceding native parent hash.
+
+        Raises:
+            ValueError: A STORE is incomplete, repeats a native identity, or
+                conflicts with a live block's parent/tokens. Validation finishes
+                before any contribution changes.
+        """
+        hashes = record.block_hashes
+        if record.kind == KV_EVENT_KIND_REMOVED:
+            if hashes not in self._chunks:
+                return []
+            self._chunks.remove(hashes)
+            removed = []
+            for block_hash in hashes:
+                count = self._block_refcounts[block_hash] - 1
+                if count:
+                    self._block_refcounts[block_hash] = count
+                else:
+                    del self._block_refcounts[block_hash]
+                    del self._descriptors[block_hash]
+                    removed.append(block_hash)
+            return (
+                [CacheRemoveEvent(removed, "CPU")]
+                if removed
+                else []
+            )
+        if (
+            record.block_size <= 0 or not hashes
+            or len(set(hashes)) != len(hashes)
+            or len(record.token_ids) != len(hashes) * record.block_size
+        ):
+            raise ValueError("native STORE does not describe complete distinct blocks")
+        descriptors = {}
+        for index, block_hash in enumerate(hashes):
+            descriptor = (
+                hashes[index - 1] if index else record.parent_block_hash,
+                record.token_ids[index * record.block_size : (index + 1) * record.block_size],
+                record.block_size,
+            )
+            existing = self._descriptors.get(block_hash)
+            if existing is not None and existing != descriptor:
+                raise ValueError("conflicting native block parent or tokens")
+            descriptors[block_hash] = descriptor
+        if hashes in self._chunks:
+            return []
+        self._descriptors.update(descriptors)
+        self._chunks.add(hashes)
+        ranges: list[tuple[int, int]] = []
+        for index, block_hash in enumerate(hashes):
+            count = self._block_refcounts.get(block_hash, 0)
+            self._block_refcounts[block_hash] = count + 1
+            if count:
+                continue
+            if ranges and ranges[-1][1] == index:
+                ranges[-1] = (ranges[-1][0], index + 1)
+            else:
+                ranges.append((index, index + 1))
+        return [
+            CacheStoreEvent(
+                block_hashes=list(hashes[start:end]),
+                parent_block_hash=hashes[start - 1]
+                if start
+                else record.parent_block_hash,
+                token_ids=list(
+                    record.token_ids[
+                        start * record.block_size : end * record.block_size
+                    ]
+                ),
+                block_size=record.block_size,
+                lora_id=None,
+                medium="CPU",
+                lora_name=None,
+            )
+            for start, end in ranges
+        ]
+
+    def reset(self) -> list[CacheEvent]:
+        """Forget chunk ownership and withdraw each advertised CPU block once.
+
+        Returns:
+            One CPU removal event, or an empty list when no blocks were advertised.
+            Subsequent replay starts with an empty ledger.
+        """
+        events: list[CacheEvent] = (
+            [CacheRemoveEvent(list(self._block_refcounts), "CPU")]
+            if self._block_refcounts
+            else []
+        )
+        self._chunks.clear()
+        self._block_refcounts.clear()
+        self._descriptors.clear()
+        return events
+
+
 class MPKVEventSubscriber:
     """Borrow a request client and own one event stream and receiver thread.
 

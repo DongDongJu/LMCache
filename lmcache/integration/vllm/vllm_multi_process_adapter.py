@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, NoReturn, Protocol
 import enum
@@ -30,18 +30,17 @@ from lmcache.integration.vllm.utils import vllm_layout_hints
 from lmcache.utils import (
     CacheEvent,
     CacheRemoveEvent,
-    CacheStoreEvent,
     EngineType,
     _lmcache_nvtx_annotate,
     init_logger,
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
-    KV_EVENT_KIND_REMOVED,
-    KV_EVENT_KIND_STORED,
+    KV_EVENT_CAPABILITY,
     BlockAllocationRecord,
+    EventBinding,
     IPCCacheServerKey,
-    KVEventBatch,
+    KVEventProfile,
     KVEventRecord,
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
@@ -52,9 +51,11 @@ from lmcache.v1.multiprocess.group_view import (
 from lmcache.v1.multiprocess.kv_event_subscriber import (
     KVEventStreamClosed,
     MPKVEventSubscriber,
+    KVEventLedger,
 )
 from lmcache.v1.multiprocess.token_codec import num_packed_tokens
 from lmcache.v1.multiprocess.transfer_context import (
+    LMCacheDrivenTransferContext,
     TransferContext,
     create_transfer_context,
 )
@@ -68,6 +69,7 @@ if TYPE_CHECKING:
     from lmcache.integration.vllm.experimental import Dispatcher
 
 logger = init_logger(__name__)
+_MAX_BUFFERED_KV_EVENTS = 65536
 
 # Export through vLLM's multiprocess Prometheus registry, independently of drains.
 _KV_EVENTS_BUFFERED = Gauge(
@@ -652,6 +654,9 @@ class LoadStoreOp:
     """Number of tokens to skip writing at the beginning of the retrieve
     range. Used to avoid overwriting APC-shared GPU blocks during retrieve."""
 
+    event_bindings: tuple[EventBinding, ...] = ()
+    """Native identities prepared by the scheduler for each STORE chunk."""
+
     @property
     def flat_block_ids(self) -> list[int]:
         """Return all block IDs flattened for group-blind error paths.
@@ -694,6 +699,7 @@ class LMCacheMPSchedulerAdapter:
         extra_config: dict[str, Any] | None = None,
         required_chunk_alignment: int | None = None,
         enable_kv_events: bool = False,
+        event_profile: KVEventProfile | None = None,
     ):
         """
         Args:
@@ -716,7 +722,8 @@ class LMCacheMPSchedulerAdapter:
                 provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
             required_chunk_alignment: Optional model-derived chunk alignment
                 used to bind or validate the LMCache server chunk size.
-            enable_kv_events: Subscribe to CPU events on every backing server.
+            enable_kv_events: Subscribe to native CPU events from the private MP.
+            event_profile: Required immutable native contract when events are enabled.
         """
         (
             vllm_block_size,
@@ -729,6 +736,8 @@ class LMCacheMPSchedulerAdapter:
             legacy_block_size,
             mq_timeout,
         )
+        if enable_kv_events and (event_profile is None or len(server_urls) != 1):
+            raise ValueError("Native MP events require one server and a native profile")
         assert len(server_urls) >= 1, "At least one server url required"
         self._server_urls: list[str] = list(server_urls)
         self.req_clients: dict[str, RequestClient] = {
@@ -820,7 +829,7 @@ class LMCacheMPSchedulerAdapter:
         self._kv_event_subscriptions: dict[str, MPKVEventSubscriber] = {}
         self._kv_event_incarnations: dict[str, int | None] = {}
         # Each server invalidates only the CPU hashes it announced.
-        self._announced_kv_hashes: dict[str, set[bytes]] = {}
+        self._kv_event_ledgers: dict[str, KVEventLedger] = {}
         if enable_kv_events:
             labels = (model_name, self.instance_id)
             self._kv_events_buffered = _KV_EVENTS_BUFFERED.labels(*labels)
@@ -830,17 +839,19 @@ class LMCacheMPSchedulerAdapter:
             self._kv_event_batches = _KV_EVENT_BATCHES.labels(*labels)
             self._kv_event_resyncs = {
                 reason: _KV_EVENT_RESYNCS.labels(*labels, reason)
-                for reason in ("server_restart", "events_lost", "stream_closed")
+                for reason in ("server_restart", "events_lost", "stream_closed", "queue_overflow")
             }
-            assert self.instance_id is not None
+            assert self.instance_id is not None and event_profile is not None
             for url, client in self.req_clients.items():
                 self._kv_event_incarnations[url] = None
-                self._announced_kv_hashes[url] = set()
+                self._kv_event_ledgers[url] = KVEventLedger()
                 self._kv_event_subscriptions[url] = MPKVEventSubscriber(
                     client,
                     self.instance_id,
                     self.model_name,
                     partial(self._drain_kv_event_updates, url),
+                    world_size=self.world_size,
+                    profile=event_profile,
                 )
             self._ensure_heartbeat_started()
             for subscriber in self._kv_event_subscriptions.values():
@@ -1258,53 +1269,23 @@ class LMCacheMPSchedulerAdapter:
             self._apply_kv_event_record(server_url, record)
 
     def _apply_kv_event_record(self, server_url: str, record: KVEventRecord) -> None:
-        """Publish CPU changes once, removing only previously announced hashes."""
-        if record.medium != "CPU":
-            return
-        announced = self._announced_kv_hashes[server_url]
-        if record.kind == KV_EVENT_KIND_REMOVED:
-            hashes = [h for h in record.block_hashes if h in announced]
-            if not hashes:
-                return
-            announced.difference_update(hashes)
-            self._buffer_kv_events(
-                [CacheRemoveEvent(block_hashes=list(hashes), medium=record.medium)]
-            )
-        elif record.kind == KV_EVENT_KIND_STORED:
-            hashes = [h for h in record.block_hashes if h not in announced]
-            if not hashes or not record.token_ids:
-                return
-            announced.update(hashes)
-            self._buffer_kv_events(
-                [
-                    CacheStoreEvent(
-                        block_hashes=list(hashes),
-                        parent_block_hash=record.parent_block_hash,
-                        token_ids=list(record.token_ids),
-                        block_size=self.lmcache_tokens_per_chunk,
-                        lora_id=None,
-                        medium=record.medium,
-                        lora_name=None,
-                    )
-                ]
-            )
-        else:
-            logger.warning("Ignoring KV event record of unknown kind %r", record.kind)
+        """Join native chunk contributions before publishing individual blocks."""
+        if len(self._kv_events) + len(record.block_hashes) > _MAX_BUFFERED_KV_EVENTS:
+            # Withdraw discarded history before keeping any later transition.
+            # Replay is conservative: uncached ancestors may remain undiscovered.
+            self._kv_events = [
+                event for ledger in self._kv_event_ledgers.values()
+                for event in ledger.reset()
+            ]
+            self._kv_events_generated.inc(len(self._kv_events))
+            self._kv_event_resyncs["queue_overflow"].inc()
+        self._buffer_kv_events(self._kv_event_ledgers[server_url].apply(record))
 
     def _resync_kv_events(self, server_url: str, reason: str) -> None:
-        """Withdraw announced CPU placements after loss, restart, or stream failure."""
+        """Withdraw only this source's CPU contributions before replay."""
         self._kv_event_resyncs[reason].inc()
         logger.warning("Resynchronizing CPU KV events after %s", reason)
-        if self._announced_kv_hashes[server_url]:
-            self._buffer_kv_events(
-                [
-                    CacheRemoveEvent(
-                        block_hashes=sorted(self._announced_kv_hashes[server_url]),
-                        medium="CPU",
-                    )
-                ]
-            )
-            self._announced_kv_hashes[server_url].clear()
+        self._buffer_kv_events(self._kv_event_ledgers[server_url].reset())
 
     def _create_key(
         self,
@@ -1387,6 +1368,7 @@ class LMCacheMPWorkerAdapter:
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         extra_config: dict[str, Any] | None = None,
         required_chunk_alignment: int | None = None,
+        event_profile: KVEventProfile | None = None,
     ):
         """Initialize the worker adapter for current or legacy vLLM callers.
 
@@ -1409,6 +1391,7 @@ class LMCacheMPWorkerAdapter:
                 provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
             required_chunk_alignment: Optional model-derived chunk alignment
                 used to bind or validate the LMCache server chunk size.
+            event_profile: Optional native contract carried by worker registration.
 
         Raises:
             TypeError: If the connector argument shape is unsupported.
@@ -1535,6 +1518,7 @@ class LMCacheMPWorkerAdapter:
             self.req_client.close()
             _raise_server_unreachable(server_url, self._mq_timeout)
         self.lmcache_tokens_per_chunk = lmcache_tokens_per_chunk
+        self._event_profile = event_profile
         if lmcache_tokens_per_chunk % vllm_block_size != 0:
             raise ValueError(
                 f"LMCache chunk size {lmcache_tokens_per_chunk} must be a "
@@ -1549,6 +1533,9 @@ class LMCacheMPWorkerAdapter:
         self.experimental: set[str] = get_experimental(
             self.req_client, timeout=self._mq_timeout
         )
+        if event_profile is not None and KV_EVENT_CAPABILITY not in self.experimental:
+            self.req_client.close()
+            raise ValueError(f"MP KV events require {KV_EVENT_CAPABILITY}")
         self.dispatcher: "Dispatcher | None" = None
 
         # Health state (shared with heartbeat thread)
@@ -1704,6 +1691,11 @@ class LMCacheMPWorkerAdapter:
         """
         self.kv_caches = kv_caches
         transfer_ctx = self._create_transfer_context(kv_caches)
+        if self._event_profile is not None and not isinstance(
+            transfer_ctx, LMCacheDrivenTransferContext
+        ):
+            transfer_ctx.close()
+            raise ValueError("MP KV events require LMCache-driven device transfer")
         layout_hints = self._layout_hints
         try:
             # Register before publishing: a context becomes visible to the
@@ -1720,6 +1712,7 @@ class LMCacheMPWorkerAdapter:
                 engine_group_infos=self.engine_group_infos,
                 engine_type=EngineType.VLLM,
                 lmcache_chunk_tokens=self.lmcache_tokens_per_chunk,
+                event_profile=self._event_profile,
             )
         except TimeoutError:
             # Never published, so there is nothing to roll back: close the
@@ -1934,6 +1927,10 @@ class LMCacheMPWorkerAdapter:
             cache_salt=cache_salt,
             request_configs=request_configs,
         )
+        if op.event_bindings:
+            key = replace(
+                key, event_profile=self._event_profile, event_bindings=op.event_bindings
+            )
         transfer_ctx = self.transfer_ctx
         if transfer_ctx is None:
             raise RuntimeError(

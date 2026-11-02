@@ -32,9 +32,11 @@ from lmcache.integration.vllm.vllm_multi_process_adapter import (
 from lmcache.utils import CacheRemoveEvent, CacheStoreEvent
 from lmcache.v1.multiprocess.custom_types import (
     KVEventBatch,
+    KVEventProfile,
     KVEventRecord,
 )
 from lmcache.v1.multiprocess.futures import MessagingStream
+from lmcache.v1.multiprocess import kv_event_subscriber as native_events
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.token_codec import pack_token_ids
 from lmcache.v1.multiprocess.transport.base import RequestClient
@@ -53,6 +55,8 @@ from tests.v1.mp_scheduler_adapter_test_utils import (
     ready_future,
 )
 
+
+_EVENT_PROFILE = KVEventProfile("vllm-native-test-v1", 16)
 
 class FakeMQClient:
     """MessageQueueClient double that records close calls."""
@@ -152,20 +156,24 @@ def _event_adapter(
         parallel_strategy=parallel_strategy or _parallel_strategy(),
         extra_config=extra_config,
         enable_kv_events=True,
+        event_profile=_EVENT_PROFILE,
     )
     assert ready.wait(5)
     return adapter, client, senders
 
 
-def _event_record(kind: str = "stored", chunk: bytes = b"chunk") -> KVEventRecord:
+def _event_record(kind: str = "stored", chunk: bytes = b"chunk", *, seq: int = 1) -> KVEventRecord:
     return KVEventRecord(
-        seq=1,
+        seq=seq,
         kind=kind,
         medium="CPU",
         model_name="test-model",
-        block_hashes=[chunk],
+        block_hashes=(chunk,),
         parent_block_hash=None,
-        token_ids=[1, 2] if kind == "stored" else [],
+        token_ids=tuple(range(16)) if kind == "stored" else (),
+        block_size=16,
+        profile_id=_EVENT_PROFILE.profile_id,
+        world_size=1,
     )
 
 
@@ -1834,10 +1842,9 @@ def test_pushed_cpu_events_preserve_transitions_without_worker_polls(
             4,
             False,
             [
-                _event_record("removed", b"unknown"),
-                stored,
-                stored,
-                replace(stored, medium="STORAGE"),
+                _event_record("removed", b"unknown", seq=1),
+                replace(stored, seq=2),
+                replace(stored, seq=3),
             ],
         )
         senders[-1](batch)
@@ -1853,21 +1860,21 @@ def test_pushed_cpu_events_preserve_transitions_without_worker_polls(
         assert len(events) == 1 and isinstance(events[0], CacheStoreEvent)
         assert (events[0].parent_block_hash, events[0].token_ids, events[0].medium) == (
             b"parent",
-            [1, 2],
+            list(range(16)),
             "CPU",
         )
-        senders[-1](replace(batch, events=[_event_record("removed"), stored]))
+        senders[-1](replace(batch, next_cursor=6, events=[_event_record("removed", seq=5), replace(stored, seq=6)]))
         assert [type(e) for e in adapter.get_kv_events()] == [
             CacheRemoveEvent,
             CacheStoreEvent,
         ]
-        senders[-1](replace(batch, events=[_event_record("removed")] * 2))
+        senders[-1](replace(batch, next_cursor=8, events=[_event_record("removed", seq=7), _event_record("removed", seq=8)]))
         assert len(adapter.get_kv_events()) == 1
         # Repeated engine drains never issue a new request.
         for _ in range(10):
             assert adapter.get_kv_events() == []
         client.subscribe_kv_events.assert_called_once_with(
-            adapter.instance_id, "test-model", 0, 1024
+            adapter.instance_id, "test-model", 0, 1024, 1, _EVENT_PROFILE
         )
     finally:
         adapter.shutdown()
@@ -1961,6 +1968,7 @@ def test_kv_event_reconnect_is_delayed_and_shutdown_stops_receiver(
         16,
         _parallel_strategy(),
         enable_kv_events=True,
+        event_profile=_EVENT_PROFILE,
     )
     try:
         assert adapter.get_kv_events() == []
@@ -2032,34 +2040,10 @@ def test_disabled_events_do_not_subscribe_or_start_heartbeat(
         adapter.shutdown()
 
 
-def test_scheduler_keeps_server_incarnations_and_resets_separate(
-    fake_adapter: tuple,
-) -> None:
-    """A reset on one server does not forget another server's announcements."""
-    adapter, client, senders = _event_adapter(fake_adapter, n_servers=2)
-    try:
-        assert client.subscribe_kv_events.call_count == 2
-        assert len(FakeHeartbeatThread.instances) == 2
-        assert all(
-            hb.instance_id == adapter.instance_id
-            for hb in FakeHeartbeatThread.instances
-        )
-        senders[0](KVEventBatch(True, 7, 1, False, [_event_record(chunk=b"first")]))
-        senders[1](KVEventBatch(True, 11, 1, False, [_event_record(chunk=b"second")]))
-        assert [type(event) for event in adapter.get_kv_events()] == [
-            CacheStoreEvent,
-            CacheStoreEvent,
-        ]
-        senders[0](KVEventBatch(True, 8, 2, False, []))
-        events = adapter.get_kv_events()
-        assert len(events) == 1 and events[0].block_hashes == [b"first"]
-        senders[1](
-            KVEventBatch(True, 11, 2, False, [_event_record("removed", b"second")])
-        )
-        events = adapter.get_kv_events()
-        assert len(events) == 1 and events[0].block_hashes == [b"second"]
-    finally:
-        adapter.shutdown()
+def test_scheduler_rejects_shared_native_event_sources(fake_adapter: tuple) -> None:
+    """Native placement attribution requires one private server per replica."""
+    with pytest.raises(ValueError, match="one server"):
+        _event_adapter(fake_adapter, n_servers=2)
 
 
 def test_scheduler_metrics_follow_background_reception_and_drain(
@@ -2093,7 +2077,7 @@ def test_scheduler_metrics_follow_background_reception_and_drain(
                 7,
                 3,
                 False,
-                [_event_record(), _event_record("removed"), _event_record()],
+                [_event_record(seq=1), _event_record("removed", seq=2), _event_record(seq=3)],
             )
         )
         assert metrics() == (3, 3, 0)
@@ -2113,14 +2097,14 @@ def test_scheduler_shutdown_waits_for_callback_before_heartbeat_and_client_close
     adapter, client, senders = _event_adapter(fake_adapter)
     entered = threading.Event()
     release = threading.Event()
-    event_type = adapter_mod.CacheStoreEvent
+    event_type = native_events.CacheStoreEvent
 
     def blocking_event(**kwargs: Any) -> CacheStoreEvent:
         entered.set()
         assert release.wait(5)
         return event_type(**kwargs)
 
-    monkeypatch.setattr(adapter_mod, "CacheStoreEvent", blocking_event)
+    monkeypatch.setattr(native_events, "CacheStoreEvent", blocking_event)
     sender = threading.Thread(
         target=senders[0], args=(KVEventBatch(True, 7, 1, False, [_event_record()]),)
     )
