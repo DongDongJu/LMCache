@@ -43,9 +43,10 @@ reconstruct readiness across a dropped eviction. Every required object must
 subsequently report a committed copy before another Stored is emitted.
 
 This implements the residency step of [issue #5932](https://github.com/LMCache/LMCache/issues/5932).
-The wire format, chunk hashes, token bindings, elected worker subscription, and
-engine publication hooks remain the existing contract. Native block identities,
-scheduler-side subscription, and idle engine publication belong to later steps.
+The wire format, chunk hashes, token bindings, and engine publication hooks remain
+the existing contract. The scheduler subscribes to committed events independently
+of worker execution. Native block identities and idle engine publication belong
+to later steps.
 The legacy wire does not distinguish salts or parallel setups for a shared model;
 separate ownership scopes prevent mixed-shard completeness but do not solve
 router identity collisions. The supported routing profile uses one unsalted
