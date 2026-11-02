@@ -29,6 +29,66 @@ Key Types:
 """
 
 
+NativeBlockHash = bytes | int
+"""Opaque native content identity; integers retain their original signedness."""
+
+
+@dataclass(frozen=True)
+class KVEventProfile:
+    """Immutable native identity contract for one model/cache context.
+
+    ``profile_id`` identifies the engine, hash algorithm, seed semantics and
+    identity representation/version. ``block_size`` is the native GPU-event
+    granularity, which must divide the server's chunk size.
+    """
+
+    profile_id: str
+    block_size: int
+
+    def __post_init__(self) -> None:
+        if not self.profile_id or self.block_size <= 0:
+            raise ValueError(
+                "native event profile requires an ID and positive block size"
+            )
+
+
+@dataclass(frozen=True)
+class EventBinding:
+    """Native identities and original tokens for one complete LMCache chunk.
+
+    Hashes and parent come from the engine's native event path. MP never
+    reconstructs them. Tuples keep retained replay records independent of
+    request cleanup and subsequent binding registrations.
+    """
+
+    profile_id: str
+    block_hashes: tuple[NativeBlockHash, ...]
+    parent_block_hash: NativeBlockHash | None
+    token_ids: tuple[int, ...]
+    block_size: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.block_hashes, tuple) or not isinstance(
+            self.token_ids, tuple
+        ):
+            raise ValueError(
+                "native event binding hashes and tokens must be immutable tuples"
+            )
+        if not self.profile_id or self.block_size <= 0 or not self.block_hashes:
+            raise ValueError(
+                "native event binding requires a profile and complete blocks"
+            )
+        if len(self.token_ids) != len(self.block_hashes) * self.block_size:
+            raise ValueError("native event blocks and tokens are not aligned")
+        hashes = self.block_hashes + (
+            () if self.parent_block_hash is None else (self.parent_block_hash,)
+        )
+        if any(type(value) not in (bytes, int) for value in hashes):
+            raise ValueError("native event identities must be bytes or integers")
+        if len({type(value) for value in hashes}) != 1:
+            raise ValueError("native event identities must use one representation")
+
+
 @dataclass(order=True, frozen=True)
 class IPCCacheServerKey:
     """Cache key for the IPC (multiprocess) protocol.
@@ -80,6 +140,10 @@ class IPCCacheServerKey:
     # lookups reject it.
     num_kv_readers: int = field(default=0, compare=False)
 
+    # Optional STORE metadata, excluded from storage identity.
+    event_profile: KVEventProfile | None = field(default=None, compare=False)
+    event_bindings: tuple[EventBinding, ...] = field(default=(), compare=False)
+
     # Duplicated from ObjectKey — cannot import ObjectKey here due to
     # circular dependency (api.py imports IPCCacheServerKey).
     _SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
@@ -91,6 +155,10 @@ class IPCCacheServerKey:
                 f"token_bytes of {len(self.token_bytes)} byte(s) is not a "
                 f"whole number of {TOKEN_STRIDE}-byte token ids"
             )
+        if self.event_bindings and self.event_profile is None:
+            raise ValueError("native event bindings require an event profile")
+        if not isinstance(self.event_bindings, tuple):
+            raise ValueError("native event bindings must be an immutable tuple")
         bad = self._SALT_FORBIDDEN_CHARS & set(self.cache_salt)
         if bad:
             raise ValueError(
@@ -115,6 +183,8 @@ class IPCCacheServerKey:
         cache_salt: str = "",
         num_kv_readers: int = 1,
         request_configs: dict[str, Any] | None = None,
+        event_profile: KVEventProfile | None = None,
+        event_bindings: tuple[EventBinding, ...] = (),
     ) -> "IPCCacheServerKey":
         """Create a key from unpacked token ids.
 
@@ -132,6 +202,8 @@ class IPCCacheServerKey:
             cache_salt: Per-user isolation salt.
             num_kv_readers: Number of workers that will read the object.
             request_configs: Optional LMCache request configs.
+            event_profile: Optional native identity contract for STORE.
+            event_bindings: Immutable engine descriptors for complete STORE chunks.
 
         Returns:
             The key, with ``token_ids`` packed into ``token_bytes``.
@@ -147,6 +219,8 @@ class IPCCacheServerKey:
             request_id=request_id,
             cache_salt=cache_salt,
             request_configs=request_configs,
+            event_profile=event_profile,
+            event_bindings=event_bindings,
         )
 
     @property
@@ -184,6 +258,8 @@ class IPCCacheServerKey:
             request_id=self.request_id,
             cache_salt=self.cache_salt,
             request_configs=self.request_configs,
+            event_profile=self.event_profile,
+            event_bindings=self.event_bindings,
         )
 
 
@@ -413,22 +489,28 @@ def get_customized_decoder(type: Any) -> msgspec.msgpack.Decoder:
 # server module (lmcache.v1.multiprocess.plugin_modules.qstore); the vLLM
 # connector requests it for ``lmcache.mp.transfer_intermediate_tensors``.
 TRANSFER_QUERY = "transfer_query"
+# Native identities require compatible engine bindings on every KV rank.
+KV_EVENT_CAPABILITY = "kv_event_native_bindings_v1"
 KV_EVENT_KIND_STORED = "stored"
 KV_EVENT_KIND_REMOVED = "removed"
 KV_EVENT_MEDIUM_CPU = "CPU"
 
 
-@dataclass
+@dataclass(frozen=True)
 class KVEventRecord:
-    """Sequenced CPU cache change; stores carry one chunk's tokens and parent."""
+    """Immutable native CPU transition; removals own exactly the advertised IDs."""
 
     seq: int
     kind: str
     medium: str
     model_name: str
-    block_hashes: list[bytes]
-    parent_block_hash: bytes | None
-    token_ids: list[int]
+    block_hashes: tuple[NativeBlockHash, ...]
+    parent_block_hash: NativeBlockHash | None
+    token_ids: tuple[int, ...]
+    block_size: int
+    profile_id: str
+    world_size: int
+    cache_salt: str = ""
 
 
 @dataclass
