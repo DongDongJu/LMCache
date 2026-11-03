@@ -1,5 +1,5 @@
 Freeze Mode
-==========
+===========
 
 .. warning::
 
@@ -93,7 +93,7 @@ Freeze mode can be manually controlled through the Controller API:
 - Monitoring and health checks continue normally
 
 Related Documentation
---------------------
+---------------------
 
 - :doc:`index` - Controller WebUI overview
 - :doc:`../api_reference/configurations` - API and configuration reference
