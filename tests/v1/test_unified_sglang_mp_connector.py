@@ -102,7 +102,11 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         self.connector = _connector_without_io()
         self.connector.page_size = 4
 
-    def test_init_converts_chunk_tokens_to_sglang_blocks(self) -> None:
+    def _construct(self, enable_kv_events=False, kv_event_publisher=False):
+        """Build a connector through ``__init__``, with its subscriber class."""
+        # First Party
+        from lmcache.v1.multiprocess.custom_types import KV_EVENT_CAPABILITY
+
         source_tensor = Mock(
             device=torch.device("cuda"),
             dtype=torch.float16,
@@ -131,9 +135,13 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         config.get_extra_config_value = lambda _key, default: default
         request_client = Mock()
         request_client.get_chunk_size.return_value.result.return_value = 8
+        request_client.get_experimental.return_value.result.return_value = [
+            KV_EVENT_CAPABILITY
+        ]
         adapter_module_name = "lmcache.integration.sglang.unified_kv_adapter"
         adapter_module = ModuleType(adapter_module_name)
         vars(adapter_module)["SGLangUnifiedKVAdapter"] = Mock(return_value=adapter)
+        connector_module = "lmcache.integration.sglang.unified_lmcache_mp_connector"
 
         with (
             patch.dict(
@@ -149,10 +157,13 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
                 return_value=request_client,
             ),
             patch.object(UnifiedLMCacheMPConnector, "register_kv_cache"),
+            patch(f"{connector_module}.MPKVEventSubscriber") as subscriber_cls,
         ):
             connector = UnifiedLMCacheMPConnector(
                 config_file=None,
-                model_config=SimpleNamespace(model_path="test-model"),
+                model_config=SimpleNamespace(
+                    model_path="test-model", speculative_algorithm=None
+                ),
                 tp_size=1,
                 tp_rank=0,
                 tp_group=None,
@@ -162,9 +173,24 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
                 tree_components=(object(),),
                 mamba_component=None,
                 sliding_window_size=None,
+                enable_kv_events=enable_kv_events,
+                kv_event_publisher=kv_event_publisher,
             )
+        return connector, subscriber_cls
 
+    def test_init_converts_chunk_tokens_to_sglang_blocks(self) -> None:
+        connector, _ = self._construct()
         self.assertEqual(connector.blocks_in_chunk, 2)
+
+    def test_kv_events_subscribe_only_on_the_rank_sglang_elects(self):
+        for publisher in (True, False):
+            with self.subTest(kv_event_publisher=publisher):
+                connector, subscriber_cls = self._construct(
+                    enable_kv_events=True, kv_event_publisher=publisher
+                )
+                # Every rank registers the profile; one rank subscribes.
+                self.assertEqual(connector.event_profile.block_size, 4)
+                self.assertEqual(subscriber_cls.call_count, int(publisher))
 
     def test_slots_to_blocks_accepts_noncontiguous_pages(self):
         slots = torch.tensor([4, 5, 6, 7, 12, 13, 14, 15])
@@ -697,9 +723,9 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         )
         self.assertEqual(connector._create_key.call_args.kwargs["worker_id"], 0)
 
-    def test_native_store_carries_exact_binding_and_ignores_partial_tail(self):
+    def _native_store_connector(self):
         # First Party
-        from lmcache.v1.multiprocess.custom_types import EventBinding, KVEventProfile
+        from lmcache.v1.multiprocess.custom_types import KVEventProfile
 
         connector = _connector_without_io()
         connector.page_size = 4
@@ -720,21 +746,84 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         connector._is_kv_writer = True
         connector._sync_success = lambda success: success
         connector._sync_leader_int = lambda value: value
-        binding = EventBinding("sglang-native", (-1, 23), None, tuple(range(8)), 4)
+        return connector
+
+    def test_native_store_binds_each_complete_chunk_to_its_pages(self):
+        # First Party
+        from lmcache.v1.multiprocess.custom_types import EventBinding
+
+        connector = self._native_store_connector()
+        tokens = list(range(100, 119))
         operation = connector.submit_store(
             "native-request",
-            list(range(11)),
-            [torch.arange(4, 12)],
+            tokens,
+            [torch.arange(4, 20)],
             device_indices_start=0,
             cache_salt="",
-            event_bindings=(binding,),
+            native_block_hashes=[-1, 23, 45, -67],
         )
-        self.assertEqual(operation.end, 8)
+        self.assertEqual((operation.start, operation.end), (0, 16))
         key = connector._transfer_ctx.store_args[1]
-        self.assertEqual(key.event_bindings, (binding,))
         self.assertEqual(key.event_profile, connector.event_profile)
-        self.assertEqual((key.start, key.end), (0, 8))
+        self.assertEqual(
+            key.event_bindings,
+            (
+                EventBinding("sglang-native", (-1, 23), None, tuple(tokens[:8]), 4),
+                EventBinding("sglang-native", (45, -67), 23, tuple(tokens[8:16]), 4),
+            ),
+        )
         self.assertEqual(connector.get_kv_events(), [])
+
+    def test_native_store_after_a_stored_prefix_links_to_the_preceding_page(self):
+        # First Party
+        from lmcache.v1.multiprocess.custom_types import EventBinding
+
+        connector = self._native_store_connector()
+        connector._store_submitted_tokens = {"native-request": 8}
+        tokens = list(range(100, 116))
+        operation = connector.submit_store(
+            "native-request",
+            tokens,
+            [torch.arange(4, 20)],
+            device_indices_start=0,
+            cache_salt="",
+            native_block_hashes=[-1, 23, 45, -67],
+        )
+        self.assertEqual((operation.start, operation.end), (8, 16))
+        key = connector._transfer_ctx.store_args[1]
+        self.assertEqual(
+            key.event_bindings,
+            (EventBinding("sglang-native", (45, -67), 23, tuple(tokens[8:16]), 4),),
+        )
+
+    def test_store_without_native_hashes_is_cached_without_a_binding(self):
+        connector = self._native_store_connector()
+        operation = connector.submit_store(
+            "salted-request",
+            list(range(8)),
+            [torch.arange(4, 12)],
+            device_indices_start=0,
+            cache_salt="tenant",
+        )
+        self.assertEqual((operation.start, operation.end), (0, 8))
+        key = connector._transfer_ctx.store_args[1]
+        self.assertIsNone(key.event_profile)
+        self.assertEqual(key.event_bindings, ())
+        self.assertEqual(key.cache_salt, "tenant")
+
+    def test_native_hashes_must_cover_every_page_of_an_unsalted_request(self):
+        connector = self._native_store_connector()
+        for cache_salt, hashes in (("", [-1, 23, 45]), ("tenant", [-1, 23, 45, -67])):
+            with self.subTest(cache_salt=cache_salt), self.assertRaises(ValueError):
+                connector.submit_store(
+                    "native-request",
+                    list(range(16)),
+                    [torch.arange(4, 20)],
+                    device_indices_start=0,
+                    cache_salt=cache_salt,
+                    native_block_hashes=hashes,
+                )
+        self.assertIsNone(connector._transfer_ctx.store_args)
 
     def test_get_store_start_uses_remote_progress(self):
         connector = _connector_without_io()
@@ -1235,3 +1324,52 @@ class TestNativeCPUEvents(unittest.TestCase):
         self.assertEqual((set(removed.block_hashes), removed.medium), ({-1, 23}, "CPU"))
         with self.assertRaisesRegex(RuntimeError, "profile mismatch"):
             connector.get_kv_events()
+
+    def test_take_events_publishes_sglang_cpu_blocks_in_server_order(self):
+        # First Party
+        from lmcache.v1.multiprocess.custom_types import KVEventBatch, KVEventRecord
+
+        class _Stored(SimpleNamespace):
+            pass
+
+        class _Removed(SimpleNamespace):
+            pass
+
+        kv_events = ModuleType("sglang.srt.disaggregation.kv_events")
+        vars(kv_events).update(
+            BlockStored=_Stored,
+            BlockRemoved=_Removed,
+            StorageMedium=SimpleNamespace(CPU="CPU_PINNED"),
+        )
+        connector = _connector_without_io()
+        connector._ensure_heartbeat_started = Mock()
+        connector._kv_event_subscriber = Mock()
+        stored = KVEventRecord(
+            1, "stored", "CPU", "test", (-1, 23), -7, tuple(range(8)), 4, "p", 1
+        )
+        connector._kv_event_updates = [
+            KVEventBatch(
+                True, 1, 2, False, [stored, replace(stored, seq=2, kind="removed")]
+            )
+        ]
+
+        with patch.dict("sys.modules", {kv_events.__name__: kv_events}):
+            events = connector.take_events()
+
+        self.assertEqual(
+            events,
+            [
+                _Stored(
+                    block_hashes=[-1, 23],
+                    parent_block_hash=-7,
+                    token_ids=list(range(8)),
+                    block_size=4,
+                    lora_id=None,
+                    medium="CPU_PINNED",
+                ),
+                _Removed(block_hashes=[-1, 23], medium="CPU_PINNED"),
+            ],
+        )
+
+    def test_take_events_is_empty_on_a_rank_without_a_subscription(self):
+        self.assertEqual(_connector_without_io().take_events(), [])

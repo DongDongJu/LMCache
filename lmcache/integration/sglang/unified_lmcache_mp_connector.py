@@ -29,7 +29,7 @@ from lmcache.integration.sglang.lmcache_mp_metadata import (
     LMCacheStoreOperation,
     SGLangKVComponentGroup,
 )
-from lmcache.utils import CacheEvent
+from lmcache.utils import CacheEvent, CacheRemoveEvent
 from lmcache.v1.multiprocess.custom_types import (
     KV_EVENT_CAPABILITY,
     EventBinding,
@@ -82,6 +82,7 @@ class UnifiedLMCacheMPConnector:
         *,
         config_file: Optional[str],
         enable_kv_events: bool = False,
+        kv_event_publisher: bool = False,
         dynamo_format: bool = False,
         model_config: Any,
         tp_size: int,
@@ -365,7 +366,8 @@ class UnifiedLMCacheMPConnector:
                 profile_id=f"sglang-native-v1:sha256:signed-int64:dynamo={int(dynamo_format)}:B={self.page_size}",
                 block_size=self.page_size,
             )
-            if self._lookup_leader:
+            # SGLang elects the rank that publishes KV events.
+            if kv_event_publisher:
                 self._kv_event_subscriber = MPKVEventSubscriber(
                     self._req_client,
                     self.instance_id,
@@ -706,8 +708,6 @@ class UnifiedLMCacheMPConnector:
         cache_salt: str,
     ) -> LMCacheLookupOperation:
         self._ensure_heartbeat_started()
-        if self.event_profile is not None and cache_salt:
-            raise ValueError("MP KV events do not support salted request namespaces")
 
         operation = LMCacheLookupOperation(
             request_id=request_id,
@@ -1108,11 +1108,41 @@ class UnifiedLMCacheMPConnector:
         *,
         device_indices_start: int,
         cache_salt: str,
-        event_bindings: tuple[EventBinding, ...] = (),
+        native_block_hashes: Sequence[int] | None = None,
     ) -> Optional[LMCacheStoreOperation]:
+        """Submit the complete chunks of ``token_ids`` that are not stored yet.
+
+        Args:
+            request_id: Request whose session tracks the stored prefix.
+            token_ids: Tokens of the prefix, from token 0.
+            device_indices: Engine slots per KV group, from
+                ``device_indices_start``.
+            device_indices_start: Chunk-aligned token offset of the first slot.
+            cache_salt: Storage namespace of the request.
+            native_block_hashes: SGLang's event hash of every complete page of
+                ``token_ids``, from page 0. With KV events enabled, each
+                submitted chunk is bound to its pages and can be announced as
+                a CPU placement. ``None`` stores the chunks without a binding,
+                so they are never announced.
+
+        Returns:
+            The pending operation, or ``None`` when no new complete chunk can
+            be stored.
+
+        Raises:
+            ValueError: The slot range does not cover the submitted chunks, or
+                the hashes accompany a cache salt or do not cover every page.
+        """
         self._ensure_heartbeat_started()
-        if self.event_profile is not None and (cache_salt or not event_bindings):
-            raise ValueError("Event-enabled STORE requires unsalted native bindings")
+        if native_block_hashes is not None and (
+            cache_salt or len(native_block_hashes) != len(token_ids) // self.page_size
+        ):
+            raise ValueError(
+                "Native KV event hashes need an unsalted request and one hash "
+                f"per page: request_id={request_id!r}, "
+                f"hashes={len(native_block_hashes)}, tokens={len(token_ids)}, "
+                f"page_size={self.page_size}, salted={bool(cache_salt)}"
+            )
 
         aligned_end = len(token_ids) // self.chunk_size * self.chunk_size
         start = self.get_store_start(request_id, aligned_end)
@@ -1196,11 +1226,13 @@ class UnifiedLMCacheMPConnector:
                 key = self._create_key(
                     lookup, start=start, end=aligned_end, worker_id=self.kv_worker_id
                 )
-                if self.event_profile is not None:
+                if self.event_profile is not None and native_block_hashes is not None:
                     key = replace(
                         key,
                         event_profile=self.event_profile,
-                        event_bindings=event_bindings,
+                        event_bindings=self._build_event_bindings(
+                            token_ids, native_block_hashes, start, aligned_end
+                        ),
                     )
                 event = transfer_ctx.create_recorded_event()
                 future = transfer_ctx.submit_store(
@@ -1343,6 +1375,51 @@ class UnifiedLMCacheMPConnector:
                 events.extend(self._kv_event_ledger.apply(record))
         return events
 
+    def take_events(self) -> list[Any]:
+        """Drain committed CPU placement changes as SGLang KV events.
+
+        Call on the scheduler thread of the publisher rank; it does not block.
+
+        Returns:
+            ``BlockStored`` and ``BlockRemoved`` events with SGLang's CPU medium
+            and the page hashes SGLang supplied, in server order. Empty on a
+            rank without a subscription.
+
+        Raises:
+            RuntimeError: The event stream failed terminally; raised by the
+                call after the one that withdrew the advertised blocks.
+        """
+        events = self.get_kv_events()
+        if not events:
+            return []
+        # Third Party
+        from sglang.srt.disaggregation.kv_events import (
+            BlockRemoved,
+            BlockStored,
+            StorageMedium,
+        )
+
+        blocks: list[Any] = []
+        for event in events:
+            if isinstance(event, CacheRemoveEvent):
+                blocks.append(
+                    BlockRemoved(
+                        block_hashes=event.block_hashes, medium=StorageMedium.CPU
+                    )
+                )
+                continue
+            blocks.append(
+                BlockStored(
+                    block_hashes=event.block_hashes,
+                    parent_block_hash=event.parent_block_hash,
+                    token_ids=event.token_ids,
+                    block_size=event.block_size,
+                    lora_id=None,
+                    medium=StorageMedium.CPU,
+                )
+            )
+        return blocks
+
     def _queue_kv_event_updates(self, subscriber: MPKVEventSubscriber) -> None:
         """Bound the caller-drained queue while satisfying receiver ownership."""
         with self._kv_event_lock:
@@ -1386,6 +1463,36 @@ class UnifiedLMCacheMPConnector:
             transfer_ctx.close()
             self._transfer_ctx = None
         self._req_client.close()
+
+    def _build_event_bindings(
+        self,
+        token_ids: Sequence[int],
+        native_block_hashes: Sequence[int],
+        start: int,
+        end: int,
+    ) -> tuple[EventBinding, ...]:
+        """Bind each chunk of ``[start, end)`` to its pages and preceding page."""
+        assert self.event_profile is not None
+        pages_per_chunk = self.chunk_size // self.page_size
+        bindings = []
+        for chunk_start in range(start, end, self.chunk_size):
+            first_page = chunk_start // self.page_size
+            bindings.append(
+                EventBinding(
+                    profile_id=self.event_profile.profile_id,
+                    block_hashes=tuple(
+                        native_block_hashes[first_page : first_page + pages_per_chunk]
+                    ),
+                    parent_block_hash=(
+                        native_block_hashes[first_page - 1] if first_page else None
+                    ),
+                    token_ids=tuple(
+                        token_ids[chunk_start : chunk_start + self.chunk_size]
+                    ),
+                    block_size=self.page_size,
+                )
+            )
+        return tuple(bindings)
 
     def _create_recorded_event(
         self, transfer_ctx: "TransferContext", stream: Any = None

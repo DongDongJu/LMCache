@@ -447,19 +447,22 @@ independent recurrent state is present.
 
 ## Native CPU placement events
 
-The native-binding event profile requires the SGLang `native_event_hash` and
-`LMCacheUnifiedRadixCache.take_events` bridge supplied with this change. The
-bridge prepares immutable native page identities when submitting STORE, using
-SGLang's native page hashing and signed event conversion. Request-scoped hash
-state extends only new pages, supports both TreeCore backends, and is released
-when the request ends. Preparation does not enqueue a CPU store. The MP server
-announces the binding only after all required dense KV ranks and object groups
-have committed readable L1 copies; eviction removes exactly those identities.
+The native-binding event profile requires the `LMCacheUnifiedRadixCache` bridge
+of the matching SGLang change. On every STORE the rank that publishes SGLang's
+KV events passes `native_block_hashes`: the event hash of each complete page of
+the stored prefix, read from its radix tree. The connector binds every
+submitted chunk to its pages and to the page before it. A STORE without hashes
+(another rank, or a salted, LoRA or multimodal request) is stored without a
+binding and is never announced. Preparation does not enqueue a CPU store. The
+MP server announces the binding only after all required dense KV ranks and
+object groups have committed readable L1 copies; eviction removes exactly those
+identities.
 
-One elected connector borrows its request client to a common
-`MPKVEventSubscriber`. The connector retains registration and heartbeat
-ownership. SGLang's existing `take_events` call drains GPU events first and then
-wraps ordered MP transitions as native CPU events on the scheduler thread. A
+The connector of the rank SGLang elects (`kv_event_publisher`) borrows its
+request client to a common `MPKVEventSubscriber`. The connector retains
+registration and heartbeat ownership. SGLang's existing `take_events` call
+drains GPU events first and then the connector's `take_events()`, which returns
+the ordered MP transitions as SGLang CPU events on the scheduler thread. A
 stream reset withdraws this connector's advertised CPU identities without an
 `AllBlocksCleared` event. Terminal protocol errors are raised after draining the
 withdrawals. No local STORE-completion event source is used.
@@ -477,6 +480,7 @@ This procedure does not assume automatic SGLang registration recovery.
 Event-enabled operation requires the `kv_event_native_bindings_v1` capability,
 a compatible immutable native profile, LMCache-driven transfer, dense full
 attention, TP=1/2, and DP=PP=CP=1. The LMCache chunk size must be an integer
-multiple of the native page size. Salted, LoRA, multimodal, speculative and
-session-cache namespaces are rejected. Explicitly disabling engine KV events
-preserves the ordinary cache path, including its existing broader model support.
+multiple of the native page size. Speculative decoding is rejected at startup.
+Salted, LoRA and multimodal requests keep caching and carry no binding.
+Explicitly disabling engine KV events preserves the ordinary cache path,
+including its existing broader model support.
