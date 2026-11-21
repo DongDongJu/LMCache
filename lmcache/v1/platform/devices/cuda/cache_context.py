@@ -373,6 +373,23 @@ class _TempGPUBuffer:
         )
 
 
+class _OwnedCUDAStream(torch.cuda.ExternalStream):
+    """A PyTorch view holding its privately allocated native CUDA stream."""
+
+    cupy_stream: "cupy.cuda.Stream"
+
+    @classmethod
+    def create(cls, device: torch.device) -> "_OwnedCUDAStream":
+        # Third Party
+        import cupy
+
+        with torch.cuda.device(device):
+            owner = cupy.cuda.Stream(non_blocking=True)
+            stream = cls(owner.ptr, device=device)
+            stream.cupy_stream = owner
+            return stream
+
+
 class GPUCacheContext(BaseCacheContext):
     """
     Manages the shape and pointers to vLLM GPU KV cache tensors.
@@ -480,27 +497,31 @@ class GPUCacheContext(BaseCacheContext):
             full_sw_kv=full_sw_kv,
         )
 
-        # GPU streams
-        self.cuda_stream_ = torch_dev.Stream(device=self.device_)
+        # Third Party
+        import cupy
+
+        main_owner = None
+        self.cupy_stream_: "cupy.cuda.Stream"
+        if use_aligned_gds_slots():
+            main_owner = _OwnedCUDAStream.create(self.device_)
+            self.cuda_stream_ = main_owner
+            self.cupy_stream_ = main_owner.cupy_stream
+        else:
+            self.cuda_stream_ = torch_dev.Stream(device=self.device_)
+            self.cupy_stream_ = cupy.cuda.ExternalStream(
+                self.cuda_stream_.cuda_stream, self.device_.index
+            )
+
         self._gds_streams: dict[int, torch.cuda.Stream] = {}
         self._gds_ready_event: torch.cuda.Event | None = None
         self._gds_transfer_lock = threading.Lock()
         self._gds_closed = False
-
-        # Register the staging buffer with the GDS cuFile context on the
-        # context's CUDA stream.
         with torch_dev.stream(self.cuda_stream_):
             register_gds_gpu_buffer(
                 self._temp_buffer.buffer,
                 object_sizes=self._temp_buffer.aligned_object_sizes,
+                stream_owner=main_owner,
             )
-
-        # Third Party
-        import cupy
-
-        self.cupy_stream_: "cupy.cuda.Stream" = cupy.cuda.ExternalStream(
-            self.cuda_stream_.cuda_stream, self.device_.index
-        )
 
         # Extra initialization
         self.cupy_stream_.launch_host_func(
@@ -550,6 +571,7 @@ class GPUCacheContext(BaseCacheContext):
             self.cuda_stream_.synchronize()
             for stream in self._gds_streams.values():
                 deregister_gds_stream(self.device_, stream)
+            self._gds_streams.clear()
             with torch_dev.stream(self.cuda_stream_):
                 deregister_gds_gpu_buffer(self._temp_buffer.buffer)
             self._close_kv_wrappers()
@@ -588,7 +610,7 @@ class GPUCacheContext(BaseCacheContext):
         if not 0 <= slot < self.max_batch_size:
             raise ValueError("GDS slot is outside the staging buffer")
         if slot not in self._gds_streams:
-            self._gds_streams[slot] = torch.cuda.Stream(device=self.device_)
+            self._gds_streams[slot] = _OwnedCUDAStream.create(self.device_)
         return self._gds_streams[slot]
 
     @contextmanager

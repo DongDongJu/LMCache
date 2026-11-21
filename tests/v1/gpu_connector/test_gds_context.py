@@ -552,7 +552,7 @@ def test_l1_context_routes_by_owner_and_limits_process_slabs(monkeypatch, backen
         tensor = torch.empty(4096, dtype=torch.uint8)
         gds_context.register_gds_gpu_buffer(tensor)
         gds_context.deregister_gds_gpu_buffer(tensor)
-        register.assert_called_once_with(tensor, object_sizes=())
+        register.assert_called_once_with(tensor, object_sizes=(), stream_owner=None)
         deregister.assert_called_once_with(tensor)
         with pytest.raises(ValueError, match="one GDS"):
             gds_context.initialize_l1_gds_context(owner + 1, config)
@@ -592,7 +592,7 @@ def test_aligned_slot_preserves_payload_and_owns_the_tail(
     )
     try:
         ctx.register_gpu_buffer(buf, object_sizes=(4097, 123))
-        ctx.register_stream(buf.device, _fake_stream(2), staging_buffer=logical)
+        ctx.register_stream(buf.device, _fake_stream(2))
         backend.register_aligned_stream.assert_called_once_with(2)
         _use_fake_stream(monkeypatch, 2)
         short = Submission(8192, 4096, 0)
@@ -648,3 +648,39 @@ def test_large_direct_cufile_groups_keep_four_aligned_slots(size, backend, monke
     for i in range(4):
         view = buf.get_temp_object_group_buffer(i, 0)
         assert view.nbytes == size and view.data_ptr() % 65536 == 0
+
+
+def test_slot_registration_rejects_main_stream_alias_in_both_orders(
+    monkeypatch, backend
+):
+    ctx = GDSContext(backend)
+    ctx.initialized = True
+    buf = torch.empty(4096, dtype=torch.uint8)
+    slot = _fake_stream(17)
+    _use_fake_stream(monkeypatch, 17)
+    ctx.register_gpu_buffer(buf)
+    with pytest.raises(ValueError, match="main stream"):
+        ctx.register_stream(buf.device, slot)
+    ctx.deregister_gpu_buffer(buf)
+    ctx.register_stream(buf.device, slot)
+    ctx.register_stream(buf.device, slot)
+    backend.register_aligned_stream.assert_called_once_with(17)
+    with pytest.raises(ValueError, match="another owner"):
+        ctx.register_stream(buf.device, _fake_stream(17))
+    with pytest.raises(ValueError, match="aligned slot"):
+        ctx.register_gpu_buffer(buf)
+
+
+@pytest.mark.skipif(
+    torch_device_type != "cuda"
+    or not torch_dev.is_available()
+    or torch.version.hip is not None,
+    reason="requires CUDA",
+)
+def test_live_owned_cuda_streams_have_distinct_handles():
+    # First Party
+    from lmcache.v1.platform.devices.cuda.cache_context import _OwnedCUDAStream
+
+    streams = [_OwnedCUDAStream.create(torch.device("cuda", 0)) for _ in range(40)]
+    assert len({s.cuda_stream for s in streams}) == len(streams)
+    assert all(s.cuda_stream == s.cupy_stream.ptr for s in streams)
