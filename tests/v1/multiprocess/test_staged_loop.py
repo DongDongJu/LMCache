@@ -209,6 +209,9 @@ def test_gds_slots_complete_in_order(harness, monkeypatch, direction, short_io):
 
     for i, stream in enumerate(streams):
         stream.wait_event.side_effect = lambda event, i=i: events.append(("wait", i))
+    slab.has_aligned_slot.return_value = False
+    assert not run(block_ids)
+    slab.has_aligned_slot.return_value = True
     if direction == H2D:
         assert not run([0] * len(block_ids))
         assert events == []

@@ -49,6 +49,9 @@ def gds_group_stride(nbytes: int) -> int:
 # This context registers staging buffers in 16 MiB regions. This is our
 # registration geometry, not a universal limit of the backend API.
 _MAX_GDS_REGION = 16 * 1024 * 1024
+# Allow independent contexts to overlap without flooding one slab with small
+# submissions from every tensor-parallel rank at once.
+_MAX_ACTIVE_GROUPS = 2
 # GDS submissions to accumulate before recording a completion event and
 # draining finished ones (keeps the live submission set bounded).
 _SUBMISSION_CHECKPOINT_EVERY = 64
@@ -126,6 +129,7 @@ def register_gds_gpu_buffer(
     Args:
         buffer: Contiguous, aligned staging buffer, after L1 initialization.
         object_sizes: Logical bytes per group in the aligned layout, or empty.
+        stream_owner: Retain this privately allocated main stream until deregistration.
     """
     with _owner_contexts_lock:
         contexts = [get_gds_context(), *_owner_contexts.values()]
@@ -244,7 +248,10 @@ class GDSContext:
         self._base_ptrs: list[int] = []
         self._nbytes: list[int] = []
         self._main_streams: dict[int, object | None] = {}
-        self._io_lock = threading.RLock()
+        self._io_state = threading.Condition()
+        self._active_groups = 0
+        self._maintenance_waiters = 0
+        self._closing = False
         self._io_concurrency = 0
 
     def initialize(self, config: GdsL1Config) -> None:
@@ -293,6 +300,7 @@ class GDSContext:
             self._slab_path,
             self._slab_size / (1 << 30),
         )
+        self._closing = False
         self.initialized = True
 
     # --- Public API ---------------------------------------------------
@@ -310,26 +318,60 @@ class GDSContext:
         return self._io_concurrency
 
     def has_aligned_slot(self, buffer: torch.Tensor) -> bool:
+        """Return whether this group view has a registered full-chunk I/O plan."""
         return buffer.data_ptr() in self._slot_io
 
     @contextmanager
     def io_scope(self) -> Iterator[None]:
-        """Serialize bounded asynchronous groups across this slab's cache contexts.
+        """Admit a group until its slot streams drain.
 
-        The caller holds its cache-context lease first and drains every submitted
-        stream before leaving this scope. Close takes the same lock, so native
-        buffers and the slab handle survive until the group has finished.
+        Native maintenance takes precedence over waiting transfers.
 
         Raises:
-            RuntimeError: Slab teardown finished before this group acquired its scope.
+            RuntimeError: The slab is closing or has already closed.
         """
-        with self._io_lock:
-            if not self.initialized:
+        with self._io_state:
+            while not self._closing and (
+                self._maintenance_waiters or self._active_groups >= _MAX_ACTIVE_GROUPS
+            ):
+                self._io_state.wait()
+            if self._closing or not self.initialized:
                 raise RuntimeError("GDS context is closed")
+            self._active_groups += 1
+        try:
             yield
+        finally:
+            with self._io_state:
+                self._active_groups -= 1
+                self._io_state.notify_all()
+
+    @contextmanager
+    def _exclusive_io(self, *, closing: bool = False) -> Iterator[None]:
+        """Stop admissions, drain existing leases, then change native resources."""
+        with self._io_state:
+            if closing:
+                self._closing = True
+                self._io_state.notify_all()
+            self._maintenance_waiters += 1
+            try:
+                self._io_state.wait_for(lambda: self._active_groups == 0)
+                yield
+            finally:
+                self._maintenance_waiters -= 1
+                self._io_state.notify_all()
 
     def register_stream(self, device: object, stream: object) -> None:
-        """Register an owned aligned slot stream inside its transfer scope."""
+        """Register an owned slot stream while the caller holds a slab lease.
+
+        Args:
+            device: Device on which the stream was created.
+            stream: Owning PyTorch view of the native stream.
+
+        Raises:
+            ValueError: The handle already belongs to another owner or stream role.
+        """
+        if not self.initialized:
+            return
         raw = platform_stream.stream_handle(device, stream)
         with self._registry_lock:
             if raw in self._main_streams:
@@ -350,8 +392,8 @@ class GDSContext:
             device: Device owning the stream.
             stream: Stream no longer used by the cache context.
 
-        The cache-context lease excludes new submissions. Close uses io_scope's
-        lock, so slab teardown cannot overlap this native cleanup. Native
+        The cache-context lease excludes new submissions. The exclusive slab
+        scope waits for active groups before native cleanup. Native
         deregistration failures are logged and retained for slab-close retry,
         allowing other drained resources to be released.
 
@@ -359,7 +401,7 @@ class GDSContext:
             RuntimeError: Synchronization or deferred I/O validation failed; the
                 caller must retain buffers whose completion is not established.
         """
-        with self._io_lock:
+        with self._exclusive_io():
             if not self.initialized:
                 return
             self.synchronize_and_check(device, stream)
@@ -424,13 +466,17 @@ class GDSContext:
         """
         if not self.initialized:
             return
-        slot_bytes = sum(map(gds_group_stride, object_sizes)) or None
-        plans = (
-            self._plan_slot_io(buffer, slot_bytes, object_sizes) if object_sizes else {}
-        )
         stream = platform_stream.current_stream(buffer.device)
         raw_stream = platform_stream.stream_handle(buffer.device, stream)
-        with self._registry_lock:
+        with self._exclusive_io(), self._registry_lock:
+            if self._closing or not self.initialized:
+                raise RuntimeError("GDS context is closed")
+            slot_bytes = sum(map(gds_group_stride, object_sizes)) or None
+            plans = (
+                self._plan_slot_io(buffer, slot_bytes, object_sizes)
+                if object_sizes
+                else {}
+            )
             stream_registered = False
             registered_regions: list[torch.Tensor] = []
             try:
@@ -439,8 +485,7 @@ class GDSContext:
                         "An aligned slot cannot be registered as a main stream"
                     )
                 if (
-                    stream_owner is not None
-                    and raw_stream in self._main_streams
+                    raw_stream in self._main_streams
                     and self._main_streams[raw_stream] is not stream_owner
                 ):
                     raise ValueError("GDS main stream belongs to another owner")
@@ -476,7 +521,9 @@ class GDSContext:
         raw_stream = platform_stream.stream_handle(buffer.device, stream)
         # No in-flight DMA on this stream may still reference the buffer.
         platform_stream.synchronize_stream(buffer.device, stream)
-        with self._registry_lock:
+        with self._exclusive_io(), self._registry_lock:
+            if not self.initialized:
+                return
             lo = buffer.data_ptr()
             for ptr in list(self._slot_io):
                 if lo <= ptr < lo + buffer.nbytes:
@@ -564,8 +611,8 @@ class GDSContext:
             pos += seg_len
 
     def close(self) -> None:
-        """Wait for the active group before deregistering buffers and the slab."""
-        with self._io_lock:
+        """Drain active groups before deregistering buffers and the slab."""
+        with self._exclusive_io(closing=True):
             self._close_slab()
 
     def _close_slab(self) -> None:
@@ -591,6 +638,9 @@ class GDSContext:
                     self.backend.deregister_stream(raw_stream)
                 except Exception as e:
                     logger.warning("GDSContext.close: deregister_stream: %s", e)
+                else:
+                    self._main_streams.pop(raw_stream, None)
+                    self._slot_streams.pop(raw_stream, None)
             self._slot_io.clear()
         if self._slab_handle is not None:
             try:

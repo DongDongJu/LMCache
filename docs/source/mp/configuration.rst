@@ -715,7 +715,11 @@ verify the installation.
      - ``0``
      - Use up to four staging slots for concurrent, aligned cuFile direct I/O.
        Zero keeps the original single-stream path. Packed buffers, buffered I/O
-       and aliased restore destinations use ordered transfers.
+       and aliased restore destinations use ordered transfers. Each cache context
+       owns its streams and drains them before slot reuse. Two independent contexts
+       may transfer concurrently on the same slab. The aligned layout uses 64 KiB registration
+       bases. cuFile's 0x8 flag specifies 4 KiB alignment for offsets and sizes
+       (see the `NVIDIA cuFile stream API <https://docs.nvidia.com/gpudirect-storage/api-reference-guide/cufile-api-functional-specification.html#cufilestreamregister>`_).
 
 L1 Manager TTLs
 ----------------

@@ -378,12 +378,13 @@ class _TempGPUBuffer:
 
 
 class _OwnedCUDAStream(torch.cuda.ExternalStream):
-    """A PyTorch view holding its privately allocated native CUDA stream."""
+    """A PyTorch view that owns its CuPy stream through native deregistration."""
 
     cupy_stream: "cupy.cuda.Stream"
 
     @classmethod
     def create(cls, device: torch.device) -> "_OwnedCUDAStream":
+        """Allocate a nonblocking CuPy stream on device and return its owning view."""
         # Third Party
         import cupy
 
