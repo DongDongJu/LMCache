@@ -11,11 +11,13 @@ unless the corresponding stack is available.
 
 # Standard
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 import os
 import tempfile
+import threading
 
 # Third Party
 import pytest
@@ -621,8 +623,17 @@ def test_aligned_slot_preserves_payload_and_owns_the_tail(
         ctx.close()
 
 
-@pytest.mark.parametrize("size", [32 << 20, (32 << 20) + 4096, 40 << 20, 64 << 20])
-def test_large_direct_cufile_groups_keep_four_aligned_slots(size, backend, monkeypatch):
+@pytest.mark.parametrize(
+    "size, packed",
+    [
+        (32 << 20, False),
+        ((32 << 20) + 4096, False),
+        (40 << 20, False),
+        (64 << 20, False),
+        (32 << 20, True),
+    ],
+)
+def test_direct_cufile_staging_layout(size, packed, backend, monkeypatch):
     # First Party
     from lmcache.v1.platform.devices.cuda.cache_context import _TempGPUBuffer
 
@@ -643,11 +654,22 @@ def test_large_direct_cufile_groups_keep_four_aligned_slots(size, backend, monke
         object_groups=[SimpleNamespace(kernel_group_indices=[0])],
         get_slots_per_chunk_in_sw=lambda _: 256,
     )
+    if packed:
+        empty = torch.empty
+
+        def limit_allocation(nbytes, **kwargs):
+            if nbytes > 4 * size:
+                raise torch.OutOfMemoryError("only the packed allocation fits")
+            return empty(nbytes, **kwargs)
+
+        monkeypatch.setattr(torch, "empty", limit_allocation)
     buf = _TempGPUBuffer(layout, 256, torch.device("cpu"))
-    assert buf.aligned_object_sizes == (size,)
+    assert buf.aligned_object_sizes == (() if packed else (size,))
     for i in range(4):
         view = buf.get_temp_object_group_buffer(i, 0)
-        assert view.nbytes == size and view.data_ptr() % 65536 == 0
+        assert view.nbytes == size
+        if not packed:
+            assert view.data_ptr() % 65536 == 0
 
 
 def test_slot_registration_rejects_main_stream_alias_in_both_orders(
@@ -684,3 +706,93 @@ def test_live_owned_cuda_streams_have_distinct_handles():
     streams = [_OwnedCUDAStream.create(torch.device("cuda", 0)) for _ in range(40)]
     assert len({s.cuda_stream for s in streams}) == len(streams)
     assert all(s.cuda_stream == s.cupy_stream.ptr for s in streams)
+
+
+@pytest.mark.parametrize("closing", [True, False])
+def test_slab_maintenance_waits_for_shared_groups(monkeypatch, backend, closing):
+    ctx = GDSContext(backend)
+    ctx.initialized = True
+    earlier = [threading.Event(), threading.Event()]
+    release = [threading.Event(), threading.Event()]
+    writer_waiting = threading.Event()
+    later_waiting = threading.Event()
+    writer_id = []
+
+    wait = ctx._io_state.wait
+
+    def observed_wait(timeout=None):
+        if threading.get_ident() in writer_id:
+            writer_waiting.set()
+        else:
+            later_waiting.set()
+        return wait(timeout)
+
+    monkeypatch.setattr(ctx._io_state, "wait", observed_wait)
+
+    def reader(index):
+        with ctx.io_scope():
+            earlier[index].set()
+            assert release[index].wait(timeout=5)
+
+    def writer():
+        writer_id.append(threading.get_ident())
+        if closing:
+            ctx.close()
+        else:
+            ctx.deregister_stream(torch.device("cpu"), _fake_stream(11))
+
+    order = []
+    _use_fake_stream(monkeypatch, 11)
+    slot = _fake_stream(11)
+    ctx.register_stream(torch.device("cpu"), slot)
+    backend.deregister_stream.side_effect = lambda _: order.append("deregistered")
+
+    def later():
+        with ctx.io_scope():
+            order.append("reader")
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        first, second = (pool.submit(reader, i) for i in range(2))
+        try:
+            assert all(e.wait(timeout=5) for e in earlier)
+            exclusive = pool.submit(writer)
+            assert writer_waiting.wait(timeout=5)
+            last = pool.submit(later)
+            if closing:
+                with pytest.raises(RuntimeError, match="closed"):
+                    last.result(timeout=5)
+            else:
+                assert later_waiting.wait(timeout=5)
+            release[0].set()
+            first.result(timeout=5)
+            assert not exclusive.done()
+        finally:
+            for event in release:
+                event.set()
+        second.result(timeout=5)
+        exclusive.result(timeout=5)
+        if not closing:
+            last.result(timeout=5)
+            assert order == ["deregistered", "reader"]
+
+
+def test_slab_admits_next_group_after_one_group_finishes(monkeypatch, backend):
+    ctx = GDSContext(backend)
+    ctx.initialized = True
+    waiting = threading.Event()
+    wait = ctx._io_state.wait
+
+    def observed_wait(timeout=None):
+        waiting.set()
+        return wait(timeout)
+
+    def enter():
+        with ctx.io_scope():
+            return True
+
+    monkeypatch.setattr(ctx._io_state, "wait", observed_wait)
+    with ThreadPoolExecutor(max_workers=1) as pool, ctx.io_scope():
+        with ctx.io_scope():
+            third = pool.submit(enter)
+            assert waiting.wait(timeout=5)
+        assert third.result(timeout=5)

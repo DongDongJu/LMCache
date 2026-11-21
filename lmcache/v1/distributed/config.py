@@ -383,7 +383,7 @@ class GdsL1Config:
     """Allocation alignment; cuFile/hipFile and O_DIRECT require 4 KiB."""
 
     io_concurrency: int = 0
-    """Opt-in concurrent cuFile async slots per process (0 disables, maximum 4)."""
+    """Concurrent cuFile slots per cache context (0 disables, maximum 4)."""
 
     def __post_init__(self) -> None:
         """Validate the number of concurrent staging slots."""
