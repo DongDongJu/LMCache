@@ -37,12 +37,11 @@ from lmcache.v1.common.utils import (
 )
 from lmcache.v1.gpu_connector.gds_context import (
     GDS_SLOT_ALIGNMENT,
-    aligned_gds_staging_budget,
     deregister_gds_gpu_buffer,
     deregister_gds_stream,
     gds_group_stride,
     register_gds_gpu_buffer,
-    validate_gds_staging_size,
+    use_aligned_gds_slots,
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
@@ -125,25 +124,27 @@ class _TempGPUBuffer:
             self._get_size_for_object_group(i)
             for i in range(kv_layer_groups_manager.num_object_groups)
         )
-        padded_bytes = sum(gds_group_stride(size) for size in sizes) * max_batch_size
-        aligned_backing = padded_bytes + GDS_SLOT_ALIGNMENT - 1
-        self.aligned_object_sizes = (
-            sizes
-            if all(sizes) and aligned_backing <= aligned_gds_staging_budget()
-            else ()
-        )
-        staging_bytes = (
-            aligned_backing
-            if self.aligned_object_sizes
-            else sum(sizes) * max_batch_size
-        )
-        validate_gds_staging_size(staging_bytes)
-        backing = torch.empty(staging_bytes, dtype=torch.uint8, device=device)
-        if self.aligned_object_sizes:
-            start = -backing.data_ptr() % GDS_SLOT_ALIGNMENT
-            self._temp_buffer = backing.narrow(0, start, padded_bytes)
-        else:
-            self._temp_buffer = backing
+        self.aligned_object_sizes: tuple[int, ...] = ()
+        if sizes and all(sizes) and use_aligned_gds_slots():
+            padded_bytes = sum(map(gds_group_stride, sizes)) * max_batch_size
+            try:
+                backing = torch.empty(
+                    padded_bytes + GDS_SLOT_ALIGNMENT - 1,
+                    dtype=torch.uint8,
+                    device=device,
+                )
+            except torch.OutOfMemoryError:
+                logger.warning(
+                    "Aligned GDS staging allocation failed; trying the packed layout"
+                )
+            else:
+                start = -backing.data_ptr() % GDS_SLOT_ALIGNMENT
+                self._temp_buffer = backing.narrow(0, start, padded_bytes)
+                self.aligned_object_sizes = sizes
+        if not self.aligned_object_sizes:
+            self._temp_buffer = torch.empty(
+                sum(sizes) * max_batch_size, dtype=torch.uint8, device=device
+            )
 
         # Offset map: (batch_idx, object_group_idx, kernel_group_idx) ->
         # (byte offset in the temp buffer, size of the buffer in bytes)
@@ -207,11 +208,6 @@ class _TempGPUBuffer:
     def buffer(self) -> torch.Tensor:
         """The flat staging tensor (for GDS cuFile registration)."""
         return self._temp_buffer
-
-    @property
-    def slot_bytes(self) -> int:
-        """Byte stride of one slot, including all of its object groups."""
-        return self._temp_buffer.numel() // self._max_batch_size
 
     def get_temp_kernel_group_buffer(
         self, batch_idx: int, kernel_group_idx: int
@@ -496,7 +492,6 @@ class GPUCacheContext(BaseCacheContext):
         with torch_dev.stream(self.cuda_stream_):
             register_gds_gpu_buffer(
                 self._temp_buffer.buffer,
-                slot_bytes=self._temp_buffer.slot_bytes,
                 object_sizes=self._temp_buffer.aligned_object_sizes,
             )
 
@@ -556,9 +551,7 @@ class GPUCacheContext(BaseCacheContext):
             for stream in self._gds_streams.values():
                 deregister_gds_stream(self.device_, stream)
             with torch_dev.stream(self.cuda_stream_):
-                deregister_gds_gpu_buffer(
-                    self._temp_buffer.buffer, slot_bytes=self._temp_buffer.slot_bytes
-                )
+                deregister_gds_gpu_buffer(self._temp_buffer.buffer)
             self._close_kv_wrappers()
 
     def _close_kv_wrappers(self) -> None:
